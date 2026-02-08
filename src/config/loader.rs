@@ -182,12 +182,48 @@ pub fn load_settings(
 
     // Layer 6b: Dynaconf-compatible SECTION.KEY env vars
     // Maps CONFIG.MODEL → config.model, OPENAI.KEY → openai.key, etc.
-    // System env vars without dots are ignored by serde (no matching fields).
-    figment = figment.merge(
-        Env::raw()
-            .split(".")
-            .map(|key| key.as_str().to_lowercase().into()),
-    );
+    //
+    // We handle ALL dotted env vars here as TOML fragments instead of using
+    // Figment's Env provider, because Env treats all values as strings and
+    // cannot deserialize array syntax like ['item'] into Vec<T> fields.
+    for (key, value) in std::env::vars() {
+        if !key.contains('.') {
+            continue;
+        }
+        let value_trimmed = value.trim();
+        let lower = key.to_lowercase();
+        let Some((section, field)) = lower.split_once('.') else {
+            continue;
+        };
+
+        let is_array = value_trimmed.starts_with('[') && value_trimmed.ends_with(']');
+
+        let fragment = if is_array {
+            // Convert Python-style single-quoted arrays to TOML double-quoted:
+            // ['a', 'b'] → ["a", "b"]
+            let toml_val = value_trimmed.replace('\'', "\"");
+            format!("[{section}]\n{field} = {toml_val}")
+        } else {
+            // Scalar value — detect type for proper TOML encoding
+            let is_literal = value_trimmed == "true"
+                || value_trimmed == "false"
+                || value_trimmed.parse::<i64>().is_ok()
+                || value_trimmed.parse::<f64>().is_ok();
+            let toml_value = if is_literal {
+                value_trimmed.to_string()
+            } else {
+                let escaped = value_trimmed
+                    .replace('\\', "\\\\")
+                    .replace('"', "\\\"")
+                    .replace('\n', "\\n")
+                    .replace('\r', "\\r")
+                    .replace('\t', "\\t");
+                format!("\"{escaped}\"")
+            };
+            format!("[{section}]\n{field} = {toml_value}")
+        };
+        figment = figment.merge(Toml::string(&fragment));
+    }
 
     let settings: Settings = figment.extract()?;
     Ok(settings)
@@ -342,6 +378,81 @@ num_max_findings = 5
 
         // CLI wins over both
         assert_eq!(settings.pr_reviewer.num_max_findings, 99);
+    }
+
+    // SAFETY: These tests modify env vars which is unsafe in multi-threaded contexts.
+    // Cargo runs tests in the same process, so we use `unsafe` and accept the risk.
+    // Tests that touch env vars should NOT run in parallel with each other.
+
+    #[test]
+    fn test_dotted_env_var_simple_string() {
+        unsafe { std::env::set_var("CONFIG.MODEL", "openai/test-model-env") };
+        let settings =
+            load_settings(&HashMap::new(), None, None).expect("should load with env override");
+        assert_eq!(settings.config.model, "openai/test-model-env");
+        unsafe { std::env::remove_var("CONFIG.MODEL") };
+    }
+
+    #[test]
+    fn test_dotted_env_var_array_double_quoted() {
+        unsafe {
+            std::env::set_var("CONFIG.FALLBACK_MODELS", r#"["openai/test-fallback"]"#);
+        }
+        let settings =
+            load_settings(&HashMap::new(), None, None).expect("should load array env var");
+        assert_eq!(
+            settings.config.fallback_models,
+            vec!["openai/test-fallback"]
+        );
+        unsafe { std::env::remove_var("CONFIG.FALLBACK_MODELS") };
+    }
+
+    #[test]
+    fn test_dotted_env_var_array_single_quoted() {
+        unsafe { std::env::set_var("IGNORE.GLOB", "['pnpm-lock.yaml']") };
+        let settings =
+            load_settings(&HashMap::new(), None, None).expect("should load single-quoted array");
+        assert!(
+            settings.ignore.glob.contains(&"pnpm-lock.yaml".to_string()),
+            "glob should contain pnpm-lock.yaml, got: {:?}",
+            settings.ignore.glob
+        );
+        unsafe { std::env::remove_var("IGNORE.GLOB") };
+    }
+
+    #[test]
+    fn test_dotted_env_var_bool() {
+        unsafe { std::env::set_var("GITHUB_APP.HANDLE_PUSH_TRIGGER", "true") };
+        let settings =
+            load_settings(&HashMap::new(), None, None).expect("should load bool env var");
+        assert!(settings.github_app.handle_push_trigger);
+        unsafe { std::env::remove_var("GITHUB_APP.HANDLE_PUSH_TRIGGER") };
+    }
+
+    #[test]
+    fn test_dotted_env_var_int() {
+        unsafe { std::env::set_var("CONFIG.MAX_MODEL_TOKENS", "128000") };
+        let settings = load_settings(&HashMap::new(), None, None).expect("should load int env var");
+        assert_eq!(settings.config.max_model_tokens, 128_000);
+        unsafe { std::env::remove_var("CONFIG.MAX_MODEL_TOKENS") };
+    }
+
+    #[test]
+    fn test_dotted_env_var_multiline_private_key() {
+        let fake_key = "-----BEGIN RSA PRIVATE KEY-----\nMIIBogIBAAJBALR\ntest123\n-----END RSA PRIVATE KEY-----";
+        unsafe { std::env::set_var("GITHUB.PRIVATE_KEY", fake_key) };
+        let settings =
+            load_settings(&HashMap::new(), None, None).expect("should load multiline env var");
+        assert!(
+            settings
+                .github
+                .private_key
+                .contains("BEGIN RSA PRIVATE KEY"),
+            "private key should contain full PEM, got: {:?}",
+            &settings.github.private_key[..50.min(settings.github.private_key.len())]
+        );
+        assert!(settings.github.private_key.contains("test123"));
+        unsafe { std::env::remove_var("GITHUB.PRIVATE_KEY") };
     }
 
     #[test]
