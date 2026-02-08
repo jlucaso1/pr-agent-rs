@@ -1,0 +1,72 @@
+[package]
+name = "pr-agent-rs"
+version = "0.1.0"
+edition = "2024"
+description = "AI-powered pull request agent for automated code review"
+license = "AGPL-3.0-or-later"
+
+[dependencies]
+async-trait = "0.1"
+
+# Web server
+axum = "0.8"
+
+base64 = "0.22"
+
+# Date/time
+chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Configuration
+figment = { version = "0.10", features = ["toml", "env"] }
+futures-util = "0.3.31"
+
+hex = "0.4"
+
+# HMAC signature verification
+hmac = "0.12"
+indexmap = "2.13.0"
+
+# JWT (for GitHub App auth — uses aws-lc-rs shared with reqwest/rustls)
+jsonwebtoken = { version = "10", features = ["aws_lc_rs"] }
+
+# Template engine (only builtins for |trim filter, std_collections for HashMap context)
+minijinja = { version = "2", default-features = false, features = ["builtins", "std_collections", "serde"] }
+
+# Regex
+regex = "1"
+
+# HTTP
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml_ng = "0.10.0"
+sha2 = "0.10"
+
+# Error handling
+thiserror = "2"
+
+# Token counting
+tiktoken-rs = "0.9"
+
+# Async runtime
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "net"] }
+toml = "0.8"
+tower-http = { version = "0.6", features = ["trace"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# URL parsing
+url = "2"
+
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1
+panic = "abort"

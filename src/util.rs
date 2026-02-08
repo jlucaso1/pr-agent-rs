@@ -1,0 +1,87 @@
+use std::collections::HashMap;
+use std::sync::{LazyLock, Mutex};
+
+use regex::Regex;
+
+/// Thread-safe cache for compiled regexes.
+///
+/// Patterns from config (e.g. `ignore_pr_title`) are compiled once and reused.
+static REGEX_CACHE: LazyLock<Mutex<HashMap<String, Regex>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Get a compiled regex from the cache, or compile and cache it.
+/// Returns `None` if the pattern is invalid.
+pub fn get_or_compile_regex(pattern: &str) -> Option<Regex> {
+    let mut cache = REGEX_CACHE.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(re) = cache.get(pattern) {
+        return Some(re.clone());
+    }
+    match Regex::new(pattern) {
+        Ok(re) => {
+            cache.insert(pattern.to_string(), re.clone());
+            Some(re)
+        }
+        Err(_) => None,
+    }
+}
+
+/// Find the largest byte offset <= `max_bytes` that falls on a UTF-8 char boundary.
+#[allow(dead_code)]
+fn floor_char_boundary(text: &str, max_bytes: usize) -> usize {
+    if max_bytes >= text.len() {
+        return text.len();
+    }
+    // Walk backwards from max_bytes until we hit a char boundary
+    let mut i = max_bytes;
+    while i > 0 && !text.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
+/// Truncate a string to approximately `max_bytes` bytes on a line boundary.
+/// Safe for multi-byte UTF-8 text — never splits a character.
+#[allow(dead_code)]
+pub fn truncate_on_line_boundary(text: &str, max_bytes: usize) -> &str {
+    if text.len() <= max_bytes {
+        return text;
+    }
+    let safe_end = floor_char_boundary(text, max_bytes);
+    match text[..safe_end].rfind('\n') {
+        Some(pos) => &text[..pos],
+        None => &text[..safe_end],
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_truncate_ascii() {
+        assert_eq!(truncate_on_line_boundary("hello\nworld", 7), "hello");
+        assert_eq!(truncate_on_line_boundary("short", 100), "short");
+    }
+
+    #[test]
+    fn test_truncate_no_newline() {
+        assert_eq!(truncate_on_line_boundary("abcdefgh", 5), "abcde");
+    }
+
+    #[test]
+    fn test_truncate_utf8_boundary() {
+        // "Hello 👋 world" — emoji is 4 bytes at offset 6..10
+        let text = "Hello 👋 world";
+        // max_bytes=8 falls inside the emoji, should back up to offset 6
+        let result = truncate_on_line_boundary(text, 8);
+        assert_eq!(result, "Hello ");
+    }
+
+    #[test]
+    fn test_truncate_multibyte_with_newline() {
+        let text = "café\nlatte";
+        // 'é' is 2 bytes, so "café" is 5 bytes. max=7 → truncate at newline pos=5
+        let result = truncate_on_line_boundary(text, 7);
+        assert_eq!(result, "café");
+    }
+}
