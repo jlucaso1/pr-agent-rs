@@ -1,1 +1,4 @@
 /target
+.secrets.toml
+.env
+.env.*

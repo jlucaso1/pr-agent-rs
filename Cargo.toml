@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2024"
 description = "AI-powered pull request agent for automated code review"
 license = "AGPL-3.0-or-later"
+repository = "https://github.com/jlucaso1/pr-agent-rs"
+keywords = ["pr", "code-review", "ai", "github", "automation"]
+categories = ["development-tools", "command-line-utilities"]
 
 [dependencies]
 async-trait = "0.1"
