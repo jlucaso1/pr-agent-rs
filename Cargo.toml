@@ -57,7 +57,7 @@ thiserror = "2"
 tiktoken-rs = "0.9"
 
 # Async runtime
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "net"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "net", "signal"] }
 toml = "0.8"
 tower-http = { version = "0.6", features = ["trace"] }
 

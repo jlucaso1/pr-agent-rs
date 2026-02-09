@@ -88,8 +88,11 @@ impl Command {
     }
 }
 
-/// Forbidden CLI config keys that cannot be overridden (security-sensitive).
-const FORBIDDEN_CLI_KEYS: &[&str] = &[
+/// Forbidden config keys that cannot be overridden via CLI args or webhook comments.
+///
+/// These are security-sensitive — exposing them to untrusted input (PR comments)
+/// could allow secrets exfiltration or provider redirection.
+pub const FORBIDDEN_OVERRIDE_KEYS: &[&str] = &[
     "shared_secret",
     "user",
     "system",
@@ -120,6 +123,18 @@ const FORBIDDEN_CLI_KEYS: &[&str] = &[
     "api_version",
 ];
 
+/// Check if a config key is forbidden for override.
+///
+/// Returns `Some(matched_forbidden_key)` if the key matches, `None` if allowed.
+pub fn check_forbidden_key(key: &str) -> Option<&'static str> {
+    let key_lower = key.to_lowercase();
+    let segments: Vec<&str> = key_lower.split('.').collect();
+    FORBIDDEN_OVERRIDE_KEYS
+        .iter()
+        .find(|&&forbidden| key_lower == forbidden || segments.contains(&forbidden))
+        .copied()
+}
+
 /// Parse the `rest` args into a HashMap of config overrides.
 /// Format: `--section.key=value` or `--section__key=value` (double underscores → dots).
 fn parse_config_overrides(rest: &[String]) -> Result<HashMap<String, String>, PrAgentError> {
@@ -135,17 +150,10 @@ fn parse_config_overrides(rest: &[String]) -> Result<HashMap<String, String>, Pr
         let stripped = stripped.replace("__", ".");
 
         if let Some((key, value)) = stripped.split_once('=') {
-            let key_lower = key.to_lowercase();
-
-            // Check for forbidden keys (exact match on dotted key or any segment)
-            let key_segments: Vec<&str> = key_lower.split('.').collect();
-            for forbidden in FORBIDDEN_CLI_KEYS {
-                let is_match = key_lower == *forbidden || key_segments.contains(forbidden);
-                if is_match {
-                    return Err(PrAgentError::Other(format!(
-                        "forbidden CLI override: '{key}' (matches '{forbidden}')"
-                    )));
-                }
+            if let Some(forbidden) = check_forbidden_key(key) {
+                return Err(PrAgentError::Other(format!(
+                    "forbidden CLI override: '{key}' (matches '{forbidden}')"
+                )));
             }
 
             overrides.insert(key.to_string(), value.to_string());

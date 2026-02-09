@@ -37,10 +37,33 @@ pub async fn start_server() -> Result<(), PrAgentError> {
         .map_err(|e| PrAgentError::Other(format!("failed to bind to {addr}: {e}")))?;
 
     axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
         .await
         .map_err(|e| PrAgentError::Other(format!("server error: {e}")))?;
 
+    tracing::info!("server shut down gracefully");
     Ok(())
+}
+
+/// Wait for SIGINT (Ctrl+C) or SIGTERM for clean container shutdown.
+async fn shutdown_signal() {
+    let ctrl_c = tokio::signal::ctrl_c();
+
+    #[cfg(unix)]
+    {
+        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to install SIGTERM handler");
+        tokio::select! {
+            _ = ctrl_c => tracing::info!("received SIGINT, shutting down"),
+            _ = sigterm.recv() => tracing::info!("received SIGTERM, shutting down"),
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        ctrl_c.await.ok();
+        tracing::info!("received SIGINT, shutting down");
+    }
 }
 
 /// Health check endpoint: GET /

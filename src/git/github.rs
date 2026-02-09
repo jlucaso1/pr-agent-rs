@@ -47,7 +47,11 @@ impl GithubProvider {
         let settings = get_settings();
 
         let base_url = settings.github.base_url.clone();
-        let client = Client::new();
+        let timeout = std::time::Duration::from_secs(settings.config.ai_timeout as u64);
+        let client = Client::builder()
+            .timeout(timeout)
+            .build()
+            .map_err(|e| PrAgentError::Other(format!("failed to build HTTP client: {e}")))?;
         let repo_full = format!("{}/{}", parsed.owner, parsed.repo);
 
         let token = if settings.github.deployment_type == "app" {
@@ -83,13 +87,23 @@ impl GithubProvider {
         body: Option<&serde_json::Value>,
     ) -> Result<reqwest::Response, PrAgentError> {
         let url = format!("{}/{}", self.base_url.trim_end_matches('/'), path);
+        self.api_request_with_retry_url(method, &url, body).await
+    }
+
+    /// Same as `api_request_with_retry` but accepts an absolute URL (for pagination).
+    async fn api_request_with_retry_url(
+        &self,
+        method: reqwest::Method,
+        url: &str,
+        body: Option<&serde_json::Value>,
+    ) -> Result<reqwest::Response, PrAgentError> {
         let settings = get_settings();
         let max_retries = settings.github.ratelimit_retries;
 
         for attempt in 0..=max_retries {
             let mut req = self
                 .client
-                .request(method.clone(), &url)
+                .request(method.clone(), url)
                 .bearer_auth(&self.token)
                 .header("Accept", "application/vnd.github+json")
                 .header("User-Agent", "pr-agent-rs");
@@ -113,7 +127,7 @@ impl GithubProvider {
                         attempt = attempt + 1,
                         max = max_retries,
                         retry_after_secs = retry_after,
-                        path,
+                        url,
                         "GitHub API rate limited, retrying"
                     );
                     tokio::time::sleep(std::time::Duration::from_secs(retry_after)).await;
@@ -154,6 +168,39 @@ impl GithubProvider {
             .await?;
         let resp = Self::check_response(resp, "GET").await?;
         resp.json().await.map_err(PrAgentError::Http)
+    }
+
+    /// Make a paginated GET request, collecting all pages of JSON arrays.
+    ///
+    /// Follows the `Link: <url>; rel="next"` header until no more pages.
+    async fn api_get_all_pages(&self, path: &str) -> Result<Vec<serde_json::Value>, PrAgentError> {
+        let mut all_items = Vec::new();
+
+        // First request uses the relative path
+        let resp = self
+            .api_request_with_retry(reqwest::Method::GET, path, None)
+            .await?;
+        let resp = Self::check_response(resp, "GET").await?;
+        let mut next_url = parse_next_link(resp.headers());
+        let page: serde_json::Value = resp.json().await.map_err(PrAgentError::Http)?;
+        if let Some(arr) = page.as_array() {
+            all_items.extend(arr.iter().cloned());
+        }
+
+        // Follow pagination links
+        while let Some(url) = next_url.take() {
+            let resp = self
+                .api_request_with_retry_url(reqwest::Method::GET, &url, None)
+                .await?;
+            let resp = Self::check_response(resp, "GET").await?;
+            next_url = parse_next_link(resp.headers());
+            let page: serde_json::Value = resp.json().await.map_err(PrAgentError::Http)?;
+            if let Some(arr) = page.as_array() {
+                all_items.extend(arr.iter().cloned());
+            }
+        }
+
+        Ok(all_items)
     }
 
     /// Make an authenticated POST request to the GitHub API.
@@ -416,15 +463,11 @@ impl GitProvider for GithubProvider {
             "repos/{}/pulls/{}/files?per_page=100",
             self.repo_full, self.parsed.pr_number
         );
-        let data = self.api_get(&path).await?;
-        let files = data
-            .as_array()
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|f| f["filename"].as_str().map(String::from))
-                    .collect()
-            })
-            .unwrap_or_default();
+        let items = self.api_get_all_pages(&path).await?;
+        let files = items
+            .iter()
+            .filter_map(|f| f["filename"].as_str().map(String::from))
+            .collect();
         Ok(files)
     }
 
@@ -502,20 +545,26 @@ impl GitProvider for GithubProvider {
         &self,
         body: &str,
         file: &str,
-        _line: &str,
+        line: &str,
         _original_suggestion: Option<&str>,
     ) -> Result<(), PrAgentError> {
         let path = format!(
             "repos/{}/pulls/{}/reviews",
             self.repo_full, self.parsed.pr_number
         );
+        let mut comment = json!({
+            "body": body,
+            "path": file,
+            "side": "RIGHT",
+        });
+        if let Ok(line_num) = line.parse::<u64>()
+            && line_num > 0
+        {
+            comment["line"] = json!(line_num);
+        }
         let review_body = json!({
             "event": "COMMENT",
-            "comments": [{
-                "body": body,
-                "path": file,
-                "side": "RIGHT",
-            }]
+            "comments": [comment]
         });
         self.api_post(&path, &review_body).await?;
         Ok(())
@@ -698,20 +747,16 @@ impl GitProvider for GithubProvider {
             "repos/{}/pulls/{}/commits?per_page=100",
             self.repo_full, self.parsed.pr_number
         );
-        let data = self.api_get(&path).await?;
-        let messages: Vec<String> = data
-            .as_array()
-            .map(|arr| {
-                arr.iter()
-                    .enumerate()
-                    .filter_map(|(i, c)| {
-                        c["commit"]["message"]
-                            .as_str()
-                            .map(|m| format!("{}. {}", i + 1, m))
-                    })
-                    .collect()
+        let items = self.api_get_all_pages(&path).await?;
+        let messages: Vec<String> = items
+            .iter()
+            .enumerate()
+            .filter_map(|(i, c)| {
+                c["commit"]["message"]
+                    .as_str()
+                    .map(|m| format!("{}. {}", i + 1, m))
             })
-            .unwrap_or_default();
+            .collect();
         Ok(messages.join("\n"))
     }
 
@@ -750,23 +795,19 @@ impl GitProvider for GithubProvider {
             "repos/{}/issues/{}/comments?per_page=100",
             self.repo_full, self.parsed.pr_number
         );
-        let data = self.api_get(&path).await?;
-        let comments = data
-            .as_array()
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|c| {
-                        Some(IssueComment {
-                            id: c["id"].as_u64()?,
-                            body: c["body"].as_str().unwrap_or_default().to_string(),
-                            user: c["user"]["login"].as_str().unwrap_or_default().to_string(),
-                            created_at: c["created_at"].as_str().unwrap_or_default().to_string(),
-                            url: c["html_url"].as_str().map(|s| s.to_string()),
-                        })
-                    })
-                    .collect()
+        let items = self.api_get_all_pages(&path).await?;
+        let comments = items
+            .iter()
+            .filter_map(|c| {
+                Some(IssueComment {
+                    id: c["id"].as_u64()?,
+                    body: c["body"].as_str().unwrap_or_default().to_string(),
+                    user: c["user"]["login"].as_str().unwrap_or_default().to_string(),
+                    created_at: c["created_at"].as_str().unwrap_or_default().to_string(),
+                    url: c["html_url"].as_str().map(|s| s.to_string()),
+                })
             })
-            .unwrap_or_default();
+            .collect();
         Ok(comments)
     }
 
@@ -785,13 +826,12 @@ impl GitProvider for GithubProvider {
 
     async fn get_latest_commit_url(&self) -> Result<String, PrAgentError> {
         let path = format!(
-            "repos/{}/pulls/{}/commits?per_page=1&direction=desc",
+            "repos/{}/pulls/{}/commits?per_page=100",
             self.repo_full, self.parsed.pr_number
         );
-        let data = self.api_get(&path).await?;
-        let url = data
-            .as_array()
-            .and_then(|arr| arr.last())
+        let items = self.api_get_all_pages(&path).await?;
+        let url = items
+            .last()
             .and_then(|c| c["html_url"].as_str())
             .unwrap_or_default();
         Ok(url.to_string())
@@ -902,6 +942,21 @@ impl GitProvider for GithubProvider {
     }
 }
 
+/// Parse the `Link` header to find the `rel="next"` URL.
+fn parse_next_link(headers: &reqwest::header::HeaderMap) -> Option<String> {
+    let link = headers.get("link")?.to_str().ok()?;
+    for part in link.split(',') {
+        let part = part.trim();
+        if part.contains(r#"rel="next""#) {
+            // Extract URL between < and >
+            let start = part.find('<')? + 1;
+            let end = part.find('>')?;
+            return Some(part[start..end].to_string());
+        }
+    }
+    None
+}
+
 /// Count added (+) and removed (-) lines in a unified diff patch.
 fn count_patch_lines(patch: &str) -> (i32, i32) {
     let mut plus = 0i32;
@@ -940,5 +995,39 @@ mod tests {
         let (plus, minus) = count_patch_lines("");
         assert_eq!(plus, 0);
         assert_eq!(minus, 0);
+    }
+
+    #[test]
+    fn test_parse_next_link() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            "link",
+            r#"<https://api.github.com/repos/owner/repo/pulls/1/files?per_page=100&page=2>; rel="next", <https://api.github.com/repos/owner/repo/pulls/1/files?per_page=100&page=3>; rel="last""#
+                .parse()
+                .unwrap(),
+        );
+        let next = parse_next_link(&headers);
+        assert_eq!(
+            next.unwrap(),
+            "https://api.github.com/repos/owner/repo/pulls/1/files?per_page=100&page=2"
+        );
+    }
+
+    #[test]
+    fn test_parse_next_link_no_next() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            "link",
+            r#"<https://api.github.com/repos/owner/repo/pulls/1/files?page=1>; rel="first""#
+                .parse()
+                .unwrap(),
+        );
+        assert!(parse_next_link(&headers).is_none());
+    }
+
+    #[test]
+    fn test_parse_next_link_no_header() {
+        let headers = reqwest::header::HeaderMap::new();
+        assert!(parse_next_link(&headers).is_none());
     }
 }

@@ -182,6 +182,7 @@ pub async fn publish_as_comment(
 /// Parse a "/command --arg=value" string into (command_name, args_overrides).
 ///
 /// Splits on whitespace and extracts `--key=value` pairs as config overrides.
+/// Security-sensitive keys (secrets, auth, URLs) are dropped with a warning log.
 pub fn parse_command(input: &str) -> (String, HashMap<String, String>) {
     let trimmed = input.trim();
     let mut parts = trimmed.split_whitespace();
@@ -194,9 +195,17 @@ pub fn parse_command(input: &str) -> (String, HashMap<String, String>) {
     let mut overrides = HashMap::new();
     for part in parts {
         let stripped = part.trim_start_matches('-');
-        // Convert double underscore to dot (e.g., pr_reviewer__num_code_suggestions → pr_reviewer.num_code_suggestions)
+        // Convert double underscore to dot
         let stripped = stripped.replace("__", ".");
         if let Some((key, value)) = stripped.split_once('=') {
+            if let Some(forbidden) = crate::cli::check_forbidden_key(key) {
+                tracing::warn!(
+                    key,
+                    forbidden,
+                    "dropping forbidden override from comment command"
+                );
+                continue;
+            }
             overrides.insert(key.to_string(), value.to_string());
         }
     }
@@ -268,5 +277,25 @@ mod tests {
     fn test_parse_command_with_leading_slash() {
         let (cmd, _) = parse_command("review");
         assert_eq!(cmd, "review");
+    }
+
+    #[test]
+    fn test_parse_command_drops_forbidden_keys() {
+        let (cmd, args) = parse_command("/review --openai.key=sk-secret --config.model=gpt-4");
+        assert_eq!(cmd, "review");
+        assert!(
+            !args.contains_key("openai.key"),
+            "forbidden key should be dropped"
+        );
+        assert_eq!(args.get("config.model").unwrap(), "gpt-4");
+    }
+
+    #[test]
+    fn test_parse_command_drops_forbidden_segment() {
+        let (_, args) = parse_command("/review --github.base_url=http://evil.com");
+        assert!(
+            !args.contains_key("github.base_url"),
+            "forbidden segment 'base_url' should be dropped"
+        );
     }
 }
