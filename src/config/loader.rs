@@ -263,8 +263,14 @@ fn cli_override_to_toml(key: &str, value: &str) -> Option<String> {
 mod tests {
     use super::*;
 
+    // Mutex to serialize tests that modify environment variables.
+    // `load_settings()` iterates ALL dotted env vars via `std::env::vars()`,
+    // so concurrent tests setting env vars will contaminate each other.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn test_load_default_settings() {
+        let _guard = ENV_LOCK.lock().unwrap();
         let settings =
             load_settings(&HashMap::new(), None, None).expect("should load default settings");
 
@@ -295,6 +301,7 @@ mod tests {
 
     #[test]
     fn test_cli_overrides() {
+        let _guard = ENV_LOCK.lock().unwrap();
         let mut overrides = HashMap::new();
         overrides.insert("pr_reviewer.num_max_findings".into(), "10".into());
         overrides.insert("config.temperature".into(), "0.5".into());
@@ -307,6 +314,7 @@ mod tests {
 
     #[test]
     fn test_repo_settings_override() {
+        let _guard = ENV_LOCK.lock().unwrap();
         let repo_toml = r#"
 [pr_reviewer]
 num_max_findings = 7
@@ -323,6 +331,7 @@ extra_instructions = "Focus on security"
 
     #[test]
     fn test_global_settings_override() {
+        let _guard = ENV_LOCK.lock().unwrap();
         let global_toml = r#"
 [pr_reviewer]
 num_max_findings = 20
@@ -340,6 +349,7 @@ extra_instructions = "Org-wide: check licenses"
 
     #[test]
     fn test_repo_overrides_global_settings() {
+        let _guard = ENV_LOCK.lock().unwrap();
         let global_toml = r#"
 [pr_reviewer]
 num_max_findings = 20
@@ -363,6 +373,7 @@ num_max_findings = 5
 
     #[test]
     fn test_cli_overrides_repo_and_global() {
+        let _guard = ENV_LOCK.lock().unwrap();
         let global_toml = r#"
 [pr_reviewer]
 num_max_findings = 20
@@ -381,12 +392,12 @@ num_max_findings = 5
         assert_eq!(settings.pr_reviewer.num_max_findings, 99);
     }
 
-    // SAFETY: These tests modify env vars which is unsafe in multi-threaded contexts.
-    // Cargo runs tests in the same process, so we use `unsafe` and accept the risk.
-    // Tests that touch env vars should NOT run in parallel with each other.
+    // All env var tests acquire ENV_LOCK. The `unsafe` blocks are required
+    // because modifying env vars is inherently process-global.
 
     #[test]
     fn test_dotted_env_var_simple_string() {
+        let _guard = ENV_LOCK.lock().unwrap();
         unsafe { std::env::set_var("CONFIG.MODEL", "openai/test-model-env") };
         let settings =
             load_settings(&HashMap::new(), None, None).expect("should load with env override");
@@ -396,6 +407,7 @@ num_max_findings = 5
 
     #[test]
     fn test_dotted_env_var_array_double_quoted() {
+        let _guard = ENV_LOCK.lock().unwrap();
         unsafe {
             std::env::set_var("CONFIG.FALLBACK_MODELS", r#"["openai/test-fallback"]"#);
         }
@@ -410,6 +422,7 @@ num_max_findings = 5
 
     #[test]
     fn test_dotted_env_var_array_single_quoted() {
+        let _guard = ENV_LOCK.lock().unwrap();
         unsafe { std::env::set_var("IGNORE.GLOB", "['pnpm-lock.yaml']") };
         let settings =
             load_settings(&HashMap::new(), None, None).expect("should load single-quoted array");
@@ -423,6 +436,7 @@ num_max_findings = 5
 
     #[test]
     fn test_dotted_env_var_array_docker_escaped_quotes() {
+        let _guard = ENV_LOCK.lock().unwrap();
         // Docker/Coolify JSON encoding produces backslash-escaped quotes in env vars
         unsafe {
             std::env::set_var("IGNORE.GLOB", r#"[\"pnpm-lock.yaml\"]"#);
@@ -439,6 +453,7 @@ num_max_findings = 5
 
     #[test]
     fn test_dotted_env_var_array_docker_escaped_multi() {
+        let _guard = ENV_LOCK.lock().unwrap();
         // Multiple items with Docker/JSON escaping
         unsafe {
             std::env::set_var(
@@ -457,6 +472,7 @@ num_max_findings = 5
 
     #[test]
     fn test_dotted_env_var_bool() {
+        let _guard = ENV_LOCK.lock().unwrap();
         unsafe { std::env::set_var("GITHUB_APP.HANDLE_PUSH_TRIGGER", "true") };
         let settings =
             load_settings(&HashMap::new(), None, None).expect("should load bool env var");
@@ -466,6 +482,7 @@ num_max_findings = 5
 
     #[test]
     fn test_dotted_env_var_int() {
+        let _guard = ENV_LOCK.lock().unwrap();
         unsafe { std::env::set_var("CONFIG.MAX_MODEL_TOKENS", "128000") };
         let settings = load_settings(&HashMap::new(), None, None).expect("should load int env var");
         assert_eq!(settings.config.max_model_tokens, 128_000);
@@ -474,6 +491,7 @@ num_max_findings = 5
 
     #[test]
     fn test_dotted_env_var_multiline_private_key() {
+        let _guard = ENV_LOCK.lock().unwrap();
         let fake_key = "-----BEGIN RSA PRIVATE KEY-----\nMIIBogIBAAJBALR\ntest123\n-----END RSA PRIVATE KEY-----";
         unsafe { std::env::set_var("GITHUB.PRIVATE_KEY", fake_key) };
         let settings =
