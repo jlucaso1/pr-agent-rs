@@ -22,34 +22,37 @@ pub struct RenderedPrompt {
 
 /// Render a prompt template pair with the given variables.
 ///
-/// Uses minijinja with `Strict` undefined behavior — missing template
-/// variables cause hard errors rather than silent empty strings.
+/// Takes ownership of `vars` to avoid cloning large Values (e.g. the diff
+/// string, which can be 100 KB+). The context Value is built once from
+/// the owned map and shared across both template renders via cheap Arc clone.
 pub fn render_prompt(
     template: &PromptTemplate,
-    vars: &HashMap<String, Value>,
+    vars: HashMap<String, Value>,
 ) -> Result<RenderedPrompt, PrAgentError> {
     let env = &*JINJA_ENV;
 
-    let system = render_template(env, "system", &template.system, vars)?;
-    let user = render_template(env, "user", &template.user, vars)?;
+    // Build context once — moves Values instead of cloning them.
+    // Value::clone() is cheap (Arc-based internally).
+    let ctx = Value::from_iter(vars);
+
+    let system = render_template(env, "system", &template.system, &ctx)?;
+    let user = render_template(env, "user", &template.user, &ctx)?;
 
     Ok(RenderedPrompt { system, user })
 }
 
-/// Render a single template string with variables.
+/// Render a single template string with a pre-built context.
 fn render_template(
     env: &Environment,
     name: &str,
     template_str: &str,
-    vars: &HashMap<String, Value>,
+    ctx: &Value,
 ) -> Result<String, PrAgentError> {
     let tmpl = env
         .template_from_str(template_str)
         .map_err(|e| PrAgentError::Other(format!("failed to parse {name} template: {e}")))?;
 
-    let ctx = Value::from_iter(vars.iter().map(|(k, v)| (k.as_str(), v.clone())));
-
-    tmpl.render(ctx)
+    tmpl.render(ctx.clone())
         .map_err(|e| PrAgentError::Other(format!("failed to render {name} template: {e}")))
 }
 
@@ -58,7 +61,7 @@ fn render_template(
 pub fn render_prompt_strings(
     system_template: &str,
     user_template: &str,
-    vars: &HashMap<String, Value>,
+    vars: HashMap<String, Value>,
 ) -> Result<RenderedPrompt, PrAgentError> {
     let template = PromptTemplate {
         system: system_template.to_string(),
@@ -83,7 +86,7 @@ mod tests {
         vars.insert("branch".into(), Value::from("feature/login"));
         vars.insert("diff".into(), Value::from("+new line\n-old line"));
 
-        let result = render_prompt(&template, &vars).unwrap();
+        let result = render_prompt(&template, vars).unwrap();
         assert!(result.system.contains("Fix login bug"));
         assert!(result.system.contains("feature/login"));
         assert!(result.user.contains("+new line"));
@@ -102,12 +105,12 @@ mod tests {
             "extra_instructions".into(),
             Value::from("Focus on security"),
         );
-        let result = render_prompt(&template, &vars).unwrap();
+        let result = render_prompt(&template, vars.clone()).unwrap();
         assert!(result.system.contains("Focus on security"));
 
         // With empty string (falsy)
         vars.insert("extra_instructions".into(), Value::from(""));
-        let result = render_prompt(&template, &vars).unwrap();
+        let result = render_prompt(&template, vars).unwrap();
         assert!(!result.system.contains("Extra:"));
     }
 
@@ -119,7 +122,7 @@ mod tests {
         };
 
         let vars = HashMap::new();
-        let result = render_prompt(&template, &vars);
+        let result = render_prompt(&template, vars);
         assert!(result.is_err());
     }
 
@@ -133,7 +136,7 @@ mod tests {
         let mut vars = HashMap::new();
         vars.insert("items".into(), Value::from(vec!["alpha", "beta", "gamma"]));
 
-        let result = render_prompt(&template, &vars).unwrap();
+        let result = render_prompt(&template, vars).unwrap();
         assert!(result.user.contains("alpha"));
         assert!(result.user.contains("beta"));
         assert!(result.user.contains("gamma"));
@@ -149,7 +152,7 @@ mod tests {
         let mut vars = HashMap::new();
         vars.insert("diff".into(), Value::from("  content  \n\n"));
 
-        let result = render_prompt(&template, &vars).unwrap();
+        let result = render_prompt(&template, vars).unwrap();
         assert_eq!(result.user, "content");
     }
 
@@ -172,7 +175,7 @@ mod tests {
             Value::from("{{ __import__('os').system('rm -rf /') }}"),
         );
 
-        let result = render_prompt(&template, &vars).unwrap();
+        let result = render_prompt(&template, vars).unwrap();
         // Must render as literal strings, not evaluate the Jinja syntax
         assert!(result.system.contains("{{ config.secret }}"));
         assert!(result.system.contains("{% for i in range(999) %}"));
@@ -224,7 +227,7 @@ mod tests {
         vars.insert("best_practices_content".into(), Value::from(""));
         vars.insert("repo_metadata".into(), Value::from(""));
 
-        let result = render_prompt(&settings.pr_review_prompt, &vars).unwrap();
+        let result = render_prompt(&settings.pr_review_prompt, vars).unwrap();
 
         // System prompt should contain the PR-Reviewer description
         assert!(result.system.contains("PR-Reviewer"));

@@ -73,15 +73,27 @@ pub fn get_pr_diff(
 
     // 2. Build file dictionary (extends patches with context + counts tokens)
     let file_dict = build_file_dict(files, add_line_numbers, extra_before, extra_after);
+
+    // Release large file contents — only needed during extend_patch above.
+    // Filenames and edit_type are still available for append_remaining_file_lists.
+    for file in files.iter_mut() {
+        drop(std::mem::take(&mut file.base_file));
+        drop(std::mem::take(&mut file.head_file));
+    }
+
     let max_tokens = get_max_tokens_with_fallback(model, settings.config.max_model_tokens);
 
     // 3. Check total tokens against budget
     let total_tokens: u32 = file_dict.iter().map(|(_, e)| e.tokens).sum();
 
     if total_tokens + OUTPUT_BUFFER_TOKENS_SOFT_THRESHOLD < max_tokens {
-        // Under budget — return full diff
-        let full_diff: String = file_dict.iter().map(|(_, e)| e.patch.as_str()).collect();
-        let filenames: Vec<String> = file_dict.iter().map(|(f, _)| f.clone()).collect();
+        // Under budget — consume file_dict, moving strings instead of cloning
+        let mut full_diff = String::new();
+        let mut filenames = Vec::with_capacity(file_dict.len());
+        for (name, entry) in file_dict {
+            full_diff.push_str(&entry.patch);
+            filenames.push(name);
+        }
         return PrDiffResult {
             diff: full_diff,
             token_count: total_tokens,
@@ -128,31 +140,17 @@ fn build_file_dict(
     extra_before: usize,
     extra_after: usize,
 ) -> Vec<(String, FileEntry)> {
-    let mut entries: Vec<(String, FileEntry)> = Vec::new();
+    let mut entries: Vec<(String, FileEntry)> = Vec::with_capacity(files.len());
 
     for file in files {
         let extended = extend_patch(&file.base_file, &file.patch, extra_before, extra_after);
 
-        // Build a lightweight view with the extended patch — avoids cloning
-        // the potentially large base_file/head_file strings.
-        let extended_file = FilePatchInfo {
-            patch: extended,
-            filename: file.filename.clone(),
-            edit_type: file.edit_type,
-            base_file: String::new(),
-            head_file: String::new(),
-            tokens: file.tokens,
-            old_filename: None,
-            num_plus_lines: file.num_plus_lines,
-            num_minus_lines: file.num_minus_lines,
-            language: None,
-            ai_file_summary: None,
-        };
-
+        // Pass raw parts directly — avoids constructing a temporary FilePatchInfo
+        // and eliminates one filename clone per file.
         let patch_text = if add_line_numbers {
-            convert_to_hunks_with_line_numbers(&extended_file)
+            convert_to_hunks_with_line_numbers(&file.filename, &extended, file.edit_type)
         } else {
-            format_patch_simple(&extended_file)
+            format_patch_simple(&file.filename, &extended, file.edit_type)
         };
 
         let tokens = count_tokens(&patch_text);

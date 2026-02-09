@@ -60,7 +60,8 @@ impl PRDescription {
 
         let diff_result = get_pr_diff(&mut files, model, true);
 
-        // Build per-file stats for the file walkthrough links
+        // Build per-file stats for the file walkthrough links (only uses metadata fields).
+        // base_file/head_file already released by get_pr_diff internally.
         let file_stats: HashMap<String, FileStats> = files
             .iter()
             .map(|f| {
@@ -81,7 +82,7 @@ impl PRDescription {
         let vars = self.build_vars(&meta, &diff_result.diff, num_files);
 
         // 4. Render prompt
-        let rendered = render_prompt(&settings.pr_description_prompt, &vars)?;
+        let rendered = render_prompt(&settings.pr_description_prompt, vars)?;
 
         // 5. Call AI (with fallback models)
         tracing::info!(model, "calling AI model for describe");

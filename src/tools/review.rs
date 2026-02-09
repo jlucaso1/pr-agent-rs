@@ -65,6 +65,7 @@ impl PRReviewer {
         let diff_result = get_pr_diff(
             &mut files, model, true, /* add_line_numbers for review */
         );
+        drop(files); // release file contents now that diff is built
         tracing::info!(
             tokens = diff_result.token_count,
             files_included = diff_result.files_in_diff.len(),
@@ -76,7 +77,7 @@ impl PRReviewer {
         let vars = self.build_vars(&meta, &diff_result.diff, num_files);
 
         // 4. Render prompt
-        let rendered = render_prompt(&settings.pr_review_prompt, &vars)?;
+        let rendered = render_prompt(&settings.pr_review_prompt, vars)?;
 
         // 5. Call AI (with fallback models)
         tracing::info!(model, "calling AI model for review");

@@ -1,8 +1,6 @@
 use regex::Regex;
 use std::sync::LazyLock;
 
-use crate::git::types::FilePatchInfo;
-
 /// Regex for parsing unified diff hunk headers.
 /// Matches: `@@ -start1[,size1] +start2[,size2] @@ [section_header]`
 static HUNK_HEADER_RE: LazyLock<Regex> =
@@ -31,26 +29,31 @@ impl HunkHeader {
     }
 }
 
-/// Convert a file's unified diff patch into the pr-agent format with
+/// Convert a unified diff patch into the pr-agent format with
 /// `## File:`, `__new hunk__`/`__old hunk__` markers and line numbers.
 ///
-/// Decouples a unified diff into separate hunks and adds line numbers for display.
-pub fn convert_to_hunks_with_line_numbers(file: &FilePatchInfo) -> String {
-    if file.patch.is_empty() {
-        if file.edit_type == crate::git::types::EditType::Deleted {
-            return format!("## File '{}' was deleted\n", file.filename.trim());
+/// Accepts raw parts to avoid requiring a full `FilePatchInfo` (which would
+/// force callers to clone the filename into a temporary struct).
+pub fn convert_to_hunks_with_line_numbers(
+    filename: &str,
+    patch: &str,
+    edit_type: crate::git::types::EditType,
+) -> String {
+    if patch.is_empty() {
+        if edit_type == crate::git::types::EditType::Deleted {
+            return format!("## File '{}' was deleted\n", filename.trim());
         }
-        return format!("## File: '{}'\n\n(empty patch)\n", file.filename.trim());
+        return format!("## File: '{}'\n\n(empty patch)\n", filename.trim());
     }
 
-    let mut output = format!("## File: '{}'\n", file.filename.trim());
+    let mut output = format!("## File: '{}'\n", filename.trim());
     let mut new_content = Vec::new();
     let mut old_content = Vec::new();
     let mut has_plus = false;
     let mut has_minus = false;
     let mut line_number: usize = 0;
 
-    for line in file.patch.lines() {
+    for line in patch.lines() {
         if let Some(header) = HunkHeader::parse(line) {
             // Flush previous hunk
             flush_hunk(&mut output, &new_content, &old_content, has_plus, has_minus);
@@ -112,32 +115,21 @@ fn flush_hunk(
 
 /// Format a file patch as a simple diff block without line numbers.
 /// Used when `add_line_numbers_to_hunks` is false.
-pub fn format_patch_simple(file: &FilePatchInfo) -> String {
-    if file.edit_type == crate::git::types::EditType::Deleted {
-        return format!("## File '{}' was deleted\n", file.filename.trim());
+pub fn format_patch_simple(
+    filename: &str,
+    patch: &str,
+    edit_type: crate::git::types::EditType,
+) -> String {
+    if edit_type == crate::git::types::EditType::Deleted {
+        return format!("## File '{}' was deleted\n", filename.trim());
     }
-    format!(
-        "\n\n## File: '{}'\n\n{}\n",
-        file.filename.trim(),
-        file.patch.trim()
-    )
+    format!("\n\n## File: '{}'\n\n{}\n", filename.trim(), patch.trim())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::git::types::{EditType, FilePatchInfo};
-
-    fn make_file(patch: &str) -> FilePatchInfo {
-        let mut f = FilePatchInfo::new(
-            String::new(),
-            String::new(),
-            patch.into(),
-            "src/main.rs".into(),
-        );
-        f.edit_type = EditType::Modified;
-        f
-    }
+    use crate::git::types::EditType;
 
     #[test]
     fn test_hunk_header_parse() {
@@ -152,8 +144,7 @@ mod tests {
     #[test]
     fn test_convert_simple_patch() {
         let patch = "@@ -1,3 +1,4 @@\n context\n-removed\n+added\n+new line\n context2";
-        let file = make_file(patch);
-        let result = convert_to_hunks_with_line_numbers(&file);
+        let result = convert_to_hunks_with_line_numbers("src/main.rs", patch, EditType::Modified);
 
         assert!(result.contains("## File: 'src/main.rs'"));
         assert!(result.contains("__new hunk__"));
@@ -163,9 +154,7 @@ mod tests {
 
     #[test]
     fn test_deleted_file() {
-        let mut f = make_file("");
-        f.edit_type = EditType::Deleted;
-        let result = convert_to_hunks_with_line_numbers(&f);
+        let result = convert_to_hunks_with_line_numbers("src/main.rs", "", EditType::Deleted);
         assert!(result.contains("was deleted"));
     }
 }

@@ -69,6 +69,14 @@ impl PRCodeSuggestions {
         // filter_files is idempotent so this operates on the already-filtered set.
         let batches_with_lines = get_pr_diff_multiple_patches(&mut files, model, true, max_calls);
 
+        // Release large file contents — base_file/head_file are no longer needed
+        // after patches have been extended above.
+        for file in &mut files {
+            drop(std::mem::take(&mut file.base_file));
+            drop(std::mem::take(&mut file.head_file));
+        }
+        drop(files);
+
         if batches_no_lines.is_empty() {
             tracing::info!("no diff content, skipping improve");
             return Ok(());
@@ -171,7 +179,7 @@ impl PRCodeSuggestions {
         let vars = self.build_vars(meta, diff);
 
         // 2. Render prompt
-        let rendered = render_prompt(&settings.pr_code_suggestions_prompt, &vars)?;
+        let rendered = render_prompt(&settings.pr_code_suggestions_prompt, vars)?;
 
         // 3. Call AI (generate suggestions, with fallback models)
         tracing::info!(model, batch = batch_index, "calling AI model for improve");
@@ -275,7 +283,7 @@ impl PRCodeSuggestions {
         );
 
         // Render reflect prompt
-        let rendered = render_prompt(&settings.pr_code_suggestions_reflect_prompt, &vars)?;
+        let rendered = render_prompt(&settings.pr_code_suggestions_reflect_prompt, vars)?;
 
         // Call AI (second pass -- reflect, with fallback models)
         tracing::info!(model, "calling AI model for improve reflect pass");
