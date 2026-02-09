@@ -144,4 +144,78 @@ mod tests {
         assert!(re.is_match("node_modules/foo/bar.js"));
         assert!(re.is_match("project/node_modules/foo.js"));
     }
+
+    #[test]
+    fn test_glob_question_mark() {
+        let re = Regex::new(&glob_to_regex("file?.txt")).unwrap();
+        assert!(re.is_match("file1.txt"));
+        assert!(re.is_match("fileA.txt"));
+        assert!(!re.is_match("file10.txt")); // ? = single char
+        assert!(!re.is_match("file.txt")); // ? requires exactly one char
+    }
+
+    #[test]
+    fn test_glob_character_class() {
+        let re = Regex::new(&glob_to_regex("[abc].rs")).unwrap();
+        assert!(re.is_match("a.rs"));
+        assert!(re.is_match("b.rs"));
+        assert!(!re.is_match("d.rs"));
+    }
+
+    #[test]
+    fn test_filter_files_removes_binary_and_ignored() {
+        use crate::git::types::{EditType, FilePatchInfo};
+
+        let mut files = vec![
+            {
+                let mut f = FilePatchInfo::new(
+                    String::new(),
+                    String::new(),
+                    "+code".into(),
+                    "src/main.rs".into(),
+                );
+                f.edit_type = EditType::Modified;
+                f
+            },
+            {
+                let mut f = FilePatchInfo::new(
+                    String::new(),
+                    String::new(),
+                    String::new(),
+                    "image.png".into(),
+                );
+                f.edit_type = EditType::Added;
+                f
+            },
+            {
+                let mut f = FilePatchInfo::new(
+                    String::new(),
+                    String::new(),
+                    "+data".into(),
+                    "data.db".into(),
+                );
+                f.edit_type = EditType::Modified;
+                f
+            },
+        ];
+
+        filter_files(&mut files);
+
+        // Only src/main.rs should remain — image.png and data.db are binary
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].filename, "src/main.rs");
+    }
+
+    #[test]
+    fn test_is_binary_no_extension() {
+        assert!(!is_binary("Makefile"));
+        assert!(!is_binary("LICENSE"));
+    }
+
+    #[test]
+    fn test_is_binary_nested_extension() {
+        // tar.gz should match gz
+        assert!(is_binary("archive.tar.gz"));
+        assert!(is_binary("deep/path/file.woff2"));
+    }
 }

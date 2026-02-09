@@ -87,4 +87,37 @@ mod tests {
         let result = truncate_on_line_boundary(text, 7);
         assert_eq!(result, "café");
     }
+
+    #[test]
+    fn test_get_or_compile_regex_valid() {
+        let re = get_or_compile_regex(r"^\[WIP\]");
+        assert!(re.is_some());
+        assert!(re.unwrap().is_match("[WIP] draft PR"));
+    }
+
+    #[test]
+    fn test_get_or_compile_regex_invalid() {
+        let re = get_or_compile_regex("[unclosed");
+        assert!(re.is_none());
+    }
+
+    #[test]
+    fn test_get_or_compile_regex_cache_hit() {
+        let pattern = r"^test-cache-\d+$";
+        let first = get_or_compile_regex(pattern).unwrap();
+        let second = get_or_compile_regex(pattern).unwrap();
+        // Both should be the same Arc (cache hit)
+        assert!(std::sync::Arc::ptr_eq(&first, &second));
+    }
+
+    #[test]
+    fn test_floor_char_boundary_within_text() {
+        let text = "Hello 🌍"; // 🌍 is 4 bytes at offset 6..10
+        // max_bytes=8 falls inside emoji, should back up to 6
+        assert_eq!(floor_char_boundary(text, 8), 6);
+        // max_bytes=10 is at end
+        assert_eq!(floor_char_boundary(text, 10), 10);
+        // max_bytes exceeds length
+        assert_eq!(floor_char_boundary(text, 100), text.len());
+    }
 }

@@ -282,3 +282,142 @@ struct ApiUsage {
     completion_tokens: u32,
     total_tokens: u32,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_handler() -> OpenAiCompatibleHandler {
+        OpenAiCompatibleHandler {
+            client: Client::new(),
+            base_url: "https://api.test.com/v1".into(),
+            api_key: "test-key".into(),
+            deployment_id: "test-deploy".into(),
+        }
+    }
+
+    #[test]
+    fn test_build_request_body_basic() {
+        let handler = test_handler();
+        let body = handler.build_request_body("gpt-4", "system msg", "user msg", Some(0.5), None);
+
+        assert_eq!(body["model"], "gpt-4");
+        let messages = body["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0]["role"], "system");
+        assert_eq!(messages[0]["content"], "system msg");
+        assert_eq!(messages[1]["role"], "user");
+        assert_eq!(messages[1]["content"], "user msg");
+        // Temperature should be set for non-o1/o3 models
+        assert!(body.get("temperature").is_some());
+    }
+
+    #[test]
+    fn test_build_request_body_with_images() {
+        let handler = test_handler();
+        let urls = vec!["https://img.com/a.png".to_string()];
+        let body = handler.build_request_body("gpt-4", "sys", "user", None, Some(&urls));
+
+        let user_msg = &body["messages"].as_array().unwrap()[1];
+        // Should be multipart content array with text + image_url
+        let content = user_msg["content"].as_array().unwrap();
+        assert_eq!(content.len(), 2);
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[1]["type"], "image_url");
+        assert_eq!(content[1]["image_url"]["url"], "https://img.com/a.png");
+    }
+
+    #[test]
+    fn test_build_request_body_user_only_model() {
+        let handler = test_handler();
+        // o1-mini is a user-message-only model
+        let body = handler.build_request_body("o1-mini", "system", "user", None, None);
+
+        let messages = body["messages"].as_array().unwrap();
+        // System message should be merged into user for o1 models
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0]["role"], "user");
+        let content = messages[0]["content"].as_str().unwrap();
+        assert!(
+            content.contains("system"),
+            "combined message should include system text"
+        );
+        assert!(
+            content.contains("user"),
+            "combined message should include user text"
+        );
+    }
+
+    #[test]
+    fn test_build_request_body_no_temperature_model() {
+        let handler = test_handler();
+        // o1-preview doesn't support temperature
+        let body = handler.build_request_body("o1-preview", "sys", "user", Some(0.7), None);
+
+        assert!(
+            body.get("temperature").is_none(),
+            "o1 models should not have temperature"
+        );
+    }
+
+    #[test]
+    fn test_build_request_body_seed_negative_excluded() {
+        let handler = test_handler();
+        // Default seed is -1, should not be included
+        let body = handler.build_request_body("gpt-4", "sys", "user", None, None);
+
+        assert!(
+            body.get("seed").is_none(),
+            "negative seed should not be included"
+        );
+    }
+
+    #[test]
+    fn test_build_request_body_empty_images_ignored() {
+        let handler = test_handler();
+        let empty: Vec<String> = vec![];
+        let body = handler.build_request_body("gpt-4", "sys", "user", None, Some(&empty));
+
+        // Empty image array should produce a plain text message, not multipart
+        let user_msg = &body["messages"].as_array().unwrap()[1];
+        assert!(
+            user_msg["content"].is_string(),
+            "empty images should produce string content, not array"
+        );
+    }
+
+    #[test]
+    fn test_build_request_body_empty_system() {
+        let handler = test_handler();
+        let body = handler.build_request_body("gpt-4", "", "user msg", None, None);
+
+        let messages = body["messages"].as_array().unwrap();
+        // Empty system message should be omitted
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0]["role"], "user");
+    }
+
+    #[tokio::test]
+    async fn test_send_completion_connection_error() {
+        let handler = OpenAiCompatibleHandler {
+            client: Client::builder()
+                .timeout(Duration::from_millis(100))
+                .build()
+                .unwrap(),
+            base_url: "http://192.0.2.1:1".into(), // RFC 5737 non-routable
+            api_key: "".into(),
+            deployment_id: "".into(),
+        };
+
+        let body = json!({"model": "test", "messages": [{"role": "user", "content": "hi"}]});
+        let result = handler.send_completion(&body).await;
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_from_settings_succeeds() {
+        // Should successfully create handler from default settings
+        let handler = OpenAiCompatibleHandler::from_settings();
+        assert!(handler.is_ok());
+    }
+}

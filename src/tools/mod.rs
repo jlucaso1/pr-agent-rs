@@ -304,4 +304,119 @@ mod tests {
             "forbidden segment 'base_url' should be dropped"
         );
     }
+
+    #[test]
+    fn test_build_common_vars_populates_all_keys() {
+        let meta = PrMetadata {
+            title: "My Title".into(),
+            description: "My Desc".into(),
+            branch: "feat/test".into(),
+            commit_messages: "commit 1\ncommit 2".into(),
+            best_practices: "Use Rust idioms".into(),
+            repo_metadata: "CLAUDE.md content".into(),
+        };
+
+        let vars = build_common_vars(&meta, "the-diff-content");
+
+        assert_eq!(vars["title"].to_string(), "My Title");
+        assert_eq!(vars["branch"].to_string(), "feat/test");
+        assert_eq!(vars["description"].to_string(), "My Desc");
+        assert_eq!(vars["diff"].to_string(), "the-diff-content");
+        assert_eq!(
+            vars["commit_messages_str"].to_string(),
+            "commit 1\ncommit 2"
+        );
+        assert_eq!(
+            vars["best_practices_content"].to_string(),
+            "Use Rust idioms"
+        );
+        assert_eq!(vars["repo_metadata"].to_string(), "CLAUDE.md content");
+        assert_eq!(vars["language"].to_string(), "");
+    }
+
+    #[test]
+    fn test_build_custom_labels_class_formats_correctly() {
+        let mut labels = HashMap::new();
+        labels.insert(
+            "bug-fix".into(),
+            CustomLabelEntry {
+                description: "Bug fix changes".into(),
+            },
+        );
+
+        let result = build_custom_labels_class(&labels);
+        assert!(result.contains("Label('bug-fix', description='Bug fix changes')"));
+    }
+
+    #[test]
+    fn test_build_custom_labels_class_empty() {
+        let labels = HashMap::new();
+        let result = build_custom_labels_class(&labels);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_insert_custom_labels_vars_with_labels() {
+        let mut vars = HashMap::new();
+        let mut settings = Settings::default();
+        settings.custom_labels.insert(
+            "perf".into(),
+            CustomLabelEntry {
+                description: "Performance".into(),
+            },
+        );
+
+        insert_custom_labels_vars(&mut vars, &settings);
+
+        assert_eq!(vars["enable_custom_labels"].to_string(), "true");
+        let class_str = vars["custom_labels_class"].to_string();
+        assert!(class_str.contains("perf"));
+    }
+
+    #[test]
+    fn test_insert_custom_labels_vars_without_labels() {
+        let mut vars = HashMap::new();
+        let settings = Settings::default();
+
+        insert_custom_labels_vars(&mut vars, &settings);
+
+        assert_eq!(vars["enable_custom_labels"].to_string(), "false");
+        assert_eq!(vars["custom_labels_class"].to_string(), "");
+    }
+
+    #[tokio::test]
+    async fn test_dispatch_unknown_command_returns_error() {
+        use crate::testing::mock_git::MockGitProvider;
+
+        let provider = Arc::new(MockGitProvider::new());
+        let result = dispatch("unknown_command", provider).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("unknown command"),
+            "should mention unknown command, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_parse_command_empty_input() {
+        let (cmd, args) = parse_command("");
+        assert_eq!(cmd, "");
+        assert!(args.is_empty());
+    }
+
+    #[test]
+    fn test_parse_command_whitespace_only() {
+        let (cmd, args) = parse_command("   ");
+        assert_eq!(cmd, "");
+        assert!(args.is_empty());
+    }
+
+    #[test]
+    fn test_parse_command_no_value() {
+        // --flag without =value should be ignored
+        let (cmd, args) = parse_command("/review --verbose");
+        assert_eq!(cmd, "review");
+        assert!(args.is_empty(), "flag without = should be skipped");
+    }
 }

@@ -791,6 +791,62 @@ num_max_findings = 3
     }
 
     #[test]
+    fn test_extract_pr_url_missing_field() {
+        let payload = serde_json::json!({ "pull_request": {} });
+        let result = extract_pr_url(&payload);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("missing pull_request.html_url")
+        );
+    }
+
+    #[test]
+    fn test_extract_pr_url_from_issue_fallback() {
+        // When pull_request.html_url is missing, should fallback to issue.html_url
+        let payload = serde_json::json!({
+            "issue": {
+                "html_url": "https://github.com/owner/repo/pull/42",
+                "pull_request": {}
+            }
+        });
+        let url = extract_pr_url_from_issue(&payload).unwrap();
+        assert_eq!(url, "https://github.com/owner/repo/pull/42");
+    }
+
+    #[test]
+    fn test_extract_pr_url_from_issue_missing_both() {
+        let payload = serde_json::json!({ "issue": {} });
+        let result = extract_pr_url_from_issue(&payload);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_verify_signature_invalid_hex() {
+        let result = verify_signature(b"body", "secret", "sha256=not-hex-data!");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("invalid hex"));
+    }
+
+    #[test]
+    fn test_should_ignore_pr_invalid_regex_does_not_crash() {
+        let mut settings = Settings::default();
+        settings.config.ignore_pr_title = vec!["[invalid".into()]; // unclosed bracket
+        // Should not panic — invalid regex is skipped with warning
+        assert!(!should_ignore_pr(&settings, "Some PR title", "user1"));
+    }
+
+    #[test]
+    fn test_should_ignore_pr_empty_author() {
+        let mut settings = Settings::default();
+        settings.config.ignore_pr_authors = vec!["bot".into()];
+        // Empty author should not match
+        assert!(!should_ignore_pr(&settings, "Title", ""));
+    }
+
+    #[test]
     fn test_fold_comment_body_preserves_marker_and_content() {
         let body = "<!-- pr-agent:improve -->\n## PR Code Suggestions ✨\n\n| Category | Suggestion | Score |\n| --- | --- | --- |\n| bug | Fix null check | Important |\n\n- [ ]  I reviewed <!-- approve and fold suggestions self-review -->";
         let folded = fold_comment_body(body).unwrap();
