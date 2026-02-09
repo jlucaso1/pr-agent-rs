@@ -18,16 +18,11 @@ COPY src/ src/
 COPY settings/ settings/
 RUN cargo build --release
 
-FROM debian:bookworm-slim
-
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends ca-certificates && \
-    rm -rf /var/lib/apt/lists/* && \
-    useradd --system --no-create-home appuser
+FROM gcr.io/distroless/cc-debian12
 
 COPY --from=builder /app/target/release/pr-agent-rs /usr/local/bin/pr-agent-rs
 
-USER appuser
+USER nonroot
 
 EXPOSE 3000
 
