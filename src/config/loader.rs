@@ -199,9 +199,10 @@ pub fn load_settings(
         let is_array = value_trimmed.starts_with('[') && value_trimmed.ends_with(']');
 
         let fragment = if is_array {
-            // Convert Python-style single-quoted arrays to TOML double-quoted:
-            // ['a', 'b'] → ["a", "b"]
-            let toml_val = value_trimmed.replace('\'', "\"");
+            // Normalize array values to valid TOML:
+            // 1. Docker/JSON escaped: [\"a\", \"b\"] → ["a", "b"]
+            // 2. Python single-quoted: ['a', 'b'] → ["a", "b"]
+            let toml_val = value_trimmed.replace("\\\"", "\"").replace('\'', "\"");
             format!("[{section}]\n{field} = {toml_val}")
         } else {
             // Scalar value — detect type for proper TOML encoding
@@ -418,6 +419,40 @@ num_max_findings = 5
             settings.ignore.glob
         );
         unsafe { std::env::remove_var("IGNORE.GLOB") };
+    }
+
+    #[test]
+    fn test_dotted_env_var_array_docker_escaped_quotes() {
+        // Docker/Coolify JSON encoding produces backslash-escaped quotes in env vars
+        unsafe {
+            std::env::set_var("IGNORE.GLOB", r#"[\"pnpm-lock.yaml\"]"#);
+        }
+        let settings = load_settings(&HashMap::new(), None, None)
+            .expect("should handle Docker-escaped array env var");
+        assert!(
+            settings.ignore.glob.contains(&"pnpm-lock.yaml".to_string()),
+            "glob should contain pnpm-lock.yaml from Docker-escaped env, got: {:?}",
+            settings.ignore.glob
+        );
+        unsafe { std::env::remove_var("IGNORE.GLOB") };
+    }
+
+    #[test]
+    fn test_dotted_env_var_array_docker_escaped_multi() {
+        // Multiple items with Docker/JSON escaping
+        unsafe {
+            std::env::set_var(
+                "CONFIG.FALLBACK_MODELS",
+                r#"[\"openai/gpt-4\", \"openai/gpt-3.5\"]"#,
+            );
+        }
+        let settings = load_settings(&HashMap::new(), None, None)
+            .expect("should handle multi-item Docker-escaped array");
+        assert_eq!(
+            settings.config.fallback_models,
+            vec!["openai/gpt-4", "openai/gpt-3.5"]
+        );
+        unsafe { std::env::remove_var("CONFIG.FALLBACK_MODELS") };
     }
 
     #[test]
