@@ -145,7 +145,12 @@ fn try_fix_yaml(
         return Some(data);
     }
 
-    tracing::error!("all YAML fallbacks exhausted");
+    let preview = if text.len() > 500 {
+        format!("{}...(truncated {} chars)", &text[..500], text.len() - 500)
+    } else {
+        text.to_string()
+    };
+    tracing::error!(response = %preview, "all YAML fallbacks exhausted");
     None
 }
 
