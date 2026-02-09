@@ -199,10 +199,14 @@ pub fn load_settings(
         let is_array = value_trimmed.starts_with('[') && value_trimmed.ends_with(']');
 
         let fragment = if is_array {
-            // Normalize array values to valid TOML:
-            // 1. Docker/JSON escaped: [\"a\", \"b\"] → ["a", "b"]
-            // 2. Python single-quoted: ['a', 'b'] → ["a", "b"]
-            let toml_val = value_trimmed.replace("\\\"", "\"").replace('\'', "\"");
+            // Normalize array values to valid TOML double-quoted strings.
+            // Docker/Coolify often backslash-escapes quotes in env vars:
+            //   [\'a\'] or [\"a\"] instead of ['a'] or ["a"]
+            // Order: strip escaped quotes first, then normalize ' → "
+            let toml_val = value_trimmed
+                .replace("\\'", "'")
+                .replace("\\\"", "\"")
+                .replace('\'', "\"");
             format!("[{section}]\n{field} = {toml_val}")
         } else {
             // Scalar value — detect type for proper TOML encoding
@@ -435,17 +439,35 @@ num_max_findings = 5
     }
 
     #[test]
-    fn test_dotted_env_var_array_docker_escaped_quotes() {
+    fn test_dotted_env_var_array_docker_escaped_double_quotes() {
         let _guard = ENV_LOCK.lock().unwrap();
-        // Docker/Coolify JSON encoding produces backslash-escaped quotes in env vars
+        // Docker/Coolify may backslash-escape double quotes: [\"val\"]
         unsafe {
             std::env::set_var("IGNORE.GLOB", r#"[\"pnpm-lock.yaml\"]"#);
         }
         let settings = load_settings(&HashMap::new(), None, None)
-            .expect("should handle Docker-escaped array env var");
+            .expect("should handle Docker-escaped double-quoted array");
         assert!(
             settings.ignore.glob.contains(&"pnpm-lock.yaml".to_string()),
             "glob should contain pnpm-lock.yaml from Docker-escaped env, got: {:?}",
+            settings.ignore.glob
+        );
+        unsafe { std::env::remove_var("IGNORE.GLOB") };
+    }
+
+    #[test]
+    fn test_dotted_env_var_array_docker_escaped_single_quotes() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        // Coolify escapes single quotes too: [\'val\'] — this is the actual
+        // production failure mode when the user types ['pnpm-lock.yaml']
+        unsafe {
+            std::env::set_var("IGNORE.GLOB", r"[\'pnpm-lock.yaml\']");
+        }
+        let settings = load_settings(&HashMap::new(), None, None)
+            .expect("should handle Docker-escaped single-quoted array");
+        assert!(
+            settings.ignore.glob.contains(&"pnpm-lock.yaml".to_string()),
+            "glob should contain pnpm-lock.yaml from escaped single-quoted env, got: {:?}",
             settings.ignore.glob
         );
         unsafe { std::env::remove_var("IGNORE.GLOB") };
