@@ -18,17 +18,24 @@ COPY src/ src/
 COPY settings/ settings/
 RUN cargo build --release
 
-# Distroless: ~20 MB base, no shell, no package manager, minimal attack surface.
-# cc-debian12 includes glibc (matching bookworm builder) but nothing else.
-FROM gcr.io/distroless/cc-debian12
+# Minimal runtime: bookworm-slim (~27 MB) with curl for Coolify health checks.
+# Matches the builder's glibc version. Has /bin/sh required by Coolify's
+# health check mechanism (it runs curl inside the container).
+FROM debian:bookworm-slim
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends ca-certificates curl && \
+    rm -rf /var/lib/apt/lists/* && \
+    useradd --system --no-create-home appuser
 
 COPY --from=builder /app/target/release/pr-agent-rs /usr/local/bin/pr-agent-rs
 
+USER appuser
+
 EXPOSE 3000
 
-# Use the binary's built-in health subcommand (no curl/wget needed).
 HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
-    CMD ["/usr/local/bin/pr-agent-rs", "health"]
+    CMD ["curl", "-sf", "http://localhost:3000/"]
 
 ENTRYPOINT ["/usr/local/bin/pr-agent-rs"]
 CMD ["serve"]
