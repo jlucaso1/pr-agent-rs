@@ -177,17 +177,18 @@ impl PRCodeSuggestions {
         // 2. Render prompt
         let rendered = render_prompt(&settings.pr_code_suggestions_prompt, &vars)?;
 
-        // 3. Call AI (generate suggestions)
+        // 3. Call AI (generate suggestions, with fallback models)
         tracing::info!(model, batch = batch_index, "calling AI model for improve");
-        let response = ai
-            .chat_completion(
-                model,
-                &rendered.system,
-                &rendered.user,
-                Some(settings.config.temperature),
-                None,
-            )
-            .await?;
+        let response = crate::ai::chat_completion_with_fallback(
+            ai,
+            model,
+            &settings.config.fallback_models,
+            &rendered.system,
+            &rendered.user,
+            Some(settings.config.temperature),
+            None,
+        )
+        .await?;
 
         tracing::info!(
             tokens = response.usage.as_ref().map_or(0, |u| u.total_tokens),
@@ -280,17 +281,18 @@ impl PRCodeSuggestions {
         // Render reflect prompt
         let rendered = render_prompt(&settings.pr_code_suggestions_reflect_prompt, &vars)?;
 
-        // Call AI (second pass -- reflect)
+        // Call AI (second pass -- reflect, with fallback models)
         tracing::info!(model, "calling AI model for improve reflect pass");
-        let response = ai
-            .chat_completion(
-                model,
-                &rendered.system,
-                &rendered.user,
-                Some(settings.config.temperature),
-                None,
-            )
-            .await?;
+        let response = crate::ai::chat_completion_with_fallback(
+            ai,
+            model,
+            &settings.config.fallback_models,
+            &rendered.system,
+            &rendered.user,
+            Some(settings.config.temperature),
+            None,
+        )
+        .await?;
 
         tracing::info!(
             tokens = response.usage.as_ref().map_or(0, |u| u.total_tokens),

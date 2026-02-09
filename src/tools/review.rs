@@ -79,21 +79,22 @@ impl PRReviewer {
         // 4. Render prompt
         let rendered = render_prompt(&settings.pr_review_prompt, &vars)?;
 
-        // 5. Call AI
+        // 5. Call AI (with fallback models)
         tracing::info!(model, "calling AI model for review");
         let ai: Arc<dyn AiHandler> = match &self.ai {
             Some(ai) => ai.clone(),
             None => Arc::new(OpenAiCompatibleHandler::from_settings()?),
         };
-        let response = ai
-            .chat_completion(
-                model,
-                &rendered.system,
-                &rendered.user,
-                Some(settings.config.temperature),
-                None,
-            )
-            .await?;
+        let response = crate::ai::chat_completion_with_fallback(
+            ai.as_ref(),
+            model,
+            &settings.config.fallback_models,
+            &rendered.system,
+            &rendered.user,
+            Some(settings.config.temperature),
+            None,
+        )
+        .await?;
 
         tracing::info!(
             tokens = response.usage.as_ref().map_or(0, |u| u.total_tokens),
