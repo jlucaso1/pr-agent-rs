@@ -474,15 +474,14 @@ impl GitProvider for GithubProvider {
     async fn get_languages(&self) -> Result<HashMap<String, u64>, PrAgentError> {
         let path = format!("repos/{}/languages", self.repo_full);
         let data = self.api_get(&path).await?;
-        let mut langs = HashMap::new();
-        if let Some(obj) = data.as_object() {
-            for (k, v) in obj {
-                if let Some(n) = v.as_u64() {
-                    langs.insert(k.clone(), n);
-                }
-            }
-        }
-        Ok(langs)
+        Ok(data
+            .as_object()
+            .map(|obj| {
+                obj.iter()
+                    .filter_map(|(k, v)| v.as_u64().map(|n| (k.clone(), n)))
+                    .collect()
+            })
+            .unwrap_or_default())
     }
 
     async fn get_pr_branch(&self) -> Result<String, PrAgentError> {

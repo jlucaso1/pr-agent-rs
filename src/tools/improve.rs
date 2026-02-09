@@ -378,15 +378,14 @@ impl PRCodeSuggestions {
         if threshold > -1 {
             // Dual publishing mode: inline high-scoring + table for all
             let threshold_u32 = threshold.max(0) as u32;
-            let high_scoring: Vec<&ParsedSuggestion> = suggestions
+            let high_scoring: Vec<ParsedSuggestion> = suggestions
                 .iter()
                 .filter(|s| s.score >= threshold_u32)
+                .cloned()
                 .collect();
 
             if !high_scoring.is_empty() {
-                let high_refs: Vec<ParsedSuggestion> =
-                    high_scoring.iter().map(|s| (*s).clone()).collect();
-                let code_suggestions = suggestions_to_code_suggestions(&high_refs);
+                let code_suggestions = suggestions_to_code_suggestions(&high_scoring);
                 if !code_suggestions.is_empty() {
                     match self
                         .provider
@@ -477,9 +476,7 @@ impl PRCodeSuggestions {
             settings.pr_code_suggestions.persistent_comment,
             false,
         )
-        .await?;
-
-        Ok(())
+        .await
     }
 
     /// Print suggestions to stdout (CLI mode).

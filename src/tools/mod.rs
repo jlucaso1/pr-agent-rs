@@ -114,25 +114,19 @@ pub fn build_custom_labels_class(labels: &HashMap<String, CustomLabelEntry>) -> 
 /// Returns a `HashMap` pre-populated with the 8 variables that every tool needs.
 /// Each tool then extends this map with its own tool-specific variables.
 pub fn build_common_vars(meta: &PrMetadata, diff: &str) -> HashMap<String, Value> {
-    let mut vars = HashMap::new();
-    vars.insert("title".into(), Value::from(meta.title.as_str()));
-    vars.insert("branch".into(), Value::from(meta.branch.as_str()));
-    vars.insert("description".into(), Value::from(meta.description.as_str()));
-    vars.insert("language".into(), Value::from(""));
-    vars.insert("diff".into(), Value::from(diff));
-    vars.insert(
-        "commit_messages_str".into(),
-        Value::from(meta.commit_messages.as_str()),
-    );
-    vars.insert(
-        "best_practices_content".into(),
-        Value::from(meta.best_practices.as_str()),
-    );
-    vars.insert(
-        "repo_metadata".into(),
-        Value::from(meta.repo_metadata.as_str()),
-    );
-    vars
+    [
+        ("title", meta.title.as_str()),
+        ("branch", meta.branch.as_str()),
+        ("description", meta.description.as_str()),
+        ("language", ""),
+        ("diff", diff),
+        ("commit_messages_str", meta.commit_messages.as_str()),
+        ("best_practices_content", meta.best_practices.as_str()),
+        ("repo_metadata", meta.repo_metadata.as_str()),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_string(), Value::from(v)))
+    .collect()
 }
 
 /// Insert custom-labels template variables into the vars map.

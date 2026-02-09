@@ -49,9 +49,8 @@ fn format_review_gfm(
 ) {
     out.push_str("<table>\n");
 
-    let mapping = match review.as_mapping() {
-        Some(m) => m,
-        None => return,
+    let Some(mapping) = review.as_mapping() else {
+        return;
     };
 
     for (key, value) in mapping {
@@ -339,9 +338,8 @@ fn format_simple_row(label: &str, value: &serde_yaml_ng::Value, out: &mut String
 
 /// Format review using plain markdown (no HTML tables).
 fn format_review_plain(review: &serde_yaml_ng::Value, out: &mut String) {
-    let mapping = match review.as_mapping() {
-        Some(m) => m,
-        None => return,
+    let Some(mapping) = review.as_mapping() else {
+        return;
     };
 
     for (key, value) in mapping {
@@ -390,25 +388,23 @@ pub(crate) fn is_value_no(text: &str) -> bool {
 
 /// Convert a YAML value to a trimmed display string.
 pub(crate) fn yaml_value_to_string(value: &serde_yaml_ng::Value) -> String {
+    use serde_yaml_ng::Value;
     match value {
-        serde_yaml_ng::Value::String(s) => s.trim().to_string(),
-        serde_yaml_ng::Value::Bool(b) => b.to_string(),
-        serde_yaml_ng::Value::Number(n) => n.to_string(),
-        serde_yaml_ng::Value::Null => String::new(),
-        serde_yaml_ng::Value::Sequence(seq) if seq.is_empty() => String::new(),
-        serde_yaml_ng::Value::Sequence(seq) => seq
+        Value::String(s) => s.trim().to_string(),
+        Value::Bool(b) => b.to_string(),
+        Value::Number(n) => n.to_string(),
+        Value::Null => String::new(),
+        Value::Sequence(seq) if seq.is_empty() => String::new(),
+        Value::Sequence(seq) => seq
             .iter()
             .map(yaml_value_to_string)
             .collect::<Vec<_>>()
             .join(", "),
-        serde_yaml_ng::Value::Mapping(_) => {
-            // For mappings, try to produce something readable
-            serde_yaml_ng::to_string(value)
-                .unwrap_or_default()
-                .trim()
-                .to_string()
-        }
-        serde_yaml_ng::Value::Tagged(tagged) => yaml_value_to_string(&tagged.value),
+        Value::Mapping(_) => serde_yaml_ng::to_string(value)
+            .unwrap_or_default()
+            .trim()
+            .to_string(),
+        Value::Tagged(tagged) => yaml_value_to_string(&tagged.value),
     }
 }
 

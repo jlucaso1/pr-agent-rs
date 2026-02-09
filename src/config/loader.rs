@@ -236,31 +236,30 @@ pub fn load_settings(
 
 /// Convert a CLI override like "pr_reviewer.num_max_findings=5" into a TOML fragment.
 fn cli_override_to_toml(key: &str, value: &str) -> Option<String> {
-    let parts: Vec<&str> = key.splitn(2, '.').collect();
-    if parts.len() == 2 {
-        let section = parts[0];
-        let field = parts[1];
-        // Try to detect type: bool, int, float, or string
-        let is_literal = value == "true"
-            || value == "false"
-            || value.parse::<i64>().is_ok()
-            || value.parse::<f64>().is_ok();
-        let toml_value = if is_literal {
-            value.to_string()
-        } else {
-            let escaped = value
-                .replace('\\', "\\\\")
-                .replace('"', "\\\"")
-                .replace('\n', "\\n")
-                .replace('\r', "\\r")
-                .replace('\t', "\\t");
-            format!("\"{escaped}\"")
-        };
-        Some(format!("[{section}]\n{field} = {toml_value}"))
+    let (section, field) = match key.split_once('.') {
+        Some(pair) => pair,
+        None => {
+            tracing::warn!("ignoring CLI override with no section: {key}={value}");
+            return None;
+        }
+    };
+    // Try to detect type: bool, int, float, or string
+    let is_literal = value == "true"
+        || value == "false"
+        || value.parse::<i64>().is_ok()
+        || value.parse::<f64>().is_ok();
+    let toml_value = if is_literal {
+        value.to_string()
     } else {
-        tracing::warn!("ignoring CLI override with no section: {key}={value}");
-        None
-    }
+        let escaped = value
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('\n', "\\n")
+            .replace('\r', "\\r")
+            .replace('\t', "\\t");
+        format!("\"{escaped}\"")
+    };
+    Some(format!("[{section}]\n{field} = {toml_value}"))
 }
 
 #[cfg(test)]

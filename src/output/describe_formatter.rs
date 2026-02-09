@@ -387,31 +387,24 @@ fn capitalize_first(s: &str) -> String {
 
 /// Extract label strings from the YAML data.
 fn extract_labels(data: &serde_yaml_ng::Value, pr_type: &str) -> Vec<String> {
-    let mut labels = Vec::new();
-
     // From explicit "labels" field
-    if let Some(label_val) = data.get("labels")
-        && let Some(seq) = label_val.as_sequence()
-    {
-        for item in seq {
-            if let Some(s) = item.as_str() {
-                labels.push(s.to_string());
-            }
+    if let Some(seq) = data.get("labels").and_then(|v| v.as_sequence()) {
+        let labels: Vec<String> = seq
+            .iter()
+            .filter_map(|item| item.as_str().map(String::from))
+            .collect();
+        if !labels.is_empty() {
+            return labels;
         }
     }
 
-    // From pr_type if no explicit labels
-    if labels.is_empty() && !pr_type.is_empty() {
-        // Split comma-separated types
-        for t in pr_type.split(',') {
-            let trimmed = t.trim();
-            if !trimmed.is_empty() {
-                labels.push(trimmed.to_string());
-            }
-        }
-    }
-
-    labels
+    // Fallback: split comma-separated pr_type
+    pr_type
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .collect()
 }
 
 #[cfg(test)]

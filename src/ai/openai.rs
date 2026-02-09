@@ -82,13 +82,7 @@ impl OpenAiCompatibleHandler {
         }
 
         // Handle images if present
-        let has_images = image_urls.is_some_and(|urls| !urls.is_empty());
-        if has_images {
-            // SAFETY: has_images is only true when image_urls.is_some_and(|urls| !urls.is_empty())
-            let urls = match image_urls {
-                Some(urls) => urls,
-                None => &[],
-            };
+        if let Some(urls) = image_urls.filter(|u| !u.is_empty()) {
             let mut content = vec![json!({"type": "text", "text": usr_msg})];
             for url in urls {
                 content.push(json!({
@@ -108,11 +102,8 @@ impl OpenAiCompatibleHandler {
 
         // Temperature
         if caps.supports_temperature && !settings.config.custom_reasoning_model {
-            if let Some(temp) = temperature {
-                body["temperature"] = json!(temp);
-            } else {
-                body["temperature"] = json!(settings.config.temperature);
-            }
+            let temp = temperature.unwrap_or(settings.config.temperature);
+            body["temperature"] = json!(temp);
         }
 
         // Reasoning effort (for o3/o4-mini models)
