@@ -4,7 +4,6 @@ use std::sync::Arc;
 use minijinja::Value;
 
 use crate::ai::AiHandler;
-use crate::ai::openai::OpenAiCompatibleHandler;
 use crate::config::loader::get_settings;
 use crate::config::types::Settings;
 use crate::error::PrAgentError;
@@ -81,10 +80,7 @@ impl PRReviewer {
 
         // 5. Call AI (with fallback models)
         tracing::info!(model, "calling AI model for review");
-        let ai: Arc<dyn AiHandler> = match &self.ai {
-            Some(ai) => ai.clone(),
-            None => Arc::new(OpenAiCompatibleHandler::from_settings()?),
-        };
+        let ai = super::resolve_ai_handler(&self.ai)?;
         let response = crate::ai::chat_completion_with_fallback(
             ai.as_ref(),
             model,

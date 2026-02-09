@@ -8,10 +8,22 @@ use std::sync::Arc;
 
 use minijinja::Value;
 
+use crate::ai::AiHandler;
+use crate::ai::openai::OpenAiCompatibleHandler;
 use crate::config::loader::{get_settings, load_settings, with_settings};
 use crate::config::types::{CustomLabelEntry, Settings};
 use crate::error::PrAgentError;
 use crate::git::GitProvider;
+
+/// Resolve the AI handler: use the injected one or create from settings.
+pub fn resolve_ai_handler(
+    injected: &Option<Arc<dyn AiHandler>>,
+) -> Result<Arc<dyn AiHandler>, PrAgentError> {
+    match injected {
+        Some(ai) => Ok(ai.clone()),
+        None => Ok(Arc::new(OpenAiCompatibleHandler::from_settings()?)),
+    }
+}
 
 /// Common PR metadata fetched once and shared across tool pipelines.
 ///

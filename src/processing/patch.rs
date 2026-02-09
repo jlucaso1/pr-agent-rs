@@ -1,3 +1,5 @@
+use std::fmt::Write;
+
 use super::diff::HunkHeader;
 
 /// Extend a unified diff patch by adding extra context lines from the original file.
@@ -88,16 +90,17 @@ fn extend_and_write_hunk(
     let ext_size2 = header.size2 + lines_added_before + lines_added_after;
 
     // Write extended header
-    output.push_str(&format!(
-        "@@ -{},{} +{},{} @@ {}\n",
+    let _ = writeln!(
+        output,
+        "@@ -{},{} +{},{} @@ {}",
         ext_start1, ext_size1, ext_start2, ext_size2, header.section_header
-    ));
+    );
 
     // Prepend context lines before
     for i in 0..lines_added_before {
         let idx = ext_start1 - 1 + i; // 0-based index
         if idx < original_lines.len() {
-            output.push_str(&format!(" {}\n", original_lines[idx]));
+            let _ = writeln!(output, " {}", original_lines[idx]);
         }
     }
 
@@ -111,7 +114,7 @@ fn extend_and_write_hunk(
     for i in 0..lines_added_after {
         let idx = hunk_end1 - 1 + i; // 0-based index
         if idx < original_lines.len() {
-            output.push_str(&format!(" {}\n", original_lines[idx]));
+            let _ = writeln!(output, " {}", original_lines[idx]);
         }
     }
 }

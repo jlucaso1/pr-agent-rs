@@ -251,17 +251,18 @@ fn fallback_extract_by_keys(
 
 /// Fallback 5: Replace leading '+' with space (AI sometimes adds diff markers).
 fn fallback_remove_leading_plus(text: &str) -> Option<serde_yaml_ng::Value> {
-    let fixed: String = text
-        .lines()
-        .map(|line| {
-            if let Some(rest) = line.strip_prefix('+') {
-                format!(" {rest}")
-            } else {
-                line.to_string()
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
+    use std::fmt::Write;
+    let mut fixed = String::with_capacity(text.len());
+    for (i, line) in text.lines().enumerate() {
+        if i > 0 {
+            fixed.push('\n');
+        }
+        if let Some(rest) = line.strip_prefix('+') {
+            let _ = write!(fixed, " {rest}");
+        } else {
+            fixed.push_str(line);
+        }
+    }
     try_parse(&fixed)
 }
 
@@ -280,12 +281,15 @@ static YAML_KEY_RE: LazyLock<Regex> =
 /// YAML parsing fails. This adds indentation to content lines following
 /// `key: |` until the next YAML key at the same or lower indentation level.
 fn fallback_fix_code_indent(text: &str, _keys: &[&str]) -> Option<serde_yaml_ng::Value> {
-    let lines: Vec<&str> = text.lines().collect();
-    let mut result: Vec<String> = Vec::with_capacity(lines.len());
+    use std::fmt::Write;
+    let mut result = String::with_capacity(text.len());
     let mut in_block_scalar = false;
     let mut key_indent: usize = 0;
 
-    for line in &lines {
+    for (i, line) in text.lines().enumerate() {
+        if i > 0 {
+            result.push('\n');
+        }
         let trimmed = line.trim_end();
         let line_indent = line.len() - line.trim_start().len();
         let trimmed_start = trimmed.trim_start();
@@ -299,14 +303,13 @@ fn fallback_fix_code_indent(text: &str, _keys: &[&str]) -> Option<serde_yaml_ng:
 
             if is_yaml_key {
                 in_block_scalar = false;
-                result.push(line.to_string());
+                result.push_str(line);
             } else {
                 // Indent content so it's deeper than the key
-                let extra = " ".repeat(key_indent + 2);
-                result.push(format!("{extra}{line}"));
+                let _ = write!(result, "{:width$}{line}", "", width = key_indent + 2);
             }
         } else {
-            result.push(line.to_string());
+            result.push_str(line);
         }
 
         // Check if this line starts a block scalar (ends with `: |` or `: |-`)
@@ -316,7 +319,7 @@ fn fallback_fix_code_indent(text: &str, _keys: &[&str]) -> Option<serde_yaml_ng:
         }
     }
 
-    try_parse(&result.join("\n"))
+    try_parse(&result)
 }
 
 /// Fallback 8: Remove leading pipe characters.

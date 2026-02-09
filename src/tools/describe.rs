@@ -4,7 +4,6 @@ use std::sync::Arc;
 use minijinja::Value;
 
 use crate::ai::AiHandler;
-use crate::ai::openai::OpenAiCompatibleHandler;
 use crate::config::loader::get_settings;
 use crate::error::PrAgentError;
 use crate::git::GitProvider;
@@ -66,11 +65,7 @@ impl PRDescription {
             .iter()
             .map(|f| {
                 let link = self.provider.get_line_link(&f.filename, -1, None);
-                let key = f
-                    .filename
-                    .to_lowercase()
-                    .trim_start_matches('/')
-                    .to_string();
+                let key = f.filename.trim_start_matches('/').to_lowercase();
                 (
                     key,
                     FileStats {
@@ -90,10 +85,7 @@ impl PRDescription {
 
         // 5. Call AI (with fallback models)
         tracing::info!(model, "calling AI model for describe");
-        let ai: Arc<dyn AiHandler> = match &self.ai {
-            Some(ai) => ai.clone(),
-            None => Arc::new(OpenAiCompatibleHandler::from_settings()?),
-        };
+        let ai = super::resolve_ai_handler(&self.ai)?;
         let response = crate::ai::chat_completion_with_fallback(
             ai.as_ref(),
             model,
@@ -176,12 +168,9 @@ impl PRDescription {
     ) -> Result<(), PrAgentError> {
         let settings = get_settings();
 
-        let data = match yaml_data {
-            Some(d) => d,
-            None => {
-                tracing::warn!("could not parse YAML from AI response, skipping publish");
-                return Ok(());
-            }
+        let Some(data) = yaml_data else {
+            tracing::warn!("could not parse YAML from AI response, skipping publish");
+            return Ok(());
         };
 
         let output = format_describe_output(
@@ -538,20 +527,9 @@ description: "Changes"
     // ── Integration tests ────────────────────────────────────────────
 
     use crate::config::loader::with_settings;
-    use crate::config::types::Settings;
     use crate::testing::fixtures::{DESCRIBE_YAML, SAMPLE_PATCH, sample_diff_file};
     use crate::testing::mock_ai::MockAiHandler;
     use crate::testing::mock_git::MockGitProvider;
-
-    fn test_settings() -> Arc<Settings> {
-        let mut overrides = std::collections::HashMap::new();
-        overrides.insert("config.publish_output".into(), "true".into());
-        overrides.insert("config.publish_output_progress".into(), "false".into());
-        Arc::new(
-            crate::config::loader::load_settings(&overrides, None, None)
-                .expect("should load test settings"),
-        )
-    }
 
     #[tokio::test]
     async fn test_describe_pipeline_end_to_end() {

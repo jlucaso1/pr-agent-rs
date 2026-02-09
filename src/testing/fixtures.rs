@@ -63,33 +63,6 @@ pr_files:
       enhancement
 ```"#;
 
-/// Describe AI response with mermaid changes diagram.
-pub const DESCRIBE_YAML_WITH_DIAGRAM: &str = r#"```yaml
-type:
-  - Enhancement
-description: |
-  This PR adds debug output and a variable assignment to the main function.
-title: |
-  Add debug output to main function
-changes_diagram: |
-  ```mermaid
-  graph LR
-  A[main] --> B[println]
-  A --> C[dbg]
-  ```
-pr_files:
-  - filename: |
-      src/main.rs
-    language: |
-      Rust
-    changes_summary: |
-      Added variable assignment and debug output
-    changes_title: |
-      Add debug logging
-    label: |
-      enhancement
-```"#;
-
 /// Improve AI response — suggestion pass (matches pr_code_suggestions_prompts.toml schema).
 pub const IMPROVE_YAML_PASS1: &str = r#"```yaml
 code_suggestions:

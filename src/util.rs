@@ -1,25 +1,28 @@
 use std::collections::HashMap;
-use std::sync::{LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 
 use regex::Regex;
 
 /// Thread-safe cache for compiled regexes.
 ///
 /// Patterns from config (e.g. `ignore_pr_title`) are compiled once and reused.
-static REGEX_CACHE: LazyLock<Mutex<HashMap<String, Regex>>> =
+/// Stored as `Arc<Regex>` so cache hits are a cheap refcount bump instead of
+/// cloning the entire compiled state machine.
+static REGEX_CACHE: LazyLock<Mutex<HashMap<String, Arc<Regex>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Get a compiled regex from the cache, or compile and cache it.
 /// Returns `None` if the pattern is invalid.
-pub fn get_or_compile_regex(pattern: &str) -> Option<Regex> {
+pub fn get_or_compile_regex(pattern: &str) -> Option<Arc<Regex>> {
     let mut cache = REGEX_CACHE.lock().unwrap_or_else(|p| p.into_inner());
     if let Some(re) = cache.get(pattern) {
         return Some(re.clone());
     }
     match Regex::new(pattern) {
         Ok(re) => {
-            cache.insert(pattern.to_string(), re.clone());
-            Some(re)
+            let arc = Arc::new(re);
+            cache.insert(pattern.to_string(), arc.clone());
+            Some(arc)
         }
         Err(_) => None,
     }

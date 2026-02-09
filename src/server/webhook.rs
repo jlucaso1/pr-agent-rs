@@ -213,6 +213,28 @@ fn should_ignore_pr(settings: &Settings, title: &str, author: &str) -> bool {
     false
 }
 
+/// Fetch an optional TOML settings file, logging success/failure.
+async fn fetch_optional_toml(
+    enabled: bool,
+    fetch: impl std::future::Future<Output = Result<Option<String>, crate::error::PrAgentError>>,
+    label: &str,
+) -> Option<String> {
+    if !enabled {
+        return None;
+    }
+    match fetch.await {
+        Ok(Some(toml)) => {
+            tracing::info!("loaded {label} .pr_agent.toml for webhook request");
+            Some(toml)
+        }
+        Ok(None) => None,
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to fetch {label} settings");
+            None
+        }
+    }
+}
+
 /// Fetch global org-level and repo-level settings, then build a scoped `Arc<Settings>`.
 ///
 /// Returns `Some(settings)` if any overrides were loaded, `None` if neither exists.
@@ -220,37 +242,19 @@ async fn fetch_scoped_settings(
     provider: &dyn GitProvider,
     settings: &Settings,
 ) -> Option<Arc<Settings>> {
-    let global_toml = if settings.config.use_global_settings_file {
-        match provider.get_global_settings().await {
-            Ok(Some(toml)) => {
-                tracing::info!("loaded global org-level .pr_agent.toml for webhook request");
-                Some(toml)
-            }
-            Ok(None) => None,
-            Err(e) => {
-                tracing::warn!(error = %e, "failed to fetch global settings");
-                None
-            }
-        }
-    } else {
-        None
-    };
+    let global_toml = fetch_optional_toml(
+        settings.config.use_global_settings_file,
+        provider.get_global_settings(),
+        "global org-level",
+    )
+    .await;
 
-    let repo_toml = if settings.config.use_repo_settings_file {
-        match provider.get_repo_settings().await {
-            Ok(Some(toml)) => {
-                tracing::info!("loaded repo-level .pr_agent.toml for webhook request");
-                Some(toml)
-            }
-            Ok(None) => None,
-            Err(e) => {
-                tracing::warn!(error = %e, "failed to fetch repo settings");
-                None
-            }
-        }
-    } else {
-        None
-    };
+    let repo_toml = fetch_optional_toml(
+        settings.config.use_repo_settings_file,
+        provider.get_repo_settings(),
+        "repo-level",
+    )
+    .await;
 
     if global_toml.is_some() || repo_toml.is_some() {
         match load_settings(

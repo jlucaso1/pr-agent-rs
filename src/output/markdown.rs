@@ -41,15 +41,14 @@ pub fn markdown_table(headers: &[&str], rows: &[Vec<String>]) -> String {
     let _ = writeln!(out, "| {} |", headers.join(" | "));
 
     // Separator
-    let _ = writeln!(
-        out,
-        "| {} |",
-        headers
-            .iter()
-            .map(|_| "---")
-            .collect::<Vec<_>>()
-            .join(" | ")
-    );
+    out.push_str("| ");
+    for (i, _) in headers.iter().enumerate() {
+        if i > 0 {
+            out.push_str(" | ");
+        }
+        out.push_str("---");
+    }
+    let _ = writeln!(out, " |");
 
     // Data rows
     for row in rows {
@@ -62,11 +61,14 @@ pub fn markdown_table(headers: &[&str], rows: &[Vec<String>]) -> String {
 /// Format a list of items as a Markdown bulleted list.
 #[allow(dead_code)]
 pub fn bullet_list(items: &[String]) -> String {
-    items
-        .iter()
-        .map(|item| format!("- {item}"))
-        .collect::<Vec<_>>()
-        .join("\n")
+    let mut out = String::new();
+    for (i, item) in items.iter().enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        let _ = write!(out, "- {item}");
+    }
+    out
 }
 
 /// Build an HTML bulleted list (`<ul>/<li>`).

@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::fmt::Write;
 
 use async_trait::async_trait;
 use base64::Engine;
@@ -880,7 +881,7 @@ impl GitProvider for GithubProvider {
                     if !combined.is_empty() {
                         combined.push_str("\n\n");
                     }
-                    combined.push_str(&format!("## From {}:\n{}", filename, content));
+                    let _ = write!(combined, "## From {}:\n{}", filename, content);
                     tracing::info!(file = %filename, "loaded repo metadata file");
                 }
                 _ => {

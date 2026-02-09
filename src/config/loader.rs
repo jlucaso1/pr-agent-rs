@@ -210,21 +210,7 @@ pub fn load_settings(
             format!("[{section}]\n{field} = {toml_val}")
         } else {
             // Scalar value — detect type for proper TOML encoding
-            let is_literal = value_trimmed == "true"
-                || value_trimmed == "false"
-                || value_trimmed.parse::<i64>().is_ok()
-                || value_trimmed.parse::<f64>().is_ok();
-            let toml_value = if is_literal {
-                value_trimmed.to_string()
-            } else {
-                let escaped = value_trimmed
-                    .replace('\\', "\\\\")
-                    .replace('"', "\\\"")
-                    .replace('\n', "\\n")
-                    .replace('\r', "\\r")
-                    .replace('\t', "\\t");
-                format!("\"{escaped}\"")
-            };
+            let toml_value = encode_toml_scalar(value_trimmed);
             format!("[{section}]\n{field} = {toml_value}")
         };
         figment = figment.merge(Toml::string(&fragment));
@@ -232,6 +218,25 @@ pub fn load_settings(
 
     let settings: Settings = figment.extract()?;
     Ok(settings)
+}
+
+/// Encode a scalar value as a TOML literal (bool/int/float) or escaped string.
+fn encode_toml_scalar(value: &str) -> String {
+    let is_literal = value == "true"
+        || value == "false"
+        || value.parse::<i64>().is_ok()
+        || value.parse::<f64>().is_ok();
+    if is_literal {
+        value.to_string()
+    } else {
+        let escaped = value
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('\n', "\\n")
+            .replace('\r', "\\r")
+            .replace('\t', "\\t");
+        format!("\"{escaped}\"")
+    }
 }
 
 /// Convert a CLI override like "pr_reviewer.num_max_findings=5" into a TOML fragment.
@@ -243,22 +248,7 @@ fn cli_override_to_toml(key: &str, value: &str) -> Option<String> {
             return None;
         }
     };
-    // Try to detect type: bool, int, float, or string
-    let is_literal = value == "true"
-        || value == "false"
-        || value.parse::<i64>().is_ok()
-        || value.parse::<f64>().is_ok();
-    let toml_value = if is_literal {
-        value.to_string()
-    } else {
-        let escaped = value
-            .replace('\\', "\\\\")
-            .replace('"', "\\\"")
-            .replace('\n', "\\n")
-            .replace('\r', "\\r")
-            .replace('\t', "\\t");
-        format!("\"{escaped}\"")
-    };
+    let toml_value = encode_toml_scalar(value);
     Some(format!("[{section}]\n{field} = {toml_value}"))
 }
 

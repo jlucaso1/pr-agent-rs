@@ -35,9 +35,8 @@ pub fn parse_suggestions(data: &serde_yaml_ng::Value) -> Vec<ParsedSuggestion> {
         .or(data.get("improve"))
         .unwrap_or(data);
 
-    let seq = match suggestions_val.as_sequence() {
-        Some(s) => s,
-        None => return Vec::new(),
+    let Some(seq) = suggestions_val.as_sequence() else {
+        return Vec::new();
     };
 
     let mut suggestions = Vec::new();

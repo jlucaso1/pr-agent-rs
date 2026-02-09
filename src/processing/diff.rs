@@ -64,15 +64,15 @@ pub fn convert_to_hunks_with_line_numbers(file: &FilePatchInfo) -> String {
 
         if line.starts_with('+') {
             has_plus = true;
-            new_content.push(format!("{} {}\n", line_number, line));
+            new_content.push(format!("{line_number} {line}\n"));
             line_number += 1;
         } else if line.starts_with('-') {
             has_minus = true;
-            old_content.push(format!("{}\n", line));
+            old_content.push(format!("{line}\n"));
         } else {
             // Context line — goes to both
-            new_content.push(format!("{} {}\n", line_number, line));
-            old_content.push(format!("{}\n", line));
+            new_content.push(format!("{line_number} {line}\n"));
+            old_content.push(format!("{line}\n"));
             line_number += 1;
         }
     }

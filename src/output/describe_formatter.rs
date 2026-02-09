@@ -307,11 +307,7 @@ fn write_file_row(out: &mut String, entry: &FileEntry, file_stats: &HashMap<Stri
     };
 
     // Look up diff stats (case-insensitive, strip leading '/')
-    let lookup_key = entry
-        .filename
-        .to_lowercase()
-        .trim_start_matches('/')
-        .to_string();
+    let lookup_key = entry.filename.trim_start_matches('/').to_lowercase();
     let (diff_pm, delta_nbsp, link) = if let Some(stats) = file_stats.get(&lookup_key) {
         let mut pm = format!("+{}/-{}", stats.num_plus_lines, stats.num_minus_lines);
         if pm.len() > 12 || pm == "+0/-0" {

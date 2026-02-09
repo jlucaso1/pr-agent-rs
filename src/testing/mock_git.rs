@@ -9,9 +9,9 @@ use crate::git::types::*;
 
 /// Captured calls made to the mock provider, for test assertions.
 #[derive(Debug, Default)]
+#[allow(dead_code)]
 pub struct MockCalls {
     pub comments: Vec<(String, bool)>,
-    pub persistent_comments: Vec<(String, String)>,
     pub descriptions: Vec<(String, String)>,
     pub labels: Vec<Vec<String>>,
     pub removed_comments: Vec<String>,
@@ -60,11 +60,6 @@ impl MockGitProvider {
     pub fn with_pr_description(mut self, title: &str, description: &str) -> Self {
         self.title = title.into();
         self.description = description.into();
-        self
-    }
-
-    pub fn with_issue_comments(mut self, comments: Vec<IssueComment>) -> Self {
-        self.issue_comments = comments;
         self
     }
 

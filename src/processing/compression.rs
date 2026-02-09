@@ -102,7 +102,7 @@ pub fn get_pr_diff(
 
     // 5. Append unprocessed file lists if space remains
     let final_diff = append_remaining_file_lists(
-        &result.patches,
+        result.patches,
         result.total_tokens,
         max_tokens,
         files,
@@ -234,7 +234,7 @@ fn generate_full_patch(
 /// If there is remaining token budget after compression, append lists of
 /// unprocessed files grouped by edit type (added, modified, deleted).
 fn append_remaining_file_lists(
-    patches: &str,
+    patches: String,
     current_tokens: u32,
     max_tokens: u32,
     all_files: &[FilePatchInfo],
@@ -244,7 +244,7 @@ fn append_remaining_file_lists(
     let delta_tokens: u32 = 10;
 
     if budget <= current_tokens + delta_tokens {
-        return patches.to_string();
+        return patches;
     }
 
     let mut remaining_budget = budget - current_tokens;
@@ -268,7 +268,7 @@ fn append_remaining_file_lists(
         }
     }
 
-    let mut result = patches.to_string();
+    let mut result = patches;
 
     // Helper closure: format and append a file list
     let mut append_list = |label: &str, files: &[&str], budget: &mut u32| {
@@ -329,7 +329,7 @@ pub fn get_pr_diff_multiple_patches(
             break;
         }
         let result = generate_full_patch(&file_dict, max_tokens, &remaining);
-        remaining = result.remaining_files.clone();
+        remaining.clone_from(&result.remaining_files);
         batches.push(result);
     }
 
@@ -452,7 +452,7 @@ mod tests {
         ];
 
         let result = append_remaining_file_lists(
-            "existing patch",
+            "existing patch".to_string(),
             100,
             100_000,
             &files,

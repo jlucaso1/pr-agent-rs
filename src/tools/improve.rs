@@ -4,7 +4,6 @@ use std::sync::Arc;
 use minijinja::Value;
 
 use crate::ai::AiHandler;
-use crate::ai::openai::OpenAiCompatibleHandler;
 use crate::config::loader::get_settings;
 use crate::error::PrAgentError;
 use crate::git::GitProvider;
@@ -75,10 +74,7 @@ impl PRCodeSuggestions {
             return Ok(());
         }
 
-        let ai: Arc<dyn AiHandler> = match &self.ai {
-            Some(ai) => ai.clone(),
-            None => Arc::new(OpenAiCompatibleHandler::from_settings()?),
-        };
+        let ai = super::resolve_ai_handler(&self.ai)?;
         let num_batches = batches_no_lines.len();
         tracing::info!(num_batches, num_files, "processing PR in extended mode");
 
