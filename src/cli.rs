@@ -267,32 +267,17 @@ pub async fn run() -> Result<(), PrAgentError> {
     Ok(())
 }
 
-/// Lightweight health check: GET http://127.0.0.1:$PORT/ with a 5s timeout.
-///
-/// Used by Docker HEALTHCHECK in distroless images where curl is unavailable.
+/// TCP connect health check for Docker HEALTHCHECK.
 async fn health_check() -> Result<(), PrAgentError> {
     let port: u16 = std::env::var("PORT")
         .ok()
         .and_then(|p| p.parse().ok())
         .unwrap_or(3000);
-    let url = format!("http://127.0.0.1:{port}/");
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(5))
-        .build()
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    let timeout = std::time::Duration::from_secs(5);
+    std::net::TcpStream::connect_timeout(&addr, timeout)
         .map_err(|e| PrAgentError::Other(format!("health check failed: {e}")))?;
-    let resp = client
-        .get(&url)
-        .send()
-        .await
-        .map_err(|e| PrAgentError::Other(format!("health check failed: {e}")))?;
-    if resp.status().is_success() {
-        Ok(())
-    } else {
-        Err(PrAgentError::Other(format!(
-            "health check failed: status {}",
-            resp.status()
-        )))
-    }
+    Ok(())
 }
 
 #[cfg(test)]

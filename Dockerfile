@@ -18,13 +18,10 @@ COPY src/ src/
 COPY settings/ settings/
 RUN cargo build --release
 
-# Minimal runtime: bookworm-slim (~27 MB) with curl for Coolify health checks.
-# Matches the builder's glibc version. Has /bin/sh required by Coolify's
-# health check mechanism (it runs curl inside the container).
 FROM debian:bookworm-slim
 
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends ca-certificates curl && \
+    apt-get install -y --no-install-recommends ca-certificates && \
     rm -rf /var/lib/apt/lists/* && \
     useradd --system --no-create-home appuser
 
@@ -35,7 +32,7 @@ USER appuser
 EXPOSE 3000
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
-    CMD ["curl", "-sf", "http://localhost:3000/"]
+    CMD ["pr-agent-rs", "health"]
 
 ENTRYPOINT ["/usr/local/bin/pr-agent-rs"]
 CMD ["serve"]
