@@ -1,4 +1,4 @@
-FROM rust:1-slim AS builder
+FROM rust:1-slim-bookworm AS builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     pkg-config cmake perl gcc g++ && \
@@ -16,23 +16,19 @@ RUN mkdir src && echo "fn main() {}" > src/main.rs && \
 # Now copy real source and rebuild (only recompiles our crate, deps are cached)
 COPY src/ src/
 COPY settings/ settings/
-RUN cargo build --release && strip target/release/pr-agent-rs
+RUN cargo build --release
 
-FROM debian:bookworm-slim
-
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates curl && \
-    rm -rf /var/lib/apt/lists/* && \
-    groupadd --system appuser && useradd --system --gid appuser appuser
+# Distroless: ~20 MB base, no shell, no package manager, minimal attack surface.
+# cc-debian12 includes glibc (matching bookworm builder) but nothing else.
+FROM gcr.io/distroless/cc-debian12
 
 COPY --from=builder /app/target/release/pr-agent-rs /usr/local/bin/pr-agent-rs
 
-USER appuser
-
 EXPOSE 3000
 
+# Use the binary's built-in health subcommand (no curl/wget needed).
 HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
-    CMD ["curl", "-f", "http://localhost:3000/"]
+    CMD ["/usr/local/bin/pr-agent-rs", "health"]
 
 ENTRYPOINT ["/usr/local/bin/pr-agent-rs"]
 CMD ["serve"]

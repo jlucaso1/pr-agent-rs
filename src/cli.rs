@@ -64,6 +64,8 @@ pub enum Command {
     Config,
     /// Start the webhook server.
     Serve,
+    /// Check if the server is healthy (for Docker HEALTHCHECK).
+    Health,
 }
 
 impl Command {
@@ -84,6 +86,7 @@ impl Command {
             Command::SimilarIssue => "similar_issue",
             Command::Config => "config",
             Command::Serve => "serve",
+            Command::Health => "health",
         }
     }
 }
@@ -166,6 +169,11 @@ fn parse_config_overrides(rest: &[String]) -> Result<HashMap<String, String>, Pr
 
 pub async fn run() -> Result<(), PrAgentError> {
     let cli = Cli::parse();
+
+    // Health check runs before any settings init — fast, lightweight.
+    if cli.command == Command::Health {
+        return health_check().await;
+    }
 
     let config_overrides = parse_config_overrides(&cli.rest)?;
 
@@ -257,6 +265,34 @@ pub async fn run() -> Result<(), PrAgentError> {
     }
 
     Ok(())
+}
+
+/// Lightweight health check: GET http://127.0.0.1:$PORT/ with a 5s timeout.
+///
+/// Used by Docker HEALTHCHECK in distroless images where curl is unavailable.
+async fn health_check() -> Result<(), PrAgentError> {
+    let port: u16 = std::env::var("PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(3000);
+    let url = format!("http://127.0.0.1:{port}/");
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .map_err(|e| PrAgentError::Other(format!("health check failed: {e}")))?;
+    let resp = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| PrAgentError::Other(format!("health check failed: {e}")))?;
+    if resp.status().is_success() {
+        Ok(())
+    } else {
+        Err(PrAgentError::Other(format!(
+            "health check failed: status {}",
+            resp.status()
+        )))
+    }
 }
 
 #[cfg(test)]
