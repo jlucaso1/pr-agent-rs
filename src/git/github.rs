@@ -824,6 +824,63 @@ impl GitProvider for GithubProvider {
         Ok(())
     }
 
+    async fn reply_to_comment(&self, comment_id: u64, body: &str) -> Result<(), PrAgentError> {
+        // GitHub API: POST /repos/{owner}/{repo}/pulls/{pull_number}/comments/{comment_id}/replies
+        let path = format!(
+            "repos/{}/pulls/{}/comments/{comment_id}/replies",
+            self.repo_full, self.parsed.pr_number
+        );
+        self.api_post(&path, &json!({"body": body})).await?;
+        Ok(())
+    }
+
+    async fn get_review_thread_comments(
+        &self,
+        comment_id: u64,
+    ) -> Result<Vec<IssueComment>, PrAgentError> {
+        // Fetch all pull request review comments, then filter to the same thread.
+        // GitHub doesn't have a direct "get thread" API — we fetch all review comments
+        // and filter by in_reply_to_id chain.
+        let path = format!(
+            "repos/{}/pulls/{}/comments?per_page=100",
+            self.repo_full, self.parsed.pr_number
+        );
+        let items = self.api_get_all_pages(&path).await?;
+
+        // Build a set of comment IDs in the same thread.
+        // The thread root is the comment that has no in_reply_to_id.
+        // All replies point to the root via in_reply_to_id.
+        let mut thread_root = comment_id;
+        for item in &items {
+            if item["id"].as_u64() == Some(comment_id) {
+                if let Some(root) = item["in_reply_to_id"].as_u64() {
+                    thread_root = root;
+                }
+                break;
+            }
+        }
+
+        let comments: Vec<IssueComment> = items
+            .iter()
+            .filter(|c| {
+                let id = c["id"].as_u64().unwrap_or(0);
+                let reply_to = c["in_reply_to_id"].as_u64().unwrap_or(0);
+                id == thread_root || reply_to == thread_root
+            })
+            .filter_map(|c| {
+                Some(IssueComment {
+                    id: c["id"].as_u64()?,
+                    body: c["body"].as_str().unwrap_or_default().to_string(),
+                    user: c["user"]["login"].as_str().unwrap_or_default().to_string(),
+                    created_at: c["created_at"].as_str().unwrap_or_default().to_string(),
+                    url: c["html_url"].as_str().map(|s| s.to_string()),
+                })
+            })
+            .collect();
+
+        Ok(comments)
+    }
+
     async fn get_latest_commit_url(&self) -> Result<String, PrAgentError> {
         let path = format!(
             "repos/{}/pulls/{}/commits?per_page=100",

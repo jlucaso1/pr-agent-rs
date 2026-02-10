@@ -1,3 +1,5 @@
+pub mod ask;
+pub mod ask_line;
 pub mod describe;
 pub mod improve;
 pub mod review;
@@ -185,9 +187,11 @@ pub async fn publish_as_comment(
     Ok(())
 }
 
-/// Parse a "/command --arg=value" string into (command_name, args_overrides).
+/// Parse a "/command --arg=value text" string into (command_name, args_overrides).
 ///
 /// Splits on whitespace and extracts `--key=value` pairs as config overrides.
+/// Non-flag words (without `--` prefix or without `=`) are collected into
+/// the `_text` key — used by /ask and /ask_line for the question text.
 /// Security-sensitive keys (secrets, auth, URLs) are dropped with a warning log.
 pub fn parse_command(input: &str) -> (String, HashMap<String, String>) {
     let trimmed = input.trim();
@@ -199,21 +203,30 @@ pub fn parse_command(input: &str) -> (String, HashMap<String, String>) {
         .to_lowercase();
 
     let mut overrides = HashMap::new();
+    let mut text_parts: Vec<&str> = Vec::new();
     for part in parts {
-        let stripped = part.trim_start_matches('-');
-        // Convert double underscore to dot
-        let stripped = stripped.replace("__", ".");
-        if let Some((key, value)) = stripped.split_once('=') {
-            if let Some(forbidden) = crate::cli::check_forbidden_key(key) {
-                tracing::warn!(
-                    key,
-                    forbidden,
-                    "dropping forbidden override from comment command"
-                );
-                continue;
+        if part.starts_with('-') && part.contains('=') {
+            let stripped = part.trim_start_matches('-');
+            // Convert double underscore to dot
+            let stripped = stripped.replace("__", ".");
+            if let Some((key, value)) = stripped.split_once('=') {
+                if let Some(forbidden) = crate::cli::check_forbidden_key(key) {
+                    tracing::warn!(
+                        key,
+                        forbidden,
+                        "dropping forbidden override from comment command"
+                    );
+                    continue;
+                }
+                overrides.insert(key.to_string(), value.to_string());
             }
-            overrides.insert(key.to_string(), value.to_string());
+        } else {
+            text_parts.push(part);
         }
+    }
+
+    if !text_parts.is_empty() {
+        overrides.insert("_text".to_string(), text_parts.join(" "));
     }
 
     (command, overrides)
@@ -228,23 +241,47 @@ pub async fn handle_command(
     provider: Arc<dyn GitProvider>,
     args: &HashMap<String, String>,
 ) -> Result<(), PrAgentError> {
-    // If there are per-command args, scope them as settings overrides
-    if !args.is_empty() {
+    // Separate config overrides (key=value flags) from tool data (_text, _diff_hunk, etc.)
+    let config_overrides: HashMap<String, String> = args
+        .iter()
+        .filter(|(k, _)| !k.starts_with('_'))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+
+    // If there are per-command config overrides, scope them as settings overrides
+    if !config_overrides.is_empty() {
         let current = get_settings();
-        // Rebuild settings: start from current base, apply these args as CLI overrides
-        let scoped =
-            Arc::new(load_settings(args, None, None).unwrap_or_else(|_| (*current).clone()));
-        return with_settings(scoped, dispatch(command, provider)).await;
+        let scoped = Arc::new(match load_settings(&config_overrides, None, None) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    ?config_overrides,
+                    "failed to apply command config overrides, using current settings"
+                );
+                (*current).clone()
+            }
+        });
+        return with_settings(scoped, dispatch(command, provider, args)).await;
     }
 
-    dispatch(command, provider).await
+    dispatch(command, provider, args).await
 }
 
-async fn dispatch(command: &str, provider: Arc<dyn GitProvider>) -> Result<(), PrAgentError> {
+async fn dispatch(
+    command: &str,
+    provider: Arc<dyn GitProvider>,
+    args: &HashMap<String, String>,
+) -> Result<(), PrAgentError> {
     match command {
         "review" | "auto_review" | "review_pr" => review::PRReviewer::new(provider).run().await,
         "describe" | "describe_pr" => describe::PRDescription::new(provider).run().await,
         "improve" | "improve_code" => improve::PRCodeSuggestions::new(provider).run().await,
+        "ask" => {
+            let question = args.get("_text").map(|s| s.as_str()).unwrap_or("");
+            ask::PRAsk::new(provider).run(question).await
+        }
+        "ask_line" => ask_line::PRAskLine::new(provider).run(args).await,
         _ => Err(PrAgentError::Other(format!("unknown command: '{command}'"))),
     }
 }
@@ -389,7 +426,8 @@ mod tests {
         use crate::testing::mock_git::MockGitProvider;
 
         let provider = Arc::new(MockGitProvider::new());
-        let result = dispatch("unknown_command", provider).await;
+        let args = HashMap::new();
+        let result = dispatch("unknown_command", provider, &args).await;
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(
@@ -414,9 +452,38 @@ mod tests {
 
     #[test]
     fn test_parse_command_no_value() {
-        // --flag without =value should be ignored
+        // --flag without =value becomes text (not a config override)
         let (cmd, args) = parse_command("/review --verbose");
         assert_eq!(cmd, "review");
-        assert!(args.is_empty(), "flag without = should be skipped");
+        assert!(
+            !args.contains_key("verbose"),
+            "flag without = should not be a config override"
+        );
+        assert_eq!(
+            args.get("_text").unwrap(),
+            "--verbose",
+            "non-flag parts collected as _text"
+        );
+    }
+
+    #[test]
+    fn test_parse_command_ask_with_question() {
+        let (cmd, args) = parse_command("/ask What does this PR do?");
+        assert_eq!(cmd, "ask");
+        assert_eq!(args.get("_text").unwrap(), "What does this PR do?");
+    }
+
+    #[test]
+    fn test_parse_command_ask_line_with_flags_and_text() {
+        let (cmd, args) = parse_command(
+            "/ask_line --line_start=10 --line_end=15 --side=RIGHT --file_name=src/main.rs --comment_id=123 What is this?",
+        );
+        assert_eq!(cmd, "ask_line");
+        assert_eq!(args.get("line_start").unwrap(), "10");
+        assert_eq!(args.get("line_end").unwrap(), "15");
+        assert_eq!(args.get("side").unwrap(), "RIGHT");
+        assert_eq!(args.get("file_name").unwrap(), "src/main.rs");
+        assert_eq!(args.get("comment_id").unwrap(), "123");
+        assert_eq!(args.get("_text").unwrap(), "What is this?");
     }
 }

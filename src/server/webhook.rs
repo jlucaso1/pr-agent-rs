@@ -8,6 +8,7 @@ use sha2::Sha256;
 
 use crate::config::loader::{get_settings, load_settings, with_settings};
 use crate::config::types::Settings;
+use crate::error::PrAgentError;
 use crate::git::GitProvider;
 use crate::git::github::GithubProvider;
 use crate::git::types::CommentId;
@@ -108,13 +109,32 @@ async fn dispatch_event(
         "pull_request" => {
             let pr_url = extract_pr_url(payload)?;
 
-            // Check ignore filters before processing
-            let pr_title = payload["pull_request"]["title"].as_str().unwrap_or("");
-            let pr_author = payload["pull_request"]["user"]["login"]
-                .as_str()
-                .unwrap_or("");
-            if should_ignore_pr(&settings, pr_title, pr_author) {
-                tracing::info!(pr_url = %pr_url, pr_title, pr_author, "ignoring PR (matched ignore filter)");
+            // Bot detection: skip bot PRs (including pr-agent's own events like label changes).
+            // Matches Python's is_bot_user() which returns True for ALL bots — the pr-agent
+            // check only controls the log message, not the filtering.
+            let sender = payload["sender"]["login"].as_str().unwrap_or("");
+            let sender_type = payload["sender"]["type"].as_str().unwrap_or("");
+            if settings.github.ignore_bot_pr && sender_type == "Bot" {
+                if !sender.contains("pr-agent") {
+                    tracing::info!(sender, sender_type, "ignoring PR from bot user");
+                }
+                return Ok(());
+            }
+
+            // Check all ignore filters (title, author, repo, labels, branches)
+            if should_ignore_pr(&settings, payload) {
+                return Ok(());
+            }
+
+            // Handle PR closed/merged event (before state check since closed PRs aren't "open")
+            if action == "closed" {
+                handle_closed_pr(payload);
+                return Ok(());
+            }
+
+            // Validate PR state: skip drafts and non-open PRs
+            if !check_pull_request_event(action, payload) {
+                tracing::info!(pr_url = %pr_url, action, "skipping PR event (draft, not open, or duplicate)");
                 return Ok(());
             }
 
@@ -123,11 +143,47 @@ async fn dispatch_event(
                 .handle_pr_actions
                 .contains(&action.to_string())
             {
-                // New PR opened / reopened / ready_for_review
+                // Check disable_auto_feedback before running auto-commands
+                if settings.config.disable_auto_feedback {
+                    tracing::info!(pr_url = %pr_url, "auto feedback is disabled, skipping pr_commands");
+                    return Ok(());
+                }
+
                 tracing::info!(pr_url = %pr_url, action, "handling PR event");
                 run_commands(&pr_url, &settings.github_app.pr_commands).await?;
             } else if action == "synchronize" && settings.github_app.handle_push_trigger {
-                // New commits pushed
+                // Skip merge commits if configured
+                if settings.github_app.push_trigger_ignore_merge_commits {
+                    let after_sha = payload["after"].as_str().unwrap_or("");
+                    let merge_commit_sha = payload["pull_request"]["merge_commit_sha"]
+                        .as_str()
+                        .unwrap_or("");
+                    if !after_sha.is_empty()
+                        && !merge_commit_sha.is_empty()
+                        && after_sha == merge_commit_sha
+                    {
+                        tracing::info!(pr_url = %pr_url, after_sha, "skipping merge commit push trigger");
+                        return Ok(());
+                    }
+                }
+
+                // Skip identical before/after SHAs (no-op push)
+                let before_sha = payload["before"].as_str().unwrap_or("");
+                let after_sha = payload["after"].as_str().unwrap_or("");
+                if !before_sha.is_empty() && before_sha == after_sha {
+                    tracing::debug!(pr_url = %pr_url, "skipping push trigger: before == after SHA");
+                    return Ok(());
+                }
+
+                // Push deduplication: limit concurrent tasks per PR
+                let _guard = match super::push_dedup::acquire_push_slot(&pr_url).await {
+                    Some(guard) => guard,
+                    None => {
+                        tracing::info!(pr_url = %pr_url, "push trigger deduplicated, skipping");
+                        return Ok(());
+                    }
+                };
+
                 tracing::info!(pr_url = %pr_url, "handling push trigger");
                 run_commands(&pr_url, &settings.github_app.push_commands).await?;
             } else {
@@ -151,26 +207,114 @@ async fn dispatch_event(
                 return Ok(());
             }
 
-            let comment_body = payload["comment"]["body"].as_str().unwrap_or("").trim();
+            let raw_comment = payload["comment"]["body"].as_str().unwrap_or("").trim();
+
+            // Handle image-reply format: "> ![image](url)\n/ask question"
+            // When users quote an image and then write /ask, the command isn't at
+            // the start. Reformat so /ask comes first with the image appended.
+            let comment_body = reformat_image_reply(raw_comment);
+            let comment_body = comment_body.as_str();
 
             if !comment_body.starts_with('/') {
                 tracing::debug!("ignoring non-command comment");
                 return Ok(());
             }
 
-            let pr_url = extract_pr_url_from_issue(payload)?;
+            // Check if this is a line-level /ask comment (code review comment on specific lines).
+            // If so, transform it to /ask_line with the appropriate flags.
+            let mut disable_eyes = false;
+            let comment_body = if comment_body.contains("/ask")
+                && payload["comment"]["subject_type"].as_str() == Some("line")
+                && payload["comment"]["pull_request_url"].as_str().is_some()
+            {
+                disable_eyes = true;
+                handle_line_comments(payload, comment_body)
+            } else {
+                comment_body.to_string()
+            };
+            let comment_body = comment_body.as_str();
+
+            // Extract PR URL — from issue or from review comment's pull_request_url
+            let pr_url = if let Some(url) = payload["comment"]["pull_request_url"].as_str() {
+                url.to_string()
+            } else {
+                extract_pr_url_from_issue(payload)?
+            };
             tracing::info!(pr_url = %pr_url, command = comment_body, "handling comment command");
 
             // Add eyes reaction to the comment
             let comment_id = payload["comment"]["id"].as_u64().unwrap_or(0);
             let provider: Arc<dyn GitProvider> = Arc::new(GithubProvider::new(&pr_url).await?);
-            let _ = provider.add_eyes_reaction(comment_id, false).await;
+            let _ = provider.add_eyes_reaction(comment_id, disable_eyes).await;
 
             // Fetch global + repo settings and scope them for this command
             let scoped_settings = fetch_scoped_settings(provider.as_ref(), &settings).await;
 
             // Parse and dispatch command
-            let (command, args) = tools::parse_command(comment_body);
+            let (command, mut args) = tools::parse_command(comment_body);
+
+            // Inject diff_hunk for ask_line when available
+            if command == "ask_line"
+                && let Some(diff_hunk) = payload["comment"]["diff_hunk"].as_str()
+            {
+                args.insert("_diff_hunk".to_string(), diff_hunk.to_string());
+            }
+
+            if let Some(s) = scoped_settings {
+                with_settings(s, tools::handle_command(&command, provider, &args)).await?;
+            } else {
+                tools::handle_command(&command, provider, &args).await?;
+            }
+        }
+        "pull_request_review_comment" => {
+            if action != "created" {
+                tracing::debug!(action, "ignoring pull_request_review_comment action");
+                return Ok(());
+            }
+
+            let raw_comment = payload["comment"]["body"].as_str().unwrap_or("").trim();
+            let comment_body = reformat_image_reply(raw_comment);
+
+            if !comment_body.contains("/ask") {
+                tracing::debug!("ignoring review comment without /ask command");
+                return Ok(());
+            }
+
+            // Extract PR URL from the review comment payload
+            let pr_url = payload["comment"]["pull_request_url"]
+                .as_str()
+                .map(|u| u.to_string())
+                .or_else(|| {
+                    payload["pull_request"]["url"]
+                        .as_str()
+                        .map(|u| u.to_string())
+                })
+                .ok_or_else(|| {
+                    PrAgentError::Other("no pull_request_url in review comment".into())
+                })?;
+
+            // Transform line comment to /ask_line command
+            let transformed = handle_line_comments(payload, &comment_body);
+            tracing::info!(
+                pr_url = %pr_url,
+                command = %transformed,
+                "handling line comment command"
+            );
+
+            // Add eyes reaction (disabled for line comments to avoid noise)
+            let comment_id = payload["comment"]["id"].as_u64().unwrap_or(0);
+            let provider: Arc<dyn GitProvider> = Arc::new(GithubProvider::new(&pr_url).await?);
+            let _ = provider.add_eyes_reaction(comment_id, true).await;
+
+            let scoped_settings = fetch_scoped_settings(provider.as_ref(), &settings).await;
+            let (command, args) = tools::parse_command(&transformed);
+
+            // Inject the diff_hunk from the webhook payload for ask_line
+            let mut args = args;
+            if let Some(diff_hunk) = payload["comment"]["diff_hunk"].as_str() {
+                args.insert("_diff_hunk".to_string(), diff_hunk.to_string());
+            }
+
             if let Some(s) = scoped_settings {
                 with_settings(s, tools::handle_command(&command, provider, &args)).await?;
             } else {
@@ -185,14 +329,62 @@ async fn dispatch_event(
     Ok(())
 }
 
-/// Check if a PR should be ignored based on title regex patterns or author list.
+/// Validate a pull_request event payload before processing.
 ///
-/// Returns true if the PR should be skipped based on configured title/author filters.
-fn should_ignore_pr(settings: &Settings, title: &str, author: &str) -> bool {
+/// Matches Python's `_check_pull_request_event()`:
+/// - Rejects draft PRs (they'll be handled on `ready_for_review`)
+/// - Rejects non-open PRs (closed, merged)
+/// - For `review_requested` and `synchronize` actions, rejects if `created_at == updated_at`
+///   to avoid double-processing when a PR is first opened
+fn check_pull_request_event(action: &str, payload: &serde_json::Value) -> bool {
+    let pr = &payload["pull_request"];
+
+    // Skip draft PRs — default to false (non-draft) if field missing
+    let is_draft = pr["draft"].as_bool().unwrap_or(false);
+    if is_draft {
+        return false;
+    }
+
+    // Skip non-open PRs
+    let state = pr["state"].as_str().unwrap_or("");
+    if state != "open" {
+        return false;
+    }
+
+    // For review_requested and synchronize: skip if created_at == updated_at
+    // to avoid double-processing when a PR is first opened (both events fire)
+    if action == "review_requested" || action == "synchronize" {
+        let created_at = pr["created_at"].as_str().unwrap_or("");
+        let updated_at = pr["updated_at"].as_str().unwrap_or("");
+        if !created_at.is_empty() && created_at == updated_at {
+            tracing::debug!(
+                action,
+                created_at,
+                "skipping: created_at == updated_at (initial PR creation)"
+            );
+            return false;
+        }
+    }
+
+    true
+}
+
+/// Check if a PR should be ignored based on configured filters.
+///
+/// Matches Python's `should_process_pr_logic()` — checks title, author,
+/// repository, labels, source branch, and target branch filters.
+fn should_ignore_pr(settings: &Settings, payload: &serde_json::Value) -> bool {
+    let title = payload["pull_request"]["title"].as_str().unwrap_or("");
+    let author = payload["pull_request"]["user"]["login"]
+        .as_str()
+        .unwrap_or("");
+
+    // 1. Title regex patterns
     for pattern in &settings.config.ignore_pr_title {
         match crate::util::get_or_compile_regex(pattern) {
             Some(re) => {
                 if re.is_match(title) {
+                    tracing::info!(title, pattern, "ignoring PR: title matches ignore pattern");
                     return true;
                 }
             }
@@ -201,6 +393,8 @@ fn should_ignore_pr(settings: &Settings, title: &str, author: &str) -> bool {
             }
         }
     }
+
+    // 2. Author list
     if !author.is_empty()
         && settings
             .config
@@ -208,9 +402,215 @@ fn should_ignore_pr(settings: &Settings, title: &str, author: &str) -> bool {
             .iter()
             .any(|a| a == author)
     {
+        tracing::info!(author, "ignoring PR: author in ignore list");
         return true;
     }
+
+    // 3. Repository full name regex patterns
+    let repo_full_name = payload["repository"]["full_name"].as_str().unwrap_or("");
+    if !repo_full_name.is_empty() {
+        for pattern in &settings.config.ignore_repositories {
+            match crate::util::get_or_compile_regex(pattern) {
+                Some(re) => {
+                    if re.is_match(repo_full_name) {
+                        tracing::info!(
+                            repo_full_name,
+                            pattern,
+                            "ignoring PR: repo matches ignore pattern"
+                        );
+                        return true;
+                    }
+                }
+                None => {
+                    tracing::warn!(pattern, "invalid ignore_repositories regex");
+                }
+            }
+        }
+    }
+
+    // 4. PR labels (exact match)
+    if !settings.config.ignore_pr_labels.is_empty()
+        && let Some(labels) = payload["pull_request"]["labels"].as_array()
+    {
+        for label in labels {
+            let label_name = label["name"].as_str().unwrap_or("");
+            if settings
+                .config
+                .ignore_pr_labels
+                .iter()
+                .any(|l| l == label_name)
+            {
+                tracing::info!(label_name, "ignoring PR: label in ignore list");
+                return true;
+            }
+        }
+    }
+
+    // 5. Source branch regex patterns (head.ref)
+    let source_branch = payload["pull_request"]["head"]["ref"]
+        .as_str()
+        .unwrap_or("");
+    if !source_branch.is_empty() {
+        for pattern in &settings.config.ignore_pr_source_branches {
+            match crate::util::get_or_compile_regex(pattern) {
+                Some(re) => {
+                    if re.is_match(source_branch) {
+                        tracing::info!(
+                            source_branch,
+                            pattern,
+                            "ignoring PR: source branch matches ignore pattern"
+                        );
+                        return true;
+                    }
+                }
+                None => {
+                    tracing::warn!(pattern, "invalid ignore_pr_source_branches regex");
+                }
+            }
+        }
+    }
+
+    // 6. Target branch regex patterns (base.ref)
+    let target_branch = payload["pull_request"]["base"]["ref"]
+        .as_str()
+        .unwrap_or("");
+    if !target_branch.is_empty() {
+        for pattern in &settings.config.ignore_pr_target_branches {
+            match crate::util::get_or_compile_regex(pattern) {
+                Some(re) => {
+                    if re.is_match(target_branch) {
+                        tracing::info!(
+                            target_branch,
+                            pattern,
+                            "ignoring PR: target branch matches ignore pattern"
+                        );
+                        return true;
+                    }
+                }
+                None => {
+                    tracing::warn!(pattern, "invalid ignore_pr_target_branches regex");
+                }
+            }
+        }
+    }
+
     false
+}
+
+/// Log PR merge statistics when a PR is closed and merged.
+///
+/// Extracts real statistics from the webhook payload: commits, additions,
+/// deletions, changed files, reviewers, comments, and time-to-merge.
+fn handle_closed_pr(payload: &serde_json::Value) {
+    let pr = &payload["pull_request"];
+    let is_merged = pr["merged"].as_bool().unwrap_or(false);
+    if !is_merged {
+        tracing::debug!("PR closed without merge, skipping analytics");
+        return;
+    }
+
+    let pr_url = pr["html_url"].as_str().unwrap_or("");
+    let title = pr["title"].as_str().unwrap_or("");
+    let commits = pr["commits"].as_u64().unwrap_or(0);
+    let additions = pr["additions"].as_u64().unwrap_or(0);
+    let deletions = pr["deletions"].as_u64().unwrap_or(0);
+    let changed_files = pr["changed_files"].as_u64().unwrap_or(0);
+    let comments =
+        pr["comments"].as_u64().unwrap_or(0) + pr["review_comments"].as_u64().unwrap_or(0);
+    let merged_by = pr["merged_by"]["login"].as_str().unwrap_or("");
+
+    // Count requested reviewers
+    let reviewers = pr["requested_reviewers"]
+        .as_array()
+        .map(|a| a.len())
+        .unwrap_or(0);
+
+    // Calculate time to merge
+    let created_at = pr["created_at"].as_str().unwrap_or("");
+    let merged_at = pr["merged_at"].as_str().unwrap_or("");
+    let time_to_merge_hours = compute_hours_between(created_at, merged_at);
+
+    tracing::info!(
+        pr_url,
+        title,
+        commits,
+        additions,
+        deletions,
+        changed_files,
+        reviewers,
+        comments,
+        merged_by,
+        time_to_merge_hours,
+        "PR merged — statistics"
+    );
+}
+
+/// Compute hours between two ISO 8601 timestamps.
+fn compute_hours_between(start: &str, end: &str) -> f64 {
+    let Ok(start_dt) = chrono::DateTime::parse_from_rfc3339(start) else {
+        return 0.0;
+    };
+    let Ok(end_dt) = chrono::DateTime::parse_from_rfc3339(end) else {
+        return 0.0;
+    };
+    let duration = end_dt - start_dt;
+    duration.num_minutes() as f64 / 60.0
+}
+
+/// Transform a line-level `/ask` comment into an `/ask_line` command string.
+///
+/// Extracts `start_line`, `end_line`, `side`, `path`, `comment_id`, and `diff_hunk`
+/// from the webhook payload and reformats the command with appropriate flags.
+///
+/// Matches Python's `handle_line_comments()` function.
+fn handle_line_comments(payload: &serde_json::Value, comment_body: &str) -> String {
+    let comment = &payload["comment"];
+
+    let end_line = comment["line"].as_u64().unwrap_or(0);
+    let start_line = comment["start_line"].as_u64().unwrap_or(end_line);
+    let start_line = if start_line == 0 {
+        end_line
+    } else {
+        start_line
+    };
+    let side = comment["side"].as_str().unwrap_or("RIGHT");
+    let path = comment["path"].as_str().unwrap_or("");
+    let comment_id = comment["id"].as_u64().unwrap_or(0);
+
+    // Extract the question text by stripping the leading /ask command (only the first one)
+    let question = comment_body
+        .trim_start()
+        .strip_prefix("/ask")
+        .unwrap_or(comment_body)
+        .trim()
+        .to_string();
+
+    format!(
+        "/ask_line --line_start={start_line} --line_end={end_line} --side={side} --file_name={path} --comment_id={comment_id} {question}"
+    )
+}
+
+/// Reformat image-reply comment: `> ![image](url)\n/ask question` → `/ask question \n> ![image](url)`.
+///
+/// When users quote an image and write `/ask` below it, the comment body doesn't
+/// start with `/`. This function moves the `/ask` command to the front so it gets
+/// recognized as a command. The image quote is appended for the /ask tool to detect.
+fn reformat_image_reply(comment: &str) -> String {
+    if comment.starts_with('/') || !comment.contains("/ask") {
+        return comment.to_string();
+    }
+
+    if comment.trim().starts_with("> ![image]")
+        && let Some(pos) = comment.find("/ask")
+    {
+        let before = comment[..pos].trim().trim_start_matches('>').trim();
+        let after = &comment[pos..];
+        let reformatted = format!("{after} \n{before}");
+        tracing::info!("reformatted image-reply comment so /ask is at the beginning");
+        return reformatted;
+    }
+
+    comment.to_string()
 }
 
 /// Fetch an optional TOML settings file, logging success/failure.
@@ -604,17 +1004,36 @@ mod tests {
         assert!(!is_self_review_checked(body));
     }
 
+    /// Helper: build a minimal PR payload for should_ignore_pr tests.
+    fn make_pr_payload(title: &str, author: &str) -> serde_json::Value {
+        serde_json::json!({
+            "pull_request": {
+                "title": title,
+                "user": { "login": author },
+                "labels": [],
+                "head": { "ref": "feature/test" },
+                "base": { "ref": "main" }
+            },
+            "repository": { "full_name": "owner/repo" }
+        })
+    }
+
     #[test]
     fn test_should_ignore_pr_title_regex() {
         let mut settings = Settings::default();
         settings.config.ignore_pr_title = vec![r"^\[Auto\]".into(), r"^Auto".into()];
 
-        assert!(should_ignore_pr(&settings, "[Auto] Update deps", "user1"));
-        assert!(should_ignore_pr(&settings, "Auto merge from main", "user1"));
+        assert!(should_ignore_pr(
+            &settings,
+            &make_pr_payload("[Auto] Update deps", "user1")
+        ));
+        assert!(should_ignore_pr(
+            &settings,
+            &make_pr_payload("Auto merge from main", "user1")
+        ));
         assert!(!should_ignore_pr(
             &settings,
-            "Fix authentication bug",
-            "user1"
+            &make_pr_payload("Fix authentication bug", "user1")
         ));
     }
 
@@ -625,18 +1044,134 @@ mod tests {
 
         assert!(should_ignore_pr(
             &settings,
-            "Update deps",
-            "dependabot[bot]"
+            &make_pr_payload("Update deps", "dependabot[bot]")
         ));
-        assert!(should_ignore_pr(&settings, "Update deps", "renovate[bot]"));
-        assert!(!should_ignore_pr(&settings, "Update deps", "human-dev"));
+        assert!(should_ignore_pr(
+            &settings,
+            &make_pr_payload("Update deps", "renovate[bot]")
+        ));
+        assert!(!should_ignore_pr(
+            &settings,
+            &make_pr_payload("Update deps", "human-dev")
+        ));
     }
 
     #[test]
     fn test_should_ignore_pr_empty_filters() {
         let settings = Settings::default();
         // Default has ignore_pr_title patterns but a normal title won't match
-        assert!(!should_ignore_pr(&settings, "Normal PR title", "user1"));
+        assert!(!should_ignore_pr(
+            &settings,
+            &make_pr_payload("Normal PR title", "user1")
+        ));
+    }
+
+    #[test]
+    fn test_should_ignore_pr_repository() {
+        let mut settings = Settings::default();
+        settings.config.ignore_repositories = vec![r"^org/internal-".into()];
+
+        let mut payload = make_pr_payload("My PR", "user1");
+        payload["repository"]["full_name"] = serde_json::json!("org/internal-tools");
+        assert!(should_ignore_pr(&settings, &payload));
+
+        let payload = make_pr_payload("My PR", "user1"); // default: owner/repo
+        assert!(!should_ignore_pr(&settings, &payload));
+    }
+
+    #[test]
+    fn test_should_ignore_pr_labels() {
+        let mut settings = Settings::default();
+        settings.config.ignore_pr_labels = vec!["do-not-review".into(), "wip".into()];
+
+        let mut payload = make_pr_payload("My PR", "user1");
+        payload["pull_request"]["labels"] = serde_json::json!([
+            { "name": "enhancement" },
+            { "name": "do-not-review" }
+        ]);
+        assert!(should_ignore_pr(&settings, &payload));
+
+        let mut payload = make_pr_payload("My PR", "user1");
+        payload["pull_request"]["labels"] = serde_json::json!([
+            { "name": "enhancement" }
+        ]);
+        assert!(!should_ignore_pr(&settings, &payload));
+    }
+
+    #[test]
+    fn test_should_ignore_pr_source_branch() {
+        let mut settings = Settings::default();
+        settings.config.ignore_pr_source_branches = vec![r"^dependabot/".into()];
+
+        let mut payload = make_pr_payload("My PR", "user1");
+        payload["pull_request"]["head"]["ref"] = serde_json::json!("dependabot/npm/lodash-4.17.21");
+        assert!(should_ignore_pr(&settings, &payload));
+
+        let payload = make_pr_payload("My PR", "user1"); // default: feature/test
+        assert!(!should_ignore_pr(&settings, &payload));
+    }
+
+    #[test]
+    fn test_should_ignore_pr_target_branch() {
+        let mut settings = Settings::default();
+        settings.config.ignore_pr_target_branches = vec![r"^release/".into()];
+
+        let mut payload = make_pr_payload("My PR", "user1");
+        payload["pull_request"]["base"]["ref"] = serde_json::json!("release/v2.0");
+        assert!(should_ignore_pr(&settings, &payload));
+
+        let payload = make_pr_payload("My PR", "user1"); // default: main
+        assert!(!should_ignore_pr(&settings, &payload));
+    }
+
+    #[test]
+    fn test_check_pull_request_event_draft() {
+        let payload = serde_json::json!({
+            "pull_request": { "draft": true, "state": "open",
+                "created_at": "2025-01-01T00:00:00Z", "updated_at": "2025-01-01T01:00:00Z" }
+        });
+        assert!(!check_pull_request_event("opened", &payload));
+    }
+
+    #[test]
+    fn test_check_pull_request_event_closed() {
+        let payload = serde_json::json!({
+            "pull_request": { "draft": false, "state": "closed",
+                "created_at": "2025-01-01T00:00:00Z", "updated_at": "2025-01-01T01:00:00Z" }
+        });
+        assert!(!check_pull_request_event("opened", &payload));
+    }
+
+    #[test]
+    fn test_check_pull_request_event_open_non_draft() {
+        let payload = serde_json::json!({
+            "pull_request": { "draft": false, "state": "open",
+                "created_at": "2025-01-01T00:00:00Z", "updated_at": "2025-01-01T01:00:00Z" }
+        });
+        assert!(check_pull_request_event("opened", &payload));
+    }
+
+    #[test]
+    fn test_check_pull_request_event_sync_created_eq_updated() {
+        // When created_at == updated_at, synchronize should be skipped
+        // (avoids double-processing on initial PR creation)
+        let payload = serde_json::json!({
+            "pull_request": { "draft": false, "state": "open",
+                "created_at": "2025-01-01T00:00:00Z", "updated_at": "2025-01-01T00:00:00Z" }
+        });
+        assert!(!check_pull_request_event("synchronize", &payload));
+        assert!(!check_pull_request_event("review_requested", &payload));
+        // But opened should still be allowed
+        assert!(check_pull_request_event("opened", &payload));
+    }
+
+    #[test]
+    fn test_check_pull_request_event_sync_different_timestamps() {
+        let payload = serde_json::json!({
+            "pull_request": { "draft": false, "state": "open",
+                "created_at": "2025-01-01T00:00:00Z", "updated_at": "2025-01-02T00:00:00Z" }
+        });
+        assert!(check_pull_request_event("synchronize", &payload));
     }
 
     #[test]
@@ -835,7 +1370,10 @@ num_max_findings = 3
         let mut settings = Settings::default();
         settings.config.ignore_pr_title = vec!["[invalid".into()]; // unclosed bracket
         // Should not panic — invalid regex is skipped with warning
-        assert!(!should_ignore_pr(&settings, "Some PR title", "user1"));
+        assert!(!should_ignore_pr(
+            &settings,
+            &make_pr_payload("Some PR title", "user1")
+        ));
     }
 
     #[test]
@@ -843,7 +1381,114 @@ num_max_findings = 3
         let mut settings = Settings::default();
         settings.config.ignore_pr_authors = vec!["bot".into()];
         // Empty author should not match
-        assert!(!should_ignore_pr(&settings, "Title", ""));
+        assert!(!should_ignore_pr(&settings, &make_pr_payload("Title", "")));
+    }
+
+    /// dispatch_event should return Ok(()) without attempting network calls
+    /// when the PR is a draft — the draft check short-circuits before run_commands.
+    #[tokio::test]
+    async fn test_dispatch_event_skips_draft_pr() {
+        let payload = serde_json::json!({
+            "action": "opened",
+            "sender": { "login": "testuser", "type": "User" },
+            "repository": { "full_name": "owner/repo" },
+            "pull_request": {
+                "html_url": "https://github.com/owner/repo/pull/1",
+                "title": "My PR",
+                "draft": true,
+                "state": "open",
+                "labels": [],
+                "user": { "login": "testuser" },
+                "head": { "ref": "feat/test" },
+                "base": { "ref": "main" },
+                "created_at": "2025-01-01T00:00:00Z",
+                "updated_at": "2025-01-01T01:00:00Z"
+            }
+        });
+
+        // Should succeed (skip) without trying to connect to GitHub
+        let result = dispatch_event("pull_request", "opened", &payload).await;
+        assert!(result.is_ok(), "draft PR should be skipped silently");
+    }
+
+    /// dispatch_event should also skip PRs that are not in "open" state.
+    #[tokio::test]
+    async fn test_dispatch_event_skips_closed_pr() {
+        let payload = serde_json::json!({
+            "action": "reopened",
+            "sender": { "login": "testuser", "type": "User" },
+            "repository": { "full_name": "owner/repo" },
+            "pull_request": {
+                "html_url": "https://github.com/owner/repo/pull/1",
+                "title": "My PR",
+                "draft": false,
+                "state": "closed",
+                "labels": [],
+                "user": { "login": "testuser" },
+                "head": { "ref": "feat/test" },
+                "base": { "ref": "main" },
+                "created_at": "2025-01-01T00:00:00Z",
+                "updated_at": "2025-01-01T01:00:00Z"
+            }
+        });
+
+        let result = dispatch_event("pull_request", "reopened", &payload).await;
+        assert!(result.is_ok(), "closed PR should be skipped silently");
+    }
+
+    /// dispatch_event should skip PRs from bot users when ignore_bot_pr is true.
+    #[tokio::test]
+    async fn test_dispatch_event_skips_bot_pr() {
+        let payload = serde_json::json!({
+            "action": "opened",
+            "sender": { "login": "dependabot[bot]", "type": "Bot" },
+            "repository": { "full_name": "owner/repo" },
+            "pull_request": {
+                "html_url": "https://github.com/owner/repo/pull/1",
+                "title": "Bump lodash",
+                "draft": false,
+                "state": "open",
+                "labels": [],
+                "user": { "login": "dependabot[bot]" },
+                "head": { "ref": "dependabot/npm/lodash" },
+                "base": { "ref": "main" },
+                "created_at": "2025-01-01T00:00:00Z",
+                "updated_at": "2025-01-01T01:00:00Z"
+            }
+        });
+
+        let result = dispatch_event("pull_request", "opened", &payload).await;
+        assert!(result.is_ok(), "bot PR should be skipped silently");
+    }
+
+    /// dispatch_event should also skip pr-agent bot events (e.g. label changes).
+    /// Matches Python's is_bot_user() which returns True for ALL bots.
+    #[tokio::test]
+    async fn test_dispatch_event_skips_pr_agent_bot_labeled_event() {
+        let payload = serde_json::json!({
+            "action": "labeled",
+            "sender": { "login": "pr-agent-app[bot]", "type": "Bot" },
+            "repository": { "full_name": "owner/repo" },
+            "pull_request": {
+                "html_url": "https://github.com/owner/repo/pull/1",
+                "title": "My Feature",
+                "draft": false,
+                "state": "open",
+                "labels": [{ "name": "Enhancement" }],
+                "user": { "login": "developer" },
+                "head": { "ref": "feat/test" },
+                "base": { "ref": "main" },
+                "created_at": "2025-01-01T00:00:00Z",
+                "updated_at": "2025-01-01T02:00:00Z"
+            }
+        });
+
+        // Should be silently ignored — bot's own label changes must not re-trigger review
+        let result = dispatch_event("pull_request", "labeled", &payload).await;
+        assert!(
+            result.is_ok(),
+            "pr-agent bot labeled event should be skipped"
+        );
     }
 
     #[test]
@@ -858,5 +1503,156 @@ num_max_findings = 3
         assert!(folded.contains("Fix null check"));
         // Checkbox preserved
         assert!(folded.contains("<!-- approve and fold suggestions self-review -->"));
+    }
+
+    // ── Image-reply reformat tests ──────────────────────────────────
+
+    #[test]
+    fn test_reformat_image_reply_basic() {
+        let comment = "> ![image](https://img.com/a.png)\n/ask What is this?";
+        let result = reformat_image_reply(comment);
+        assert!(
+            result.starts_with("/ask"),
+            "should start with /ask, got: {result}"
+        );
+        assert!(result.contains("What is this?"));
+        assert!(result.contains("![image](https://img.com/a.png)"));
+    }
+
+    #[test]
+    fn test_reformat_image_reply_already_starts_with_slash() {
+        let comment = "/ask What does this PR do?";
+        let result = reformat_image_reply(comment);
+        assert_eq!(result, comment, "should return unchanged");
+    }
+
+    #[test]
+    fn test_reformat_image_reply_no_ask() {
+        let comment = "> ![image](https://img.com/a.png)\nsome other text";
+        let result = reformat_image_reply(comment);
+        assert_eq!(result, comment, "should return unchanged without /ask");
+    }
+
+    #[test]
+    fn test_reformat_image_reply_no_image() {
+        let comment = "some text /ask question";
+        let result = reformat_image_reply(comment);
+        assert_eq!(result, comment, "should return unchanged without image");
+    }
+
+    // ── Line comment transformation tests ───────────────────────────
+
+    #[test]
+    fn test_handle_line_comments_basic() {
+        let payload = serde_json::json!({
+            "comment": {
+                "id": 12345,
+                "line": 20,
+                "start_line": 15,
+                "side": "RIGHT",
+                "path": "src/main.rs",
+                "diff_hunk": "@@ -10,5 +10,7 @@ fn main()"
+            }
+        });
+
+        let result = handle_line_comments(&payload, "/ask What does this do?");
+        assert!(result.starts_with("/ask_line"));
+        assert!(result.contains("--line_start=15"));
+        assert!(result.contains("--line_end=20"));
+        assert!(result.contains("--side=RIGHT"));
+        assert!(result.contains("--file_name=src/main.rs"));
+        assert!(result.contains("--comment_id=12345"));
+        assert!(result.contains("What does this do?"));
+    }
+
+    #[test]
+    fn test_handle_line_comments_no_start_line() {
+        let payload = serde_json::json!({
+            "comment": {
+                "id": 100,
+                "line": 42,
+                "start_line": null,
+                "side": "LEFT",
+                "path": "lib.rs"
+            }
+        });
+
+        let result = handle_line_comments(&payload, "/ask Why was this removed?");
+        // When start_line is null, it should default to end_line
+        assert!(result.contains("--line_start=42"));
+        assert!(result.contains("--line_end=42"));
+        assert!(result.contains("--side=LEFT"));
+    }
+
+    #[test]
+    fn test_handle_line_comments_question_containing_ask() {
+        // Question text contains "/ask" — only the leading one should be stripped
+        let payload = serde_json::json!({
+            "comment": {
+                "id": 999,
+                "line": 5,
+                "start_line": 5,
+                "side": "RIGHT",
+                "path": "main.rs"
+            }
+        });
+
+        let result = handle_line_comments(&payload, "/ask why does /ask appear here?");
+        assert!(
+            result.contains("why does /ask appear here?"),
+            "inner /ask should be preserved, got: {result}"
+        );
+    }
+
+    // ── PR merge analytics tests ────────────────────────────────────
+
+    #[test]
+    fn test_compute_hours_between() {
+        let hours = compute_hours_between("2025-01-01T00:00:00Z", "2025-01-01T02:30:00Z");
+        assert!((hours - 2.5).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_compute_hours_between_invalid() {
+        assert_eq!(
+            compute_hours_between("invalid", "2025-01-01T00:00:00Z"),
+            0.0
+        );
+        assert_eq!(compute_hours_between("", ""), 0.0);
+    }
+
+    #[test]
+    fn test_handle_closed_pr_merged() {
+        // Should not panic, just logs
+        let payload = serde_json::json!({
+            "pull_request": {
+                "html_url": "https://github.com/o/r/pull/1",
+                "title": "Add feature",
+                "merged": true,
+                "commits": 3,
+                "additions": 100,
+                "deletions": 20,
+                "changed_files": 5,
+                "comments": 2,
+                "review_comments": 4,
+                "merged_by": { "login": "reviewer" },
+                "requested_reviewers": [{"login": "r1"}, {"login": "r2"}],
+                "created_at": "2025-01-01T00:00:00Z",
+                "merged_at": "2025-01-02T12:00:00Z"
+            }
+        });
+        // Just verify it doesn't panic
+        handle_closed_pr(&payload);
+    }
+
+    #[test]
+    fn test_handle_closed_pr_not_merged() {
+        let payload = serde_json::json!({
+            "pull_request": {
+                "merged": false
+            }
+        });
+        // Should return early without panic
+        handle_closed_pr(&payload);
     }
 }

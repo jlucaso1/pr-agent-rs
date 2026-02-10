@@ -193,6 +193,21 @@ pub trait GitProvider: Send + Sync {
         Err(PrAgentError::Unsupported("edit_comment".into()))
     }
 
+    /// Reply to a specific review comment (inline code comment thread).
+    async fn reply_to_comment(&self, _comment_id: u64, _body: &str) -> Result<(), PrAgentError> {
+        Err(PrAgentError::Unsupported("reply_to_comment".into()))
+    }
+
+    /// Get all comments in the same review thread as the given comment.
+    async fn get_review_thread_comments(
+        &self,
+        _comment_id: u64,
+    ) -> Result<Vec<IssueComment>, PrAgentError> {
+        Err(PrAgentError::Unsupported(
+            "get_review_thread_comments".into(),
+        ))
+    }
+
     /// Create or update a file in the repo (e.g. for changelog pushes).
     async fn create_or_update_pr_file(
         &self,

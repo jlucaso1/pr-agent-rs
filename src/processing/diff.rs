@@ -126,6 +126,73 @@ pub fn format_patch_simple(
     format!("\n\n## File: '{}'\n\n{}\n", filename.trim(), patch.trim())
 }
 
+/// Extract hunk lines from a diff patch for the /ask_line tool.
+///
+/// Given a raw diff hunk (typically from `body["comment"]["diff_hunk"]`),
+/// returns a tuple of (full_hunk_formatted, selected_lines).
+///
+/// - `full_hunk_formatted`: The entire hunk with `## File:` header and line numbers
+/// - `selected_lines`: Only the lines within `[line_start, line_end]` range
+///
+/// `side` is `"LEFT"` for removed lines or `"RIGHT"` (default) for added/context lines.
+pub fn extract_hunk_lines_from_patch(
+    patch: &str,
+    filename: &str,
+    line_start: usize,
+    line_end: usize,
+    side: &str,
+) -> (String, String) {
+    if patch.is_empty() {
+        return (String::new(), String::new());
+    }
+
+    let use_left = side.eq_ignore_ascii_case("LEFT");
+
+    let mut full_hunk = format!("## File: '{}'\n\n", filename.trim());
+    let mut selected = String::new();
+    let mut new_line: usize = 0;
+    let mut old_line: usize = 0;
+
+    for line in patch.lines() {
+        if let Some(header) = HunkHeader::parse(line) {
+            full_hunk.push_str(&format!("{line}\n"));
+            new_line = header.start2;
+            old_line = header.start1;
+            continue;
+        }
+
+        if line.starts_with('+') {
+            let formatted = format!("{new_line} {line}\n");
+            full_hunk.push_str(&formatted);
+            if !use_left && new_line >= line_start && new_line <= line_end {
+                selected.push_str(&formatted);
+            }
+            new_line += 1;
+        } else if line.starts_with('-') {
+            let formatted = format!("{old_line} {line}\n");
+            full_hunk.push_str(&formatted);
+            if use_left && old_line >= line_start && old_line <= line_end {
+                selected.push_str(&formatted);
+            }
+            old_line += 1;
+        } else {
+            // Context line
+            let formatted = format!("{new_line} {line}\n");
+            full_hunk.push_str(&formatted);
+            if !use_left && new_line >= line_start && new_line <= line_end {
+                selected.push_str(&formatted);
+            }
+            if use_left && old_line >= line_start && old_line <= line_end {
+                selected.push_str(&format!("{old_line} {line}\n"));
+            }
+            new_line += 1;
+            old_line += 1;
+        }
+    }
+
+    (full_hunk, selected)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -156,5 +223,46 @@ mod tests {
     fn test_deleted_file() {
         let result = convert_to_hunks_with_line_numbers("src/main.rs", "", EditType::Deleted);
         assert!(result.contains("was deleted"));
+    }
+
+    #[test]
+    fn test_extract_hunk_lines_right_side() {
+        let patch = "@@ -10,4 +10,5 @@ fn example()\n context1\n-old_line\n+new_line\n+added_line\n context2";
+        let (full, selected) = extract_hunk_lines_from_patch(patch, "src/lib.rs", 11, 12, "RIGHT");
+
+        assert!(full.contains("## File: 'src/lib.rs'"));
+        assert!(full.contains("@@ -10,4 +10,5 @@"));
+        assert!(!selected.is_empty());
+        // Lines 11-12 on RIGHT side = new_line (11) and added_line (12)
+        assert!(selected.contains("+new_line"));
+        assert!(selected.contains("+added_line"));
+    }
+
+    #[test]
+    fn test_extract_hunk_lines_left_side() {
+        let patch = "@@ -10,3 +10,3 @@\n context\n-removed\n+added\n context2";
+        let (full, selected) = extract_hunk_lines_from_patch(patch, "src/lib.rs", 11, 11, "LEFT");
+
+        assert!(full.contains("## File: 'src/lib.rs'"));
+        // Line 11 on LEFT side = the removed line
+        assert!(selected.contains("-removed"));
+    }
+
+    #[test]
+    fn test_extract_hunk_lines_empty_patch() {
+        let (full, selected) = extract_hunk_lines_from_patch("", "f.rs", 1, 1, "RIGHT");
+        assert!(full.is_empty());
+        assert!(selected.is_empty());
+    }
+
+    #[test]
+    fn test_extract_hunk_lines_out_of_range() {
+        let patch = "@@ -1,2 +1,2 @@\n context\n-old\n+new";
+        let (full, selected) = extract_hunk_lines_from_patch(patch, "f.rs", 100, 200, "RIGHT");
+
+        // Full hunk should still be populated
+        assert!(!full.is_empty());
+        // But selected lines should be empty (out of range)
+        assert!(selected.is_empty());
     }
 }
