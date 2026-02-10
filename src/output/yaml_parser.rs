@@ -27,22 +27,17 @@ pub fn load_yaml(
     first_key: &str,
     last_key: &str,
 ) -> Option<serde_yaml_ng::Value> {
-    let original = response_text.to_string();
-
-    // Strip markdown fences and whitespace
-    let cleaned = response_text
-        .trim_matches('\n')
+    // Strip markdown fences and whitespace — trim once, reuse the slice
+    let trimmed = response_text.trim_matches('\n');
+    let stripped = trimmed
         .strip_prefix("yaml")
-        .unwrap_or(response_text.trim_matches('\n'))
-        .strip_prefix("```yaml")
-        .unwrap_or(response_text.trim_matches('\n'))
-        .trim()
-        .strip_suffix("```")
-        .unwrap_or(response_text.trim())
-        .to_string();
+        .or_else(|| trimmed.strip_prefix("```yaml"))
+        .unwrap_or(trimmed)
+        .trim();
+    let cleaned = stripped.strip_suffix("```").unwrap_or(stripped).trim();
 
-    // Direct parse attempt
-    if let Ok(data) = serde_yaml_ng::from_str::<serde_yaml_ng::Value>(&cleaned)
+    // Direct parse attempt — zero allocations on the happy path
+    if let Ok(data) = serde_yaml_ng::from_str::<serde_yaml_ng::Value>(cleaned)
         && !data.is_null()
     {
         return Some(data);
@@ -54,8 +49,8 @@ pub fn load_yaml(
     let mut keys: Vec<&str> = DEFAULT_KEYS_YAML.to_vec();
     keys.extend_from_slice(extra_keys);
 
-    // Run through fallback cascade
-    try_fix_yaml(&cleaned, &keys, first_key, last_key, &original)
+    // Run through fallback cascade (pass original text for fallback 2's code-block extraction)
+    try_fix_yaml(cleaned, &keys, first_key, last_key, response_text)
 }
 
 /// Convenience wrapper with no extra keys or key boundaries.
@@ -145,6 +140,25 @@ fn try_fix_yaml(
         return Some(data);
     }
 
+    // ── Fallback 9: Fix orphan continuation lines ──
+    // When the AI returns a long value that wraps to the next line at column 0,
+    // it breaks YAML. This indents those orphan lines to make them valid
+    // plain-scalar continuations of the previous line's value.
+    if let Some(data) = fallback_fix_orphan_continuation_lines(text) {
+        tracing::info!("YAML parsed after fixing orphan continuation lines");
+        return Some(data);
+    }
+
+    // ── Fallback 10: Quote keys containing brackets ──
+    // Keys like `estimated_effort_to_review_[1-5]` can confuse some YAML parsers
+    // because `[1-5]` looks like a flow sequence. Quote them to be safe.
+    if text.contains('[')
+        && let Some(data) = fallback_quote_bracket_keys(text)
+    {
+        tracing::info!("YAML parsed after quoting bracket-containing keys");
+        return Some(data);
+    }
+
     let preview = if text.len() > 500 {
         format!("{}...(truncated {} chars)", &text[..500], text.len() - 500)
     } else {
@@ -165,16 +179,29 @@ fn try_parse(text: &str) -> Option<serde_yaml_ng::Value> {
 // ── Fallback implementations ────────────────────────────────────────
 
 /// Fallback 1: For each known key, add `|-\n        ` block scalar indicator.
+///
+/// Single pass: scans each line for a matching key and splices in the block
+/// scalar marker without collecting lines into a `Vec<String>`.
 fn fallback_add_block_scalar(text: &str, keys: &[&str]) -> Option<serde_yaml_ng::Value> {
-    let mut lines: Vec<String> = text.lines().map(|l| l.to_string()).collect();
-    for line in &mut lines {
-        for key in keys {
-            if line.contains(key) && !line.contains('|') {
-                *line = line.replace(key, &format!("{key} |\n        "));
-            }
+    let mut result = String::with_capacity(text.len() + keys.len() * 16);
+    let mut changed = false;
+    for (i, line) in text.lines().enumerate() {
+        if i > 0 {
+            result.push('\n');
         }
+        // Find the first matching key in this line (skip if line already has '|')
+        if !line.contains('|')
+            && let Some((key, pos)) = keys.iter().find_map(|k| line.find(k).map(|p| (*k, p)))
+        {
+            result.push_str(&line[..pos + key.len()]);
+            result.push_str(" |\n        ");
+            result.push_str(line[pos + key.len()..].trim_start());
+            changed = true;
+            continue;
+        }
+        result.push_str(line);
     }
-    try_parse(&lines.join("\n"))
+    if changed { try_parse(&result) } else { None }
 }
 
 /// Fallback 1.5: Replace `|\n` with `|2\n` for proper indent handling.
@@ -185,15 +212,23 @@ fn fallback_pipe_to_pipe2(text: &str) -> Option<serde_yaml_ng::Value> {
     }
 
     // Nested fix: add indent for lines with '}' at indent level 2
-    let mut lines: Vec<String> = replaced.lines().map(|l| l.to_string()).collect();
-    for line in &mut lines {
+    let mut result = String::with_capacity(replaced.len() + 64);
+    let mut changed = false;
+    for (i, line) in replaced.lines().enumerate() {
+        if i > 0 {
+            result.push('\n');
+        }
         let trimmed = line.trim_start();
         let indent = line.len() - trimmed.len();
         if indent == 2 && !line.contains("|2") && line.contains('}') {
-            *line = format!("    {}", trimmed);
+            result.push_str("    ");
+            result.push_str(trimmed);
+            changed = true;
+        } else {
+            result.push_str(line);
         }
     }
-    try_parse(&lines.join("\n"))
+    if changed { try_parse(&result) } else { None }
 }
 
 /// Fallback 2: Extract YAML from ```yaml ... ``` code blocks.
@@ -333,6 +368,90 @@ fn fallback_remove_leading_pipe(text: &str) -> Option<serde_yaml_ng::Value> {
     try_parse(stripped)
 }
 
+/// Fallback 9: Fix orphan continuation lines.
+///
+/// When the AI returns a long value that wraps to the next line at column 0 without
+/// indentation, the YAML parser fails. This detects such "orphan" lines (at indent 0,
+/// not YAML keys, not list items) and indents them to be valid plain-scalar continuations
+/// of the previous line's value.
+///
+/// Single O(n) pass — tracks the previous non-empty line's indent incrementally
+/// instead of scanning backwards.
+fn fallback_fix_orphan_continuation_lines(text: &str) -> Option<serde_yaml_ng::Value> {
+    use std::fmt::Write;
+    let mut result = String::with_capacity(text.len() + 128);
+    let mut changed = false;
+    let mut prev_nonempty_indent: usize = 0;
+
+    for (i, line) in text.lines().enumerate() {
+        if i > 0 {
+            result.push('\n');
+        }
+        let trimmed = line.trim_start();
+        let line_indent = line.len() - trimmed.len();
+
+        // Detect orphan lines: at indent 0, not empty, not a YAML key or list item
+        if i > 0
+            && !trimmed.is_empty()
+            && line_indent == 0
+            && prev_nonempty_indent >= 2
+            && !YAML_KEY_RE.is_match(trimmed)
+            && !trimmed.starts_with("- ")
+            && !trimmed.starts_with("---")
+            && !trimmed.starts_with("...")
+            && !trimmed.starts_with('#')
+        {
+            // Indent as a continuation: deeper than the mapping key's indent
+            let _ = write!(
+                result,
+                "{:width$}{trimmed}",
+                "",
+                width = prev_nonempty_indent + 2
+            );
+            changed = true;
+            // Don't update prev_nonempty_indent — the orphan's logical indent
+            // is the one we just assigned, but for consecutive orphans we still
+            // want to use the original anchor indent.
+            continue;
+        }
+
+        result.push_str(line);
+
+        // Track the indent of the last non-empty line
+        if !trimmed.is_empty() {
+            prev_nonempty_indent = line_indent;
+        }
+    }
+
+    if changed { try_parse(&result) } else { None }
+}
+
+/// Regex for bracket-containing YAML keys: captures leading indent + key with brackets + colon.
+static BRACKET_KEY_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^(\s*)([\w]+(?:_\[[^\]]*\])+[\w]*)(\s*:.*)$").unwrap());
+
+/// Fallback 10: Quote YAML keys that contain square brackets.
+fn fallback_quote_bracket_keys(text: &str) -> Option<serde_yaml_ng::Value> {
+    use std::fmt::Write;
+    let mut result = String::with_capacity(text.len() + 32);
+    let mut changed = false;
+    for (i, line) in text.lines().enumerate() {
+        if i > 0 {
+            result.push('\n');
+        }
+        if let Some(caps) = BRACKET_KEY_RE.captures(line) {
+            let indent = caps.get(1).map_or("", |m| m.as_str());
+            let key = caps.get(2).map_or("", |m| m.as_str());
+            let rest = caps.get(3).map_or("", |m| m.as_str());
+            let _ = write!(result, r#"{indent}"{key}"{rest}"#);
+            changed = true;
+        } else {
+            result.push_str(line);
+        }
+    }
+    if changed { try_parse(&result) } else { None }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -416,6 +535,50 @@ pr_files:
         assert!(data["description"].as_str().unwrap().contains("login bug"));
         assert!(data["title"].as_str().unwrap().contains("authentication"));
         assert!(data["pr_files"].is_sequence());
+    }
+
+    #[test]
+    fn test_load_yaml_review_long_issue_content() {
+        // Reproduces production failure: AI returns a long issue_content that wraps across
+        // lines without block scalar indicator or indentation.
+        let yaml = r#"review:
+  estimated_effort_to_review_[1-5]: 2
+  score: 90
+  relevant_tests: yes
+  key_issues_to_review:
+    - relevant_file: apps/web/src/app/(app)/subscription/page.tsx
+      issue_header: Undefined variable 'isLoading'
+      issue_content: The variable `isLoading` is used in disabled attributes on the coupon input (line 912), remove button (line 887), and validate button (line 919) but is not defined in the component. This will cause a ReferenceError at runtime.
+It likely should be replaced with the correct loading state variable from the hooks used in the component.
+  security_concerns: No"#;
+        let data = load_yaml(
+            yaml,
+            &[
+                "estimated_effort_to_review_[1-5]:",
+                "security_concerns:",
+                "key_issues_to_review:",
+                "relevant_file:",
+                "issue_header:",
+                "issue_content:",
+            ],
+            "review",
+            "security_concerns",
+        );
+        assert!(
+            data.is_some(),
+            "should parse review YAML with long issue_content"
+        );
+        let data = data.unwrap();
+        let review = &data["review"];
+        assert!(review["key_issues_to_review"].is_sequence());
+    }
+
+    #[test]
+    fn test_load_yaml_bracket_key_quoting() {
+        // Key with brackets that might confuse some YAML parsers
+        let yaml = "data:\n  estimated_effort_to_review_[1-5]: 3\n  score: 90";
+        let data = load_yaml_simple(yaml);
+        assert!(data.is_some(), "bracket key should parse");
     }
 
     #[test]

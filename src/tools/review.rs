@@ -100,7 +100,20 @@ impl PRReviewer {
         );
 
         // 6. Parse YAML from response
-        let yaml_data = load_yaml(&response.content, &[], "review", "security_concerns");
+        let yaml_data = load_yaml(
+            &response.content,
+            &[
+                "estimated_effort_to_review_[1-5]:",
+                "security_concerns:",
+                "key_issues_to_review:",
+                "relevant_file:",
+                "issue_header:",
+                "issue_content:",
+                "ticket_compliance_check:",
+            ],
+            "review",
+            "security_concerns",
+        );
 
         // 7. Format and publish
         if settings.config.publish_output {

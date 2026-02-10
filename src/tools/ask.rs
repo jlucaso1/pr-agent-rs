@@ -103,10 +103,6 @@ impl PRAsk {
 }
 
 /// Extract image URL from question text.
-///
-/// Handles two patterns (matching Python):
-/// - `![image](url)` — markdown image syntax
-/// - Direct `https://...png` or `https://...jpg` URLs
 fn extract_image_url(question: &str) -> Option<String> {
     if let Some(marker_pos) = question.find("![image]") {
         // Pattern: "question text ![image](url)"

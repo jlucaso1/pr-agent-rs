@@ -40,12 +40,6 @@ struct Entry {
 }
 
 /// Deduplicates concurrent push triggers for the same PR URL.
-///
-/// Mirrors Python's `DefaultDictWithTimeout` + `asyncio.Condition` pattern:
-/// - First push trigger proceeds immediately
-/// - Second push trigger waits until the first finishes (if backlog enabled)
-/// - Further push triggers are rejected (discarded)
-/// - Entries expire after TTL seconds
 pub struct PushDeduplicator {
     entries: Mutex<HashMap<String, Entry>>,
 }

@@ -110,8 +110,6 @@ async fn dispatch_event(
             let pr_url = extract_pr_url(payload)?;
 
             // Bot detection: skip bot PRs (including pr-agent's own events like label changes).
-            // Matches Python's is_bot_user() which returns True for ALL bots — the pr-agent
-            // check only controls the log message, not the filtering.
             let sender = payload["sender"]["login"].as_str().unwrap_or("");
             let sender_type = payload["sender"]["type"].as_str().unwrap_or("");
             if settings.github.ignore_bot_pr && sender_type == "Bot" {
@@ -330,12 +328,6 @@ async fn dispatch_event(
 }
 
 /// Validate a pull_request event payload before processing.
-///
-/// Matches Python's `_check_pull_request_event()`:
-/// - Rejects draft PRs (they'll be handled on `ready_for_review`)
-/// - Rejects non-open PRs (closed, merged)
-/// - For `review_requested` and `synchronize` actions, rejects if `created_at == updated_at`
-///   to avoid double-processing when a PR is first opened
 fn check_pull_request_event(action: &str, payload: &serde_json::Value) -> bool {
     let pr = &payload["pull_request"];
 
@@ -370,9 +362,6 @@ fn check_pull_request_event(action: &str, payload: &serde_json::Value) -> bool {
 }
 
 /// Check if a PR should be ignored based on configured filters.
-///
-/// Matches Python's `should_process_pr_logic()` — checks title, author,
-/// repository, labels, source branch, and target branch filters.
 fn should_ignore_pr(settings: &Settings, payload: &serde_json::Value) -> bool {
     let title = payload["pull_request"]["title"].as_str().unwrap_or("");
     let author = payload["pull_request"]["user"]["login"]
@@ -558,11 +547,6 @@ fn compute_hours_between(start: &str, end: &str) -> f64 {
 }
 
 /// Transform a line-level `/ask` comment into an `/ask_line` command string.
-///
-/// Extracts `start_line`, `end_line`, `side`, `path`, `comment_id`, and `diff_hunk`
-/// from the webhook payload and reformats the command with appropriate flags.
-///
-/// Matches Python's `handle_line_comments()` function.
 fn handle_line_comments(payload: &serde_json::Value, comment_body: &str) -> String {
     let comment = &payload["comment"];
 
@@ -1462,7 +1446,6 @@ num_max_findings = 3
     }
 
     /// dispatch_event should also skip pr-agent bot events (e.g. label changes).
-    /// Matches Python's is_bot_user() which returns True for ALL bots.
     #[tokio::test]
     async fn test_dispatch_event_skips_pr_agent_bot_labeled_event() {
         let payload = serde_json::json!({
