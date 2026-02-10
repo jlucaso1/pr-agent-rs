@@ -86,6 +86,15 @@ impl PRCodeSuggestions {
         let num_batches = batches_no_lines.len();
         tracing::info!(num_batches, num_files, "processing PR in extended mode");
 
+        // Extract images from PR body for vision-capable models
+        let image_urls = super::get_pr_images(
+            &meta.description,
+            self.provider.as_ref(),
+            self.provider.get_pr_number(),
+        )
+        .await;
+        let image_ref = image_urls.as_deref();
+
         // 3. Process batches (parallel or sequential)
         let all_suggestions = if settings.pr_code_suggestions.parallel_calls && num_batches > 1 {
             let futures: Vec<_> = batches_no_lines
@@ -100,6 +109,7 @@ impl PRCodeSuggestions {
                         &batch.patches,
                         &batch_lines.patches,
                         i,
+                        image_ref,
                     )
                 })
                 .collect();
@@ -130,6 +140,7 @@ impl PRCodeSuggestions {
                         &batch.patches,
                         &batch_lines.patches,
                         i,
+                        image_ref,
                     )
                     .await
                 {
@@ -164,6 +175,7 @@ impl PRCodeSuggestions {
     /// Process a single diff batch: AI call + reflect pass.
     ///
     /// Returns scored (but unfiltered) suggestions for this batch.
+    #[allow(clippy::too_many_arguments)]
     async fn process_single_batch(
         &self,
         ai: &dyn AiHandler,
@@ -172,6 +184,7 @@ impl PRCodeSuggestions {
         diff: &str,
         diff_with_lines: &str,
         batch_index: usize,
+        image_urls: Option<&[String]>,
     ) -> Result<Vec<ParsedSuggestion>, PrAgentError> {
         let settings = get_settings();
 
@@ -190,7 +203,7 @@ impl PRCodeSuggestions {
             &rendered.system,
             &rendered.user,
             Some(settings.config.temperature),
-            None,
+            image_urls,
         )
         .await?;
 
@@ -884,6 +897,45 @@ code_suggestions:
             comment.contains("Architecture") || comment.contains("General"),
             "high-level suggestions (lines 0-0) should appear in Architecture/General section: got first 500 chars: {}",
             &comment[..comment.len().min(500)]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_improve_passes_images_to_suggest_not_reflect() {
+        let img_url = "https://github.com/user-attachments/assets/abc123-arch";
+        let provider = Arc::new(
+            MockGitProvider::new()
+                .with_diff_files(vec![sample_diff_file("src/main.rs", SAMPLE_PATCH)])
+                .with_pr_description(
+                    "Test PR",
+                    &format!("![arch]({img_url})\nArchitecture change"),
+                ),
+        );
+        let ai = Arc::new(MockAiHandler::with_responses(vec![
+            IMPROVE_YAML_PASS1.into(),
+            IMPROVE_YAML_PASS2_REFLECT.into(),
+        ]));
+        let improver = PRCodeSuggestions::new_with_ai(provider.clone(), ai.clone());
+
+        let settings = test_settings();
+        with_settings(settings, improver.run()).await.unwrap();
+
+        let recorded = ai.get_recorded_calls();
+        assert_eq!(recorded.len(), 2, "should have suggest + reflect calls");
+
+        // First call (suggest) should have images
+        let suggest_call = &recorded[0];
+        assert!(
+            suggest_call.image_urls.is_some(),
+            "suggest pass should include images from PR body"
+        );
+        assert_eq!(suggest_call.image_urls.as_ref().unwrap(), &[img_url]);
+
+        // Second call (reflect) should NOT have images
+        let reflect_call = &recorded[1];
+        assert!(
+            reflect_call.image_urls.is_none(),
+            "reflect pass should NOT include images"
         );
     }
 }

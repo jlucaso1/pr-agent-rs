@@ -32,6 +32,7 @@ pub struct MockGitProvider {
     pub commit_messages: String,
     pub diff_files: Vec<FilePatchInfo>,
     pub issue_comments: Vec<IssueComment>,
+    pub issue_bodies: HashMap<u64, (String, String)>,
     pub repo_settings_toml: Option<String>,
     pub global_settings_toml: Option<String>,
     pub calls: Mutex<MockCalls>,
@@ -46,6 +47,7 @@ impl MockGitProvider {
             commit_messages: "feat: add test feature".into(),
             diff_files: Vec::new(),
             issue_comments: Vec::new(),
+            issue_bodies: HashMap::new(),
             repo_settings_toml: None,
             global_settings_toml: None,
             calls: Mutex::new(MockCalls::default()),
@@ -70,6 +72,12 @@ impl MockGitProvider {
 
     pub fn with_global_settings(mut self, toml: &str) -> Self {
         self.global_settings_toml = Some(toml.into());
+        self
+    }
+
+    pub fn with_issue_body(mut self, number: u64, title: &str, body: &str) -> Self {
+        self.issue_bodies
+            .insert(number, (title.into(), body.into()));
         self
     }
 
@@ -234,5 +242,16 @@ impl GitProvider for MockGitProvider {
     async fn auto_approve(&self) -> Result<bool, PrAgentError> {
         self.calls.lock().unwrap().auto_approvals.push(());
         Ok(true)
+    }
+
+    fn repo_owner_and_name(&self) -> (String, String) {
+        ("test-owner".into(), "test-repo".into())
+    }
+
+    async fn get_issue_body(&self, issue_number: u64) -> Result<(String, String), PrAgentError> {
+        self.issue_bodies
+            .get(&issue_number)
+            .cloned()
+            .ok_or_else(|| PrAgentError::GitProvider(format!("issue #{issue_number} not found")))
     }
 }

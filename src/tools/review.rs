@@ -82,6 +82,13 @@ impl PRReviewer {
         // 5. Call AI (with fallback models)
         tracing::info!(model, "calling AI model for review");
         let ai = super::resolve_ai_handler(&self.ai)?;
+        let image_urls = super::get_pr_images(
+            &meta.description,
+            self.provider.as_ref(),
+            self.provider.get_pr_number(),
+        )
+        .await;
+        let image_ref = image_urls.as_deref();
         let response = crate::ai::chat_completion_with_fallback(
             ai.as_ref(),
             model,
@@ -89,7 +96,7 @@ impl PRReviewer {
             &rendered.system,
             &rendered.user,
             Some(settings.config.temperature),
-            None,
+            image_ref,
         )
         .await?;
 
@@ -423,5 +430,174 @@ mod tests {
             !calls.removed_comments.is_empty(),
             "should remove the progress comment after completion"
         );
+    }
+
+    #[tokio::test]
+    async fn test_review_passes_images_to_ai() {
+        // Use GitHub user-attachment URLs — these skip HEAD validation in tests
+        let img_url = "https://github.com/user-attachments/assets/abc123-screenshot";
+        let provider = Arc::new(
+            MockGitProvider::new()
+                .with_diff_files(vec![sample_diff_file("src/main.rs", SAMPLE_PATCH)])
+                .with_pr_description(
+                    "Test PR",
+                    &format!("## Changes\n![screenshot]({img_url})\nSome text"),
+                ),
+        );
+        let ai = Arc::new(MockAiHandler::new(REVIEW_YAML));
+        let reviewer = PRReviewer::new_with_ai(provider.clone(), ai.clone());
+
+        let settings = test_settings();
+        with_settings(settings, reviewer.run()).await.unwrap();
+
+        let recorded = ai.get_recorded_calls();
+        assert_eq!(recorded.len(), 1);
+        let call = &recorded[0];
+        assert!(
+            call.image_urls.is_some(),
+            "should pass image URLs to AI when PR body contains images"
+        );
+        let urls = call.image_urls.as_ref().unwrap();
+        assert_eq!(urls, &[img_url]);
+    }
+
+    #[tokio::test]
+    async fn test_review_no_images_when_vision_disabled() {
+        let provider = Arc::new(
+            MockGitProvider::new()
+                .with_diff_files(vec![sample_diff_file("src/main.rs", SAMPLE_PATCH)])
+                .with_pr_description(
+                    "Test PR",
+                    "![screenshot](https://github.com/user-attachments/assets/abc123)",
+                ),
+        );
+        let ai = Arc::new(MockAiHandler::new(REVIEW_YAML));
+        let reviewer = PRReviewer::new_with_ai(provider.clone(), ai.clone());
+
+        let mut overrides = std::collections::HashMap::new();
+        overrides.insert("config.publish_output".into(), "true".into());
+        overrides.insert("config.publish_output_progress".into(), "false".into());
+        overrides.insert("config.enable_vision".into(), "false".into());
+        let settings =
+            Arc::new(crate::config::loader::load_settings(&overrides, None, None).unwrap());
+        with_settings(settings, reviewer.run()).await.unwrap();
+
+        let recorded = ai.get_recorded_calls();
+        assert_eq!(recorded.len(), 1);
+        assert!(
+            recorded[0].image_urls.is_none(),
+            "should NOT pass images when vision is disabled"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_review_extracts_images_from_linked_issues() {
+        // PR body references issue #1, which has a screenshot
+        let issue_img = "https://github.com/user-attachments/assets/issue-screenshot-1";
+        let provider = Arc::new(
+            MockGitProvider::new()
+                .with_diff_files(vec![sample_diff_file("src/main.rs", SAMPLE_PATCH)])
+                .with_pr_description("Test PR", "Fixes #1\nSome description")
+                .with_issue_body(1, "Bug report", &format!("Steps:\n![bug]({issue_img})")),
+        );
+        let ai = Arc::new(MockAiHandler::new(REVIEW_YAML));
+        let reviewer = PRReviewer::new_with_ai(provider.clone(), ai.clone());
+
+        let settings = test_settings();
+        with_settings(settings, reviewer.run()).await.unwrap();
+
+        let recorded = ai.get_recorded_calls();
+        assert_eq!(recorded.len(), 1);
+        let call = &recorded[0];
+        assert!(
+            call.image_urls.is_some(),
+            "should extract images from linked issue body"
+        );
+        let urls = call.image_urls.as_ref().unwrap();
+        assert!(
+            urls.contains(&issue_img.to_string()),
+            "should include issue image URL: {urls:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_review_merges_pr_and_issue_images() {
+        // PR body has one image AND references issue #2 which has another image
+        let pr_img = "https://github.com/user-attachments/assets/pr-screenshot";
+        let issue_img = "https://github.com/user-attachments/assets/issue-screenshot-2";
+        let provider = Arc::new(
+            MockGitProvider::new()
+                .with_diff_files(vec![sample_diff_file("src/main.rs", SAMPLE_PATCH)])
+                .with_pr_description("Test PR", &format!("![ui]({pr_img})\nFixes #2"))
+                .with_issue_body(
+                    2,
+                    "Feature request",
+                    &format!("Mockup:\n![mockup]({issue_img})"),
+                ),
+        );
+        let ai = Arc::new(MockAiHandler::new(REVIEW_YAML));
+        let reviewer = PRReviewer::new_with_ai(provider.clone(), ai.clone());
+
+        let settings = test_settings();
+        with_settings(settings, reviewer.run()).await.unwrap();
+
+        let recorded = ai.get_recorded_calls();
+        assert_eq!(recorded.len(), 1);
+        let urls = recorded[0].image_urls.as_ref().unwrap();
+        assert_eq!(urls.len(), 2, "should have both PR and issue images");
+        assert!(urls.contains(&pr_img.to_string()));
+        assert!(urls.contains(&issue_img.to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_review_deduplicates_images_across_pr_and_issues() {
+        // Same image URL in both PR body and issue body — should appear once
+        let shared_img = "https://github.com/user-attachments/assets/shared-img";
+        let provider = Arc::new(
+            MockGitProvider::new()
+                .with_diff_files(vec![sample_diff_file("src/main.rs", SAMPLE_PATCH)])
+                .with_pr_description("Test PR", &format!("![img]({shared_img})\nFixes #3"))
+                .with_issue_body(3, "Bug", &format!("See ![same]({shared_img})")),
+        );
+        let ai = Arc::new(MockAiHandler::new(REVIEW_YAML));
+        let reviewer = PRReviewer::new_with_ai(provider.clone(), ai.clone());
+
+        let settings = test_settings();
+        with_settings(settings, reviewer.run()).await.unwrap();
+
+        let recorded = ai.get_recorded_calls();
+        let urls = recorded[0].image_urls.as_ref().unwrap();
+        assert_eq!(
+            urls.len(),
+            1,
+            "duplicate image across PR and issue should be deduplicated"
+        );
+        assert_eq!(urls[0], shared_img);
+    }
+
+    #[tokio::test]
+    async fn test_review_skips_missing_issues_gracefully() {
+        // PR references issue #99 which doesn't exist in mock — should not error
+        let pr_img = "https://github.com/user-attachments/assets/pr-img";
+        let provider = Arc::new(
+            MockGitProvider::new()
+                .with_diff_files(vec![sample_diff_file("src/main.rs", SAMPLE_PATCH)])
+                .with_pr_description("Test PR", &format!("![img]({pr_img})\nFixes #99")),
+            // Note: issue #99 is NOT added to mock — simulates 404
+        );
+        let ai = Arc::new(MockAiHandler::new(REVIEW_YAML));
+        let reviewer = PRReviewer::new_with_ai(provider.clone(), ai.clone());
+
+        let settings = test_settings();
+        with_settings(settings, reviewer.run()).await.unwrap();
+
+        let recorded = ai.get_recorded_calls();
+        let urls = recorded[0].image_urls.as_ref().unwrap();
+        assert_eq!(
+            urls.len(),
+            1,
+            "should still have PR image despite issue fetch failure"
+        );
+        assert_eq!(urls[0], pr_img);
     }
 }

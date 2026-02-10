@@ -1,6 +1,7 @@
 pub mod ask;
 pub mod ask_line;
 pub mod describe;
+pub mod image;
 pub mod improve;
 pub mod review;
 
@@ -141,6 +142,92 @@ pub fn build_common_vars(meta: &PrMetadata, diff: &str) -> HashMap<String, Value
     .into_iter()
     .map(|(k, v)| (k.to_string(), Value::from(v)))
     .collect()
+}
+
+/// Extract validated image URLs from the PR description and linked issues,
+/// respecting `enable_vision` config.
+///
+/// Collects images from:
+/// 1. The PR description itself (markdown images, HTML `<img>` tags, bare URLs)
+/// 2. Bodies of issues referenced in the PR description (`#N`, full GitHub URLs)
+///
+/// **Edge cases handled:**
+/// - Skips fetching the PR's own number (GitHub issues API returns PRs too)
+/// - Only follows 1 level deep — does NOT recurse into issues referenced by other issues
+/// - Individual issue fetch failures are logged and skipped (no hard failure)
+/// - Deduplicates images across PR body and all issue bodies
+/// - Validates all URLs with HEAD requests (GitHub-hosted URLs are trusted)
+/// - Capped at 5 linked issues max to avoid excessive API calls
+///
+/// Returns `None` when no images are found or vision is disabled,
+/// matching the `image_urls: Option<&[String]>` convention used by the AI handler.
+pub async fn get_pr_images(
+    description: &str,
+    provider: &dyn GitProvider,
+    pr_number: Option<u64>,
+) -> Option<Vec<String>> {
+    let settings = get_settings();
+    if !settings.config.enable_vision {
+        return None;
+    }
+
+    // 1. Extract image URLs from PR body
+    let mut all_urls = image::extract_image_urls(description);
+    let mut seen: std::collections::HashSet<String> = all_urls.iter().cloned().collect();
+
+    // 2. Extract linked issue numbers and fetch their bodies
+    let (owner, repo) = provider.repo_owner_and_name();
+    if !owner.is_empty() && !repo.is_empty() {
+        let issue_numbers = image::extract_linked_issue_numbers(description, &owner, &repo);
+
+        // Filter out the PR's own number (GitHub issues API returns PRs too,
+        // so fetching it would just return the same body we already parsed)
+        // and enforce the cap of 5 as defense-in-depth.
+        let issue_numbers: Vec<u64> = issue_numbers
+            .into_iter()
+            .filter(|&n| pr_number != Some(n))
+            .take(image::MAX_LINKED_ISSUES)
+            .collect();
+
+        if !issue_numbers.is_empty() {
+            let futures: Vec<_> = issue_numbers
+                .iter()
+                .map(|&n| provider.get_issue_body(n))
+                .collect();
+            let results = futures_util::future::join_all(futures).await;
+
+            for (i, result) in results.into_iter().enumerate() {
+                match result {
+                    Ok((_title, body)) => {
+                        for url in image::extract_image_urls(&body) {
+                            if seen.insert(url.clone()) {
+                                all_urls.push(url);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            issue = issue_numbers[i],
+                            error = %e,
+                            "failed to fetch linked issue body for image extraction, skipping"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    if all_urls.is_empty() {
+        return None;
+    }
+
+    // 3. Validate all URLs (HEAD requests, GitHub URLs trusted)
+    let validated = image::validate_image_urls(all_urls).await;
+    if validated.is_empty() {
+        None
+    } else {
+        Some(validated)
+    }
 }
 
 /// Insert custom-labels template variables into the vars map.

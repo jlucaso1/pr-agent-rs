@@ -123,13 +123,20 @@ impl PRAskLine {
 
         // 5. Call AI
         let ai = resolve_ai_handler(&self.ai)?;
+        let image_urls = if settings.config.enable_vision {
+            let urls = crate::tools::image::extract_and_validate_image_urls(question).await;
+            if urls.is_empty() { None } else { Some(urls) }
+        } else {
+            None
+        };
+        let image_ref = image_urls.as_deref();
         let response = ai
             .chat_completion(
                 model,
                 &rendered.system,
                 &rendered.user,
                 Some(settings.config.temperature),
-                None,
+                image_ref,
             )
             .await?;
 

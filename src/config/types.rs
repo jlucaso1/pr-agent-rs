@@ -223,6 +223,7 @@ pub struct GlobalConfig {
     pub enable_claude_extended_thinking: bool,
     pub extended_thinking_budget_tokens: u32,
     pub extended_thinking_max_output_tokens: u32,
+    pub enable_vision: bool,
 }
 
 impl Default for GlobalConfig {
@@ -284,6 +285,7 @@ impl Default for GlobalConfig {
             enable_claude_extended_thinking: false,
             extended_thinking_budget_tokens: 2048,
             extended_thinking_max_output_tokens: 4096,
+            enable_vision: true,
         }
     }
 }

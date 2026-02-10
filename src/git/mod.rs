@@ -239,9 +239,18 @@ pub trait GitProvider: Send + Sync {
         Ok(self.get_diff_files().await?.len())
     }
 
-    /// Get the PR number/ID.
+    /// Get the PR number/ID as a string.
     fn get_pr_id(&self) -> &str {
         ""
+    }
+
+    /// Get the PR number as a u64.
+    ///
+    /// Returns `None` if the provider doesn't track a numeric PR number.
+    /// Used to avoid fetching the PR's own body when extracting linked issues.
+    fn get_pr_number(&self) -> Option<u64> {
+        let id = self.get_pr_id();
+        if id.is_empty() { None } else { id.parse().ok() }
     }
 
     /// Fetch `best_practices.md` content from the repo root.
@@ -259,5 +268,15 @@ pub trait GitProvider: Send + Sync {
     /// or empty string if none exist or `add_repo_metadata` is false.
     async fn get_repo_metadata(&self) -> Result<String, PrAgentError> {
         Ok(String::new())
+    }
+
+    /// Repository owner and name (e.g. `("octocat", "hello-world")`).
+    fn repo_owner_and_name(&self) -> (String, String) {
+        (String::new(), String::new())
+    }
+
+    /// Fetch an issue's title and body by issue number.
+    async fn get_issue_body(&self, _issue_number: u64) -> Result<(String, String), PrAgentError> {
+        Err(PrAgentError::Unsupported("get_issue_body".into()))
     }
 }

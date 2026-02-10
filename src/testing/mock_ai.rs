@@ -7,13 +7,24 @@ use crate::ai::AiHandler;
 use crate::ai::types::{ChatResponse, FinishReason, ModelCapabilities, Usage};
 use crate::error::PrAgentError;
 
+/// A recorded AI call for test assertions (model, prompts, images).
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct RecordedAiCall {
+    pub model: String,
+    pub system: String,
+    pub user: String,
+    pub image_urls: Option<Vec<String>>,
+}
+
 /// Mock AI handler that returns pre-configured responses in order.
 ///
 /// Supports single-response (review/describe) and multi-response (improve's
-/// suggestion + reflect passes) flows.
+/// suggestion + reflect passes) flows.  Records every call for assertions.
 pub struct MockAiHandler {
     responses: Mutex<VecDeque<String>>,
     pub call_count: Mutex<usize>,
+    recorded_calls: Mutex<Vec<RecordedAiCall>>,
 }
 
 impl MockAiHandler {
@@ -24,6 +35,7 @@ impl MockAiHandler {
         Self {
             responses: Mutex::new(q),
             call_count: Mutex::new(0),
+            recorded_calls: Mutex::new(Vec::new()),
         }
     }
 
@@ -32,11 +44,17 @@ impl MockAiHandler {
         Self {
             responses: Mutex::new(responses.into()),
             call_count: Mutex::new(0),
+            recorded_calls: Mutex::new(Vec::new()),
         }
     }
 
     pub fn get_call_count(&self) -> usize {
         *self.call_count.lock().unwrap()
+    }
+
+    /// Get all recorded AI calls for test assertions.
+    pub fn get_recorded_calls(&self) -> Vec<RecordedAiCall> {
+        self.recorded_calls.lock().unwrap().clone()
     }
 }
 
@@ -52,12 +70,20 @@ impl AiHandler for MockAiHandler {
 
     async fn chat_completion(
         &self,
-        _model: &str,
-        _system: &str,
-        _user: &str,
+        model: &str,
+        system: &str,
+        user: &str,
         _temperature: Option<f32>,
-        _image_urls: Option<&[String]>,
+        image_urls: Option<&[String]>,
     ) -> Result<ChatResponse, PrAgentError> {
+        // Record the call
+        self.recorded_calls.lock().unwrap().push(RecordedAiCall {
+            model: model.to_string(),
+            system: system.to_string(),
+            user: user.to_string(),
+            image_urls: image_urls.map(|u| u.to_vec()),
+        });
+
         let mut count = self.call_count.lock().unwrap();
         *count += 1;
 

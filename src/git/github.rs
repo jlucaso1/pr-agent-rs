@@ -950,6 +950,18 @@ impl GitProvider for GithubProvider {
         Ok(combined)
     }
 
+    fn repo_owner_and_name(&self) -> (String, String) {
+        (self.parsed.owner.clone(), self.parsed.repo.clone())
+    }
+
+    async fn get_issue_body(&self, issue_number: u64) -> Result<(String, String), PrAgentError> {
+        let path = format!("repos/{}/issues/{}", self.repo_full, issue_number);
+        let data = self.api_get(&path).await?;
+        let title = data["title"].as_str().unwrap_or_default().to_string();
+        let body = data["body"].as_str().unwrap_or_default().to_string();
+        Ok((title, body))
+    }
+
     async fn auto_approve(&self) -> Result<bool, PrAgentError> {
         let path = format!(
             "repos/{}/pulls/{}/reviews",

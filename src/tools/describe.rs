@@ -87,6 +87,13 @@ impl PRDescription {
         // 5. Call AI (with fallback models)
         tracing::info!(model, "calling AI model for describe");
         let ai = super::resolve_ai_handler(&self.ai)?;
+        let image_urls = super::get_pr_images(
+            &meta.description,
+            self.provider.as_ref(),
+            self.provider.get_pr_number(),
+        )
+        .await;
+        let image_ref = image_urls.as_deref();
         let response = crate::ai::chat_completion_with_fallback(
             ai.as_ref(),
             model,
@@ -94,7 +101,7 @@ impl PRDescription {
             &rendered.system,
             &rendered.user,
             Some(settings.config.temperature),
-            None,
+            image_ref,
         )
         .await?;
 
@@ -669,5 +676,37 @@ description: "Changes"
             !calls.comments.is_empty(),
             "should publish as comment instead"
         );
+    }
+
+    #[tokio::test]
+    async fn test_describe_passes_images_to_ai() {
+        let img_url = "https://github.com/user-attachments/assets/abc123-design";
+        let provider = Arc::new(
+            MockGitProvider::new()
+                .with_diff_files(vec![sample_diff_file("src/main.rs", SAMPLE_PATCH)])
+                .with_pr_description(
+                    "Test PR",
+                    &format!("## UI Update\n![design]({img_url})\nNew layout"),
+                ),
+        );
+        let ai = Arc::new(MockAiHandler::new(DESCRIBE_YAML));
+        let describer = PRDescription::new_with_ai(provider.clone(), ai.clone());
+
+        let mut overrides = std::collections::HashMap::new();
+        overrides.insert("config.publish_output".into(), "true".into());
+        overrides.insert("config.publish_output_progress".into(), "false".into());
+        let settings =
+            Arc::new(crate::config::loader::load_settings(&overrides, None, None).unwrap());
+        with_settings(settings, describer.run()).await.unwrap();
+
+        let recorded = ai.get_recorded_calls();
+        assert_eq!(recorded.len(), 1);
+        let call = &recorded[0];
+        assert!(
+            call.image_urls.is_some(),
+            "should pass image URLs to AI when PR body contains images"
+        );
+        let urls = call.image_urls.as_ref().unwrap();
+        assert_eq!(urls, &[img_url]);
     }
 }
