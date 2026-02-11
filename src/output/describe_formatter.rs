@@ -1,7 +1,9 @@
 use std::collections::HashMap;
 use std::fmt::Write;
+use std::sync::LazyLock;
 
 use indexmap::IndexMap;
+use regex::Regex;
 
 use crate::config::types::{BoolOrString, PrDescriptionConfig};
 use crate::output::markdown::persistent_comment_marker;
@@ -118,16 +120,17 @@ pub fn format_describe_output(
         let diagram_str = diagram.as_str().unwrap_or("").trim();
         if !diagram_str.is_empty() {
             let _ = writeln!(body, "### Diagram Walkthrough\n");
+            // Sanitize mermaid content: quote text with special chars like (){}
+            let sanitized = sanitize_mermaid(diagram_str);
             // Preserve existing fences from AI, only add closing if missing.
-            // Check if AI already returned fenced content.
-            if diagram_str.starts_with("```") {
-                let mut d = diagram_str.to_string();
+            if sanitized.starts_with("```") {
+                let mut d = sanitized;
                 if !d.ends_with("```") {
                     d.push_str("\n```");
                 }
                 let _ = writeln!(body, "{d}\n");
             } else {
-                let _ = writeln!(body, "```mermaid\n{diagram_str}\n```\n");
+                let _ = writeln!(body, "```mermaid\n{sanitized}\n```\n");
             }
         }
     }
@@ -401,6 +404,56 @@ fn extract_labels(data: &serde_yaml_ng::Value, pr_type: &str) -> Vec<String> {
         .filter(|s| !s.is_empty())
         .map(String::from)
         .collect()
+}
+
+/// Regex matching mermaid edge labels: `|text|` (between arrows and nodes).
+/// Captures: (1) = text inside the pipes.
+static MERMAID_EDGE_LABEL_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"\|([^"|][^|]*)\|"#).unwrap());
+
+/// Regex matching mermaid node text: `ID[text]` (square brackets after node ID).
+/// Captures: (1) = node ID, (2) = text inside the brackets.
+static MERMAID_NODE_TEXT_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"(\w+)\[([^"\]]*[(){}][^\]]*)\]"#).unwrap());
+
+/// Characters inside mermaid text that trigger shape parsing and need quoting.
+const MERMAID_SPECIAL: &[char] = &['(', ')', '{', '}'];
+
+/// Sanitize mermaid diagram content by quoting text that contains special characters.
+///
+/// Mermaid interprets `(`, `)`, `{`, `}` as shape delimiters. When AI-generated
+/// edge labels or node text contain these (e.g. `.min(1)`), the diagram fails to
+/// render. This wraps such text in double quotes, which tells mermaid to treat it
+/// as literal text.
+fn sanitize_mermaid(text: &str) -> String {
+    let mut result = String::with_capacity(text.len() + 32);
+    for line in text.lines() {
+        if !result.is_empty() {
+            result.push('\n');
+        }
+        let mut fixed = line.to_string();
+        // 1. Quote edge labels containing special chars: |text| → |"text"|
+        if fixed.contains('|') {
+            fixed = MERMAID_EDGE_LABEL_RE
+                .replace_all(&fixed, |caps: &regex::Captures| {
+                    let label = &caps[1];
+                    if label.contains(MERMAID_SPECIAL) {
+                        format!("|\"{}\"| ", label.trim())
+                    } else {
+                        caps[0].to_string()
+                    }
+                })
+                .into_owned();
+        }
+        // 2. Quote node text containing special chars: ID[text()] → ID["text()"]
+        fixed = MERMAID_NODE_TEXT_RE
+            .replace_all(&fixed, |caps: &regex::Captures| {
+                format!("{}[\"{}\" ]", &caps[1], caps[2].trim())
+            })
+            .into_owned();
+        result.push_str(&fixed);
+    }
+    result
 }
 
 #[cfg(test)]
@@ -709,5 +762,81 @@ pr_files:
                 .body
                 .contains(r#"<a href="https://github.com/owner/repo/pull/1/files#diff-abc123">"#)
         );
+    }
+
+    // ── Mermaid sanitization tests ──────────────────────────────────
+
+    #[test]
+    fn test_sanitize_mermaid_edge_label_with_parens() {
+        let input = r#"flowchart LR
+  G[Schemas] -->|Add .min(1)| H[Prevent errors]"#;
+        let result = sanitize_mermaid(input);
+        assert!(
+            result.contains(r#"|"Add .min(1)"| "#),
+            "edge label with parens should be quoted: {result}"
+        );
+    }
+
+    #[test]
+    fn test_sanitize_mermaid_node_text_with_parens() {
+        let input = "  A[fn(x)] --> B[result]";
+        let result = sanitize_mermaid(input);
+        assert!(
+            result.contains(r#"A["fn(x)" ]"#),
+            "node text with parens should be quoted: {result}"
+        );
+        // B[result] has no special chars — should NOT be quoted
+        assert!(
+            result.contains("B[result]"),
+            "node text without special chars should be unchanged: {result}"
+        );
+    }
+
+    #[test]
+    fn test_sanitize_mermaid_no_special_chars_unchanged() {
+        let input = "flowchart LR\n  A[Start] -->|Do work| B[End]";
+        let result = sanitize_mermaid(input);
+        assert_eq!(result, input, "no special chars → no changes");
+    }
+
+    #[test]
+    fn test_sanitize_mermaid_already_quoted_unchanged() {
+        // Already double-quoted text should not be re-quoted
+        let input = r#"A -->|"already quoted(1)"| B"#;
+        let result = sanitize_mermaid(input);
+        assert_eq!(result, input, "already-quoted labels should not be changed");
+    }
+
+    #[test]
+    fn test_sanitize_mermaid_curly_braces_in_edge_label() {
+        let input = "A -->|{key: value}| B";
+        let result = sanitize_mermaid(input);
+        assert!(
+            result.contains(r#"|"{key: value}"| "#),
+            "edge label with curly braces should be quoted: {result}"
+        );
+    }
+
+    #[test]
+    fn test_sanitize_mermaid_production_failure() {
+        // Exact reproduction of the production failure from logs
+        let input = r#"flowchart LR
+  A[Shared compressPDF] -->|Validation added| B[Prevents corrupted PDFs]
+  C[Macer POST/PUT routes] -->|Use uploadFileToR2| D[Consistent file handling]
+  E[Transaction callbacks] -->|Fix db→trx| F[Proper isolation]
+  G[Payment request schemas] -->|Add .min(1)| H[Prevent empty array errors]
+  B --> I[All apps protected]
+  D --> I
+  F --> I
+  H --> I"#;
+        let result = sanitize_mermaid(input);
+        // The problematic line should now have quoted label
+        assert!(
+            result.contains(r#"|"Add .min(1)"| "#),
+            "production failure line should have quoted edge label: {result}"
+        );
+        // Lines without special chars should be untouched
+        assert!(result.contains("-->|Validation added|"));
+        assert!(result.contains("-->|Use uploadFileToR2|"));
     }
 }

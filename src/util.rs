@@ -29,8 +29,7 @@ pub fn get_or_compile_regex(pattern: &str) -> Option<Arc<Regex>> {
 }
 
 /// Find the largest byte offset <= `max_bytes` that falls on a UTF-8 char boundary.
-#[allow(dead_code)]
-fn floor_char_boundary(text: &str, max_bytes: usize) -> usize {
+pub(crate) fn floor_char_boundary(text: &str, max_bytes: usize) -> usize {
     if max_bytes >= text.len() {
         return text.len();
     }

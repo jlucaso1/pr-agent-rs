@@ -159,8 +159,29 @@ fn try_fix_yaml(
         return Some(data);
     }
 
-    let preview = if text.len() > 500 {
-        format!("{}...(truncated {} chars)", &text[..500], text.len() - 500)
+    // ── Fallback 11: Composite — fix indentation + quote bracket keys ──
+    // When a response needs BOTH indent fixing AND bracket-key quoting,
+    // neither individual fallback succeeds. Chain them together.
+    if text.contains('[') {
+        let indent_fixed = apply_fix_code_indent(text);
+        if let Some(data) = fallback_quote_bracket_keys(&indent_fixed) {
+            tracing::info!("YAML parsed after composite fix (indent + bracket quoting)");
+            return Some(data);
+        }
+    }
+
+    // ── Fallback 12: Composite — fix orphan lines + quote bracket keys ──
+    if text.contains('[') {
+        let orphan_fixed = apply_fix_orphan_continuation_lines(text);
+        if let Some(data) = fallback_quote_bracket_keys(&orphan_fixed) {
+            tracing::info!("YAML parsed after composite fix (orphan lines + bracket quoting)");
+            return Some(data);
+        }
+    }
+
+    let preview = if text.len() > 2000 {
+        let end = crate::util::floor_char_boundary(text, 2000);
+        format!("{}...(truncated {} chars)", &text[..end], text.len() - end)
     } else {
         text.to_string()
     };
@@ -321,6 +342,14 @@ static YAML_KEY_RE: LazyLock<Regex> =
 /// YAML parsing fails. This adds indentation to content lines following
 /// `key: |` until the next YAML key at the same or lower indentation level.
 fn fallback_fix_code_indent(text: &str, _keys: &[&str]) -> Option<serde_yaml_ng::Value> {
+    try_parse(&apply_fix_code_indent(text))
+}
+
+/// Core logic for Fallback 7: returns the fixed text (always allocates).
+///
+/// Separated from `fallback_fix_code_indent` so composite fallbacks can
+/// chain the indent-fixed text through additional fixups.
+fn apply_fix_code_indent(text: &str) -> String {
     use std::fmt::Write;
     let mut result = String::with_capacity(text.len());
     let mut in_block_scalar = false;
@@ -336,10 +365,14 @@ fn fallback_fix_code_indent(text: &str, _keys: &[&str]) -> Option<serde_yaml_ng:
 
         if in_block_scalar {
             // Check if this line ends the block scalar:
-            // non-empty, at indent <= key_indent, looks like a YAML key or list item
+            // non-empty, at indent <= key_indent, looks like a YAML key or a list
+            // item whose content is a YAML key (e.g. `- filename: value`).
+            // Plain `- text` (no colon key) is block scalar content, not a boundary.
             let is_yaml_key = !trimmed_start.is_empty()
                 && line_indent <= key_indent
-                && (YAML_KEY_RE.is_match(trimmed_start) || trimmed_start.starts_with("- "));
+                && (YAML_KEY_RE.is_match(trimmed_start)
+                    || (trimmed_start.starts_with("- ")
+                        && YAML_KEY_RE.is_match(trimmed_start.get(2..).unwrap_or(""))));
 
             if is_yaml_key {
                 in_block_scalar = false;
@@ -355,11 +388,17 @@ fn fallback_fix_code_indent(text: &str, _keys: &[&str]) -> Option<serde_yaml_ng:
         // Check if this line starts a block scalar (ends with `: |` or `: |-`)
         if !in_block_scalar && (trimmed.ends_with(": |") || trimmed.ends_with(": |-")) {
             in_block_scalar = true;
-            key_indent = line_indent;
+            // Account for `- key: |` list items: the key is 2 chars deeper
+            // than the line indent, so sibling keys at indent+2 should end the scalar.
+            key_indent = if trimmed_start.starts_with("- ") {
+                line_indent + 2
+            } else {
+                line_indent
+            };
         }
     }
 
-    try_parse(&result)
+    result
 }
 
 /// Fallback 8: Remove leading pipe characters.
@@ -378,9 +417,21 @@ fn fallback_remove_leading_pipe(text: &str) -> Option<serde_yaml_ng::Value> {
 /// Single O(n) pass — tracks the previous non-empty line's indent incrementally
 /// instead of scanning backwards.
 fn fallback_fix_orphan_continuation_lines(text: &str) -> Option<serde_yaml_ng::Value> {
+    let fixed = apply_fix_orphan_continuation_lines(text);
+    if fixed == text {
+        None
+    } else {
+        try_parse(&fixed)
+    }
+}
+
+/// Core logic for Fallback 9: returns the fixed text.
+///
+/// Separated from `fallback_fix_orphan_continuation_lines` so composite
+/// fallbacks can chain the orphan-fixed text through additional fixups.
+fn apply_fix_orphan_continuation_lines(text: &str) -> String {
     use std::fmt::Write;
     let mut result = String::with_capacity(text.len() + 128);
-    let mut changed = false;
     let mut prev_nonempty_indent: usize = 0;
 
     for (i, line) in text.lines().enumerate() {
@@ -408,7 +459,6 @@ fn fallback_fix_orphan_continuation_lines(text: &str) -> Option<serde_yaml_ng::V
                 "",
                 width = prev_nonempty_indent + 2
             );
-            changed = true;
             // Don't update prev_nonempty_indent — the orphan's logical indent
             // is the one we just assigned, but for consecutive orphans we still
             // want to use the original anchor indent.
@@ -423,7 +473,7 @@ fn fallback_fix_orphan_continuation_lines(text: &str) -> Option<serde_yaml_ng::V
         }
     }
 
-    if changed { try_parse(&result) } else { None }
+    result
 }
 
 /// Regex for bracket-containing YAML keys: captures leading indent + key with brackets + colon.
@@ -594,5 +644,151 @@ It likely should be replaced with the correct loading state variable from the ho
                 .contains("mermaid")
         );
         assert!(data["pr_files"].is_sequence());
+    }
+
+    // ── Production failure reproduction tests ───────────────────────
+
+    #[test]
+    fn test_describe_block_scalar_list_content() {
+        // Production failure: AI returns block scalar with content starting with `- `
+        // (list-like text that is actually content, not a YAML list item).
+        let yaml = r#"type:
+- Bug fix
+description: |
+- Remove CSS capitalize class from clan date display
+- Implement manual first-char uppercase in JavaScript
+- Fix date format to show "Fev. de 2026" with lowercase "de"
+title: |
+Fix clan creation date capitalization for Portuguese prepositions
+pr_files:
+- filename: |
+    apps/web/src/app/(app)/clan/[id]/page.tsx
+  changes_summary: |
+    - Removed capitalize CSS class from date paragraph element
+    - Added IIFE to capitalize only first character"#;
+        let data = load_yaml(yaml, &[], "type", "pr_files");
+        assert!(
+            data.is_some(),
+            "should parse describe YAML with list-like block scalar content"
+        );
+        let data = data.unwrap();
+        assert!(data["pr_files"].is_sequence());
+        let desc = data["description"].as_str().unwrap_or_default();
+        assert!(
+            desc.contains("Remove CSS"),
+            "description should contain the block scalar content"
+        );
+    }
+
+    #[test]
+    fn test_describe_list_item_block_scalar() {
+        // Production failure: block scalar inside a list item (`- filename: |`)
+        // with sibling keys at indent 2 (`changes_summary:` must end the scalar).
+        let yaml = r#"pr_files:
+- filename: |
+    apps/web/src/app/(app)/clan/[id]/page.tsx
+  changes_summary: |
+    - Removed capitalize CSS class
+  label: bug fix"#;
+        let data = load_yaml(yaml, &[], "pr_files", "pr_files");
+        assert!(
+            data.is_some(),
+            "should parse list-item block scalar with sibling keys"
+        );
+        let data = data.unwrap();
+        let file = &data["pr_files"][0];
+        let filename = file["filename"].as_str().unwrap_or_default();
+        assert!(
+            filename.contains("page.tsx"),
+            "filename should be extracted: got {filename:?}"
+        );
+        let summary = file["changes_summary"].as_str().unwrap_or_default();
+        assert!(
+            summary.contains("Removed"),
+            "changes_summary should be extracted: got {summary:?}"
+        );
+    }
+
+    #[test]
+    fn test_review_bracket_key_with_block_scalars() {
+        // Production failure: bracket key + block scalars everywhere + orphan line.
+        // Needs composite fallback (indent fix + bracket quoting).
+        let yaml = r#"review:
+  estimated_effort_to_review_[1-5]: |
+    2
+  score: |
+    85
+  relevant_tests: |
+    No
+  key_issues_to_review:
+    - relevant_file: |
+        apps/api/app/Console/Commands/AdaptCommand.php
+      issue_header: |
+        Missing Output Validation
+      issue_content: |
+        The adaptQuestion method decodes JSON from Gemini AI but only checks for existence of statement key. It does not validate that the returned statement is actually in Portuguese.
+  security_concerns: |
+    No"#;
+        let data = load_yaml(
+            yaml,
+            &[
+                "estimated_effort_to_review_[1-5]:",
+                "security_concerns:",
+                "key_issues_to_review:",
+                "relevant_file:",
+                "issue_header:",
+                "issue_content:",
+            ],
+            "review",
+            "security_concerns",
+        );
+        assert!(
+            data.is_some(),
+            "should parse review YAML with bracket keys and block scalars"
+        );
+        let data = data.unwrap();
+        let review = &data["review"];
+        assert!(review["key_issues_to_review"].is_sequence());
+    }
+
+    #[test]
+    fn test_review_orphan_line_after_long_value() {
+        // Production failure: long issue_content wraps to column 0 without indentation.
+        let yaml = r#"review:
+  estimated_effort_to_review_[1-5]: 3
+  score: 85
+  relevant_tests: No
+  key_issues_to_review:
+    - relevant_file: .github/workflows/opencode-qa-verify.yml
+      issue_header: Missing E2E environment setup
+      issue_content: The QA verify workflow runs Playwright E2E tests via the run-e2e tool but does not set up the E2E database environment.
+This will cause E2E tests to fail due to missing database migrations for the E2E environment and missing browser binaries.
+  security_concerns: No"#;
+        let data = load_yaml(
+            yaml,
+            &[
+                "estimated_effort_to_review_[1-5]:",
+                "security_concerns:",
+                "key_issues_to_review:",
+                "relevant_file:",
+                "issue_header:",
+                "issue_content:",
+            ],
+            "review",
+            "security_concerns",
+        );
+        assert!(
+            data.is_some(),
+            "should parse review YAML with orphan continuation line"
+        );
+        let data = data.unwrap();
+        let review = &data["review"];
+        let issues = &review["key_issues_to_review"];
+        assert!(issues.is_sequence());
+        let content = issues[0]["issue_content"].as_str().unwrap_or_default();
+        assert!(
+            content.contains("E2E tests"),
+            "issue_content should contain the full text"
+        );
     }
 }
