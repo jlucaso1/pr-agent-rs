@@ -232,6 +232,14 @@ async fn dispatch_event(
             };
             let comment_body = comment_body.as_str();
 
+            // Parse command early so we can reject unknown commands before
+            // creating a provider, adding eyes reactions, or fetching settings.
+            let (command, mut args) = tools::parse_command(comment_body);
+            if !tools::is_known_command(&command) {
+                tracing::debug!(command, "ignoring unknown command from comment");
+                return Ok(());
+            }
+
             // Extract PR URL — from issue or from review comment's pull_request_url
             let pr_url = if let Some(url) = payload["comment"]["pull_request_url"].as_str() {
                 url.to_string()
@@ -247,9 +255,6 @@ async fn dispatch_event(
 
             // Fetch global + repo settings and scope them for this command
             let scoped_settings = fetch_scoped_settings(provider.as_ref(), &settings).await;
-
-            // Parse and dispatch command
-            let (command, mut args) = tools::parse_command(comment_body);
 
             // Inject diff_hunk for ask_line when available
             if command == "ask_line"
@@ -1637,5 +1642,61 @@ num_max_findings = 3
         });
         // Should return early without panic
         handle_closed_pr(&payload);
+    }
+
+    // ── Unknown command early-rejection tests ────────────────────────
+
+    /// dispatch_event should silently ignore unknown `/` commands in issue
+    /// comments — no provider creation, no eyes reaction, no error.
+    #[tokio::test]
+    async fn test_dispatch_event_ignores_unknown_slash_command() {
+        let payload = serde_json::json!({
+            "action": "created",
+            "issue": {
+                "pull_request": {
+                    "html_url": "https://github.com/owner/repo/pull/1"
+                }
+            },
+            "comment": {
+                "id": 42,
+                "body": "/qa-verify"
+            }
+        });
+
+        // Should return Ok(()) without attempting any network calls
+        let result = dispatch_event("issue_comment", "created", &payload).await;
+        assert!(
+            result.is_ok(),
+            "unknown command /qa-verify should be silently ignored, got: {:?}",
+            result,
+        );
+    }
+
+    /// Known commands like /review should NOT be rejected (they will fail due
+    /// to missing network, but that's expected — we only verify they aren't
+    /// short-circuited by the unknown-command check).
+    #[tokio::test]
+    async fn test_dispatch_event_does_not_reject_known_command() {
+        let payload = serde_json::json!({
+            "action": "created",
+            "issue": {
+                "pull_request": {
+                    "html_url": "https://github.com/owner/repo/pull/1"
+                }
+            },
+            "comment": {
+                "id": 42,
+                "body": "/review"
+            }
+        });
+
+        // Known command should NOT return Ok(()) early — it will try to
+        // create a GithubProvider and fail because there's no real GitHub.
+        // An error here proves it got past the unknown-command gate.
+        let result = dispatch_event("issue_comment", "created", &payload).await;
+        assert!(
+            result.is_err(),
+            "/review should proceed past the gate and fail on provider creation"
+        );
     }
 }

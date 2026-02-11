@@ -319,6 +319,39 @@ pub fn parse_command(input: &str) -> (String, HashMap<String, String>) {
     (command, overrides)
 }
 
+/// Recognized tool commands.
+///
+/// The single source of truth for command-name → tool mapping.
+/// `resolve_command` maps string aliases to variants; `dispatch` executes them.
+/// Adding a new tool here automatically makes it recognized by `is_known_command`.
+enum Command {
+    Review,
+    Describe,
+    Improve,
+    Ask,
+    AskLine,
+}
+
+/// Map a command name string to its `Command` variant, if recognized.
+fn resolve_command(name: &str) -> Option<Command> {
+    match name {
+        "review" | "auto_review" | "review_pr" => Some(Command::Review),
+        "describe" | "describe_pr" => Some(Command::Describe),
+        "improve" | "improve_code" => Some(Command::Improve),
+        "ask" => Some(Command::Ask),
+        "ask_line" => Some(Command::AskLine),
+        _ => None,
+    }
+}
+
+/// Check whether a command name is one that pr-agent-rs can handle.
+///
+/// Used by the webhook handler to reject unknown commands early — before
+/// creating a provider, adding eyes reactions, or fetching scoped settings.
+pub fn is_known_command(name: &str) -> bool {
+    resolve_command(name).is_some()
+}
+
 /// Dispatch a command to the appropriate tool.
 ///
 /// If `args` contains per-command overrides (from `/command --key=value` parsing),
@@ -360,16 +393,18 @@ async fn dispatch(
     provider: Arc<dyn GitProvider>,
     args: &HashMap<String, String>,
 ) -> Result<(), PrAgentError> {
-    match command {
-        "review" | "auto_review" | "review_pr" => review::PRReviewer::new(provider).run().await,
-        "describe" | "describe_pr" => describe::PRDescription::new(provider).run().await,
-        "improve" | "improve_code" => improve::PRCodeSuggestions::new(provider).run().await,
-        "ask" => {
+    let Some(cmd) = resolve_command(command) else {
+        return Err(PrAgentError::Other(format!("unknown command: '{command}'")));
+    };
+    match cmd {
+        Command::Review => review::PRReviewer::new(provider).run().await,
+        Command::Describe => describe::PRDescription::new(provider).run().await,
+        Command::Improve => improve::PRCodeSuggestions::new(provider).run().await,
+        Command::Ask => {
             let question = args.get("_text").map(|s| s.as_str()).unwrap_or("");
             ask::PRAsk::new(provider).run(question).await
         }
-        "ask_line" => ask_line::PRAskLine::new(provider).run(args).await,
-        _ => Err(PrAgentError::Other(format!("unknown command: '{command}'"))),
+        Command::AskLine => ask_line::PRAskLine::new(provider).run(args).await,
     }
 }
 
@@ -572,5 +607,35 @@ mod tests {
         assert_eq!(args.get("file_name").unwrap(), "src/main.rs");
         assert_eq!(args.get("comment_id").unwrap(), "123");
         assert_eq!(args.get("_text").unwrap(), "What is this?");
+    }
+
+    // ── is_known_command tests ───────────────────────────────────────
+
+    #[test]
+    fn test_is_known_command_all_aliases() {
+        // Every alias in resolve_command must be recognized
+        for cmd in [
+            "review",
+            "auto_review",
+            "review_pr",
+            "describe",
+            "describe_pr",
+            "improve",
+            "improve_code",
+            "ask",
+            "ask_line",
+        ] {
+            assert!(is_known_command(cmd), "'{cmd}' should be a known command");
+        }
+    }
+
+    #[test]
+    fn test_is_known_command_rejects_unknown() {
+        for cmd in ["qa-verify", "qa-review", "help", "deploy", "", "REVIEW"] {
+            assert!(
+                !is_known_command(cmd),
+                "'{cmd}' should NOT be a known command"
+            );
+        }
     }
 }
