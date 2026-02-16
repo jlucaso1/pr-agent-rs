@@ -24,7 +24,7 @@ clap = { version = "4", features = ["derive"] }
 
 # Configuration
 figment = { version = "0.10", features = ["toml", "env"] }
-futures-util = "0.3.31"
+futures-util = "0.3.32"
 
 hex = "0.4"
 
