@@ -163,11 +163,43 @@ pub fn get_max_tokens(model: &str) -> u32 {
     }
 }
 
-/// Look up the maximum context tokens for a model, falling back to the
-/// configured `max_model_tokens` if the model is unknown.
-pub fn get_max_tokens_with_fallback(model: &str, config_max: u32) -> u32 {
+/// Resolve the effective max context tokens for a model, mirroring the Python
+/// `get_max_tokens` (pr_agent/algo/utils.py):
+///
+/// 1. Known model → its table limit.
+/// 2. Unknown model with `custom_model_max_tokens > 0` → that value.
+/// 3. Unknown model with no custom limit → fall back to `max_model_tokens`
+///    (Python raises here; we warn and degrade gracefully instead of crashing).
+///
+/// In ALL cases the result is further capped by `max_model_tokens` when it is
+/// positive. This is an input-quality limit: the AI degrades when the input is
+/// too long, so users can cap even very large known models (e.g. limit a 128k
+/// model to the default 32k). Previously this cap was only applied to unknown
+/// models, silently ignoring `max_model_tokens` for every known model.
+pub fn get_max_tokens_with_fallback(
+    model: &str,
+    max_model_tokens: u32,
+    custom_model_max_tokens: i32,
+) -> u32 {
     let known = get_max_tokens(model);
-    if known > 0 { known } else { config_max }
+    let base = if known > 0 {
+        known
+    } else if custom_model_max_tokens > 0 {
+        custom_model_max_tokens as u32
+    } else {
+        tracing::warn!(
+            model,
+            "model not in the known token table and custom_model_max_tokens is unset; \
+             falling back to max_model_tokens"
+        );
+        max_model_tokens
+    };
+
+    if max_model_tokens > 0 {
+        base.min(max_model_tokens)
+    } else {
+        base
+    }
 }
 
 /// Check if a model does NOT support the temperature parameter.
@@ -206,6 +238,8 @@ pub fn is_user_message_only_model(model: &str) -> bool {
 }
 
 /// Check if a model supports the `reasoning_effort` parameter.
+///
+/// Mirrors the Python `SUPPORT_REASONING_EFFORT_MODELS` list (o3/o4 family).
 pub fn supports_reasoning_effort(model: &str) -> bool {
     let normalized = normalize_model_name(model);
 
@@ -218,6 +252,45 @@ pub fn supports_reasoning_effort(model: &str) -> bool {
             | "o4-mini"
             | "o4-mini-2025-04-16"
     )
+}
+
+/// Check if a model belongs to the GPT-5 family.
+///
+/// Mirrors the Python `if model.startswith('gpt-5')` branch
+/// (`thinking_kwargs_gpt5`): every GPT-5 model receives `reasoning_effort`
+/// and has `temperature` removed. This is a separate mechanism from the
+/// o3/o4 `SUPPORT_REASONING_EFFORT_MODELS` list — the default config model
+/// (`gpt-5.2-2025-12-11`) is in this family.
+pub fn is_gpt5_reasoning_model(model: &str) -> bool {
+    let normalized = normalize_model_name(model);
+    normalized.starts_with("gpt-5")
+}
+
+/// Check if a model uses the `reasoning_effort` parameter through any path
+/// (GPT-5 family or the o3/o4 list). When true, the request must include
+/// `reasoning_effort` and omit `temperature`.
+pub fn uses_reasoning_effort(model: &str) -> bool {
+    is_gpt5_reasoning_model(model) || supports_reasoning_effort(model)
+}
+
+/// Normalize a configured `reasoning_effort` to a valid value, falling back to
+/// `"medium"` (with a warning) for anything outside the accepted set. Mirrors
+/// the Python `ReasoningEffort` validation so an invalid config value is never
+/// sent to the API raw.
+pub fn normalize_reasoning_effort(value: &str) -> String {
+    const VALID: &[&str] = &["xhigh", "high", "medium", "low", "minimal"];
+    let v = value.trim().to_lowercase();
+    if VALID.contains(&v.as_str()) {
+        v
+    } else {
+        if !value.trim().is_empty() {
+            tracing::warn!(
+                value,
+                "invalid reasoning_effort in config, falling back to 'medium'"
+            );
+        }
+        "medium".to_string()
+    }
 }
 
 /// Check if a model requires streaming (e.g. some API providers require it).
@@ -282,6 +355,36 @@ mod tests {
     }
 
     #[test]
+    fn test_get_max_tokens_with_fallback_caps_known_models() {
+        // Known model larger than the cap is clamped (the C2 fix): previously
+        // get_max_tokens_with_fallback ignored max_model_tokens for known models.
+        assert_eq!(get_max_tokens_with_fallback("gpt-4o", 32_000, -1), 32_000);
+        // Known model smaller than the cap stays as-is.
+        assert_eq!(get_max_tokens_with_fallback("gpt-4", 32_000, -1), 8_000);
+        // Cap disabled (0) → full known limit.
+        assert_eq!(get_max_tokens_with_fallback("gpt-4o", 0, -1), 128_000);
+    }
+
+    #[test]
+    fn test_get_max_tokens_with_fallback_unknown_model() {
+        // Unknown model uses custom_model_max_tokens when positive (the C4 fix),
+        // then still clamped by max_model_tokens.
+        assert_eq!(
+            get_max_tokens_with_fallback("unknown-model", 32_000, 16_000),
+            16_000
+        );
+        assert_eq!(
+            get_max_tokens_with_fallback("unknown-model", 32_000, 64_000),
+            32_000
+        );
+        // Unknown model with no custom limit → falls back to max_model_tokens.
+        assert_eq!(
+            get_max_tokens_with_fallback("unknown-model", 32_000, -1),
+            32_000
+        );
+    }
+
+    #[test]
     fn test_model_capabilities() {
         assert!(is_no_temperature_model("o3-mini"));
         assert!(!is_no_temperature_model("gpt-4o"));
@@ -289,5 +392,33 @@ mod tests {
         assert!(!is_user_message_only_model("gpt-4o"));
         assert!(supports_reasoning_effort("o3-mini"));
         assert!(!supports_reasoning_effort("gpt-4o"));
+    }
+
+    #[test]
+    fn test_gpt5_family_uses_reasoning_effort() {
+        // GPT-5 family is detected regardless of provider prefix / suffix.
+        assert!(is_gpt5_reasoning_model("gpt-5.2-2025-12-11")); // default config model
+        assert!(is_gpt5_reasoning_model("openai/gpt-5.2-2025-12-11"));
+        assert!(is_gpt5_reasoning_model("gpt-5"));
+        assert!(is_gpt5_reasoning_model("gpt-5-mini"));
+        assert!(is_gpt5_reasoning_model("gpt-5.1-codex"));
+        assert!(!is_gpt5_reasoning_model("gpt-4o"));
+        assert!(!is_gpt5_reasoning_model("o3-mini"));
+
+        // `uses_reasoning_effort` unifies both paths (GPT-5 family + o3/o4 list).
+        assert!(uses_reasoning_effort("gpt-5.2-2025-12-11"));
+        assert!(uses_reasoning_effort("o3-mini"));
+        assert!(!uses_reasoning_effort("gpt-4o"));
+    }
+
+    #[test]
+    fn test_normalize_reasoning_effort() {
+        // Valid values pass through (case/space-normalized).
+        assert_eq!(normalize_reasoning_effort("high"), "high");
+        assert_eq!(normalize_reasoning_effort(" Medium "), "medium");
+        assert_eq!(normalize_reasoning_effort("xhigh"), "xhigh");
+        // Invalid / empty fall back to medium.
+        assert_eq!(normalize_reasoning_effort("ultra"), "medium");
+        assert_eq!(normalize_reasoning_effort(""), "medium");
     }
 }

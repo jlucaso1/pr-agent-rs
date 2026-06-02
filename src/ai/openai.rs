@@ -8,7 +8,7 @@ use serde_json::json;
 use super::AiHandler;
 use super::token::{
     get_max_tokens_with_fallback, is_no_temperature_model, is_user_message_only_model,
-    supports_reasoning_effort,
+    normalize_reasoning_effort, uses_reasoning_effort,
 };
 use super::types::{ChatResponse, FinishReason, ModelCapabilities, Usage};
 use crate::config::loader::get_settings;
@@ -40,7 +40,7 @@ impl OpenAiCompatibleHandler {
             settings.openai.api_base.clone()
         };
         let deployment_id = settings.openai.deployment_id.clone();
-        let timeout_secs = settings.config.ai_timeout as u64;
+        let timeout_secs = settings.config.ai_timeout;
 
         let client = Client::builder()
             .timeout(Duration::from_secs(timeout_secs))
@@ -70,8 +70,14 @@ impl OpenAiCompatibleHandler {
         // Build messages
         let mut messages = Vec::new();
 
-        let (sys_msg, usr_msg) = if !caps.supports_system_message {
-            // Combine system + user into a single user message
+        // Combine system + user into a single user message when the model can't
+        // take a separate system prompt OR the user marked it a custom reasoning
+        // model. Previously only the former was honored, so custom_reasoning_model
+        // still sent a separate system message (rejected by some reasoning models)
+        // even though its temperature suppression already applied.
+        let merge_system_into_user =
+            !caps.supports_system_message || settings.config.custom_reasoning_model;
+        let (sys_msg, usr_msg) = if merge_system_into_user {
             (String::new(), format!("{system}\n\n\n{user}"))
         } else {
             (system.to_string(), user.to_string())
@@ -106,7 +112,7 @@ impl OpenAiCompatibleHandler {
             body["temperature"] = json!(temp);
         }
 
-        // Reasoning effort (for o3/o4-mini models)
+        // Reasoning effort (GPT-5 family + o3/o4-mini models)
         if caps.reasoning_effort.is_some() {
             // When reasoning effort is set, remove temperature
             if let Some(obj) = body.as_object_mut() {
@@ -143,22 +149,24 @@ impl OpenAiCompatibleHandler {
             let status = resp.status();
 
             if status.as_u16() == 429 {
-                // Parse Retry-After header if available, default to 60s
-                let retry_after = resp
-                    .headers()
-                    .get("retry-after")
-                    .and_then(|v| v.to_str().ok())
-                    .and_then(|s| s.parse::<u64>().ok())
-                    .unwrap_or(60);
+                // Parse Retry-After header if available, default to 60s. NOTE
+                // (S2): the value is propagated to the caller, not slept on
+                // here — AI rate limits are surfaced rather than auto-retried,
+                // matching the Python original.
+                let retry_after = crate::util::parse_retry_after(resp.headers(), 60);
                 return Err(PrAgentError::RateLimited {
                     retry_after_secs: retry_after,
                 });
             }
 
             let body_text = resp.text().await.unwrap_or_default();
-            return Err(PrAgentError::AiHandler(format!(
-                "API returned {status}: {body_text}"
-            )));
+            let msg = format!("API returned {status}: {body_text}");
+            // 4xx (other than 429) is a client error — not worth retrying.
+            return Err(if status.is_client_error() {
+                PrAgentError::AiClientError(msg)
+            } else {
+                PrAgentError::AiHandler(msg)
+            });
         }
 
         let api_resp: ApiResponse = resp.json().await.map_err(PrAgentError::Http)?;
@@ -177,6 +185,14 @@ impl OpenAiCompatibleHandler {
             .map(FinishReason::from)
             .unwrap_or_default();
 
+        // Surface truncated output — otherwise the caller silently parses a
+        // half-finished (often invalid) response.
+        if finish_reason == FinishReason::Length {
+            tracing::warn!(
+                "AI response was truncated (finish_reason=length); output may be incomplete"
+            );
+        }
+
         let usage = api_resp.usage.map(|u| Usage {
             prompt_tokens: u.prompt_tokens,
             completion_tokens: u.completion_tokens,
@@ -191,6 +207,27 @@ impl OpenAiCompatibleHandler {
     }
 }
 
+/// Reject a fixed seed combined with a non-zero temperature — but only when the
+/// temperature is ACTUALLY part of the request. Temperature is sent iff the
+/// model supports it, it isn't a custom reasoning model, and no `reasoning_effort`
+/// overrides it (the same condition `build_request_body` uses). So a seed on a
+/// reasoning / no-temperature model (which drops temperature) is allowed.
+fn validate_seed_temperature(
+    reasoning_effort_set: bool,
+    supports_temperature: bool,
+    custom_reasoning_model: bool,
+    effective_temp: f32,
+    seed: i32,
+) -> Result<(), PrAgentError> {
+    let temperature_sent = supports_temperature && !custom_reasoning_model && !reasoning_effort_set;
+    if temperature_sent && effective_temp > 0.0 && seed >= 0 {
+        return Err(PrAgentError::AiHandler(format!(
+            "seed ({seed}) is not supported with temperature ({effective_temp}) > 0"
+        )));
+    }
+    Ok(())
+}
+
 #[async_trait]
 impl AiHandler for OpenAiCompatibleHandler {
     fn deployment_id(&self) -> &str {
@@ -199,12 +236,14 @@ impl AiHandler for OpenAiCompatibleHandler {
 
     fn capabilities(&self, model: &str) -> ModelCapabilities {
         let settings = get_settings();
-        let max_tokens = get_max_tokens_with_fallback(model, settings.config.max_model_tokens);
+        let max_tokens = get_max_tokens_with_fallback(
+            model,
+            settings.config.max_model_tokens,
+            settings.config.custom_model_max_tokens,
+        );
 
-        let reasoning_effort = supports_reasoning_effort(model)
-            .then(|| &settings.config.reasoning_effort)
-            .filter(|e| !e.is_empty())
-            .cloned();
+        let reasoning_effort = uses_reasoning_effort(model)
+            .then(|| normalize_reasoning_effort(&settings.config.reasoning_effort));
 
         ModelCapabilities {
             supports_system_message: !is_user_message_only_model(model),
@@ -224,6 +263,22 @@ impl AiHandler for OpenAiCompatibleHandler {
         temperature: Option<f32>,
         image_urls: Option<&[String]>,
     ) -> Result<ChatResponse, PrAgentError> {
+        // A fixed seed is incompatible with a non-zero temperature (the result
+        // would not be reproducible) — but ONLY when temperature is actually
+        // sent. Reasoning / no-temperature models (e.g. the default
+        // gpt-5.2-2025-12-11) have temperature removed from the request, so a
+        // seed is fine there. Default seed is -1 (opt-in).
+        let settings = get_settings();
+        let caps = self.capabilities(model);
+        let effective_temp = temperature.unwrap_or(settings.config.temperature);
+        validate_seed_temperature(
+            caps.reasoning_effort.is_some(),
+            caps.supports_temperature,
+            settings.config.custom_reasoning_model,
+            effective_temp,
+            settings.config.seed,
+        )?;
+
         let body = self.build_request_body(model, system, user, temperature, image_urls);
 
         // Retry logic: retry on transient errors with exponential backoff
@@ -231,10 +286,10 @@ impl AiHandler for OpenAiCompatibleHandler {
         for attempt in 0..=MODEL_RETRIES {
             match self.send_completion(&body).await {
                 Ok(resp) => return Ok(resp),
-                Err(e @ PrAgentError::RateLimited { .. }) => {
-                    // Don't retry rate limits — propagate immediately
-                    return Err(e);
-                }
+                // Only retry transient errors (network/5xx). Rate limits and
+                // client (4xx) errors propagate immediately instead of burning
+                // attempts with backoff.
+                Err(e) if !e.is_retryable() => return Err(e),
                 Err(e) => {
                     tracing::warn!(
                         attempt = attempt + 1,
@@ -349,6 +404,56 @@ mod tests {
     }
 
     #[test]
+    fn test_build_request_body_gpt5_reasoning_effort() {
+        let handler = test_handler();
+        // The default config model is a GPT-5 model: it must receive
+        // `reasoning_effort` and must NOT receive `temperature`, mirroring the
+        // Python `thinking_kwargs_gpt5` branch (model.startswith('gpt-5')).
+        let body = handler.build_request_body("gpt-5.2-2025-12-11", "sys", "user", Some(0.2), None);
+
+        assert!(
+            body.get("temperature").is_none(),
+            "gpt-5 models must not send temperature"
+        );
+        assert!(
+            body["reasoning_effort"].is_string(),
+            "gpt-5 models must send reasoning_effort, got: {:?}",
+            body.get("reasoning_effort")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_build_request_body_custom_reasoning_model_merges_messages() {
+        // C5: custom_reasoning_model must merge system+user into a single user
+        // message (and suppress temperature), even for a model that otherwise
+        // supports a separate system prompt.
+        use crate::config::loader::with_settings;
+        let mut overrides = std::collections::HashMap::new();
+        overrides.insert("config.custom_reasoning_model".into(), "true".into());
+        let settings = std::sync::Arc::new(
+            crate::config::loader::load_settings(&overrides, None, None).unwrap(),
+        );
+
+        let handler = test_handler();
+        let body = with_settings(settings, async {
+            handler.build_request_body("gpt-4", "system", "user", Some(0.5), None)
+        })
+        .await;
+
+        let messages = body["messages"].as_array().unwrap();
+        assert_eq!(
+            messages.len(),
+            1,
+            "custom_reasoning_model should merge system+user into one message"
+        );
+        assert_eq!(messages[0]["role"], "user");
+        assert!(
+            body.get("temperature").is_none(),
+            "custom_reasoning_model should suppress temperature"
+        );
+    }
+
+    #[test]
     fn test_build_request_body_no_temperature_model() {
         let handler = test_handler();
         // o1-preview doesn't support temperature
@@ -395,6 +500,52 @@ mod tests {
         // Empty system message should be omitted
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0]["role"], "user");
+    }
+
+    #[test]
+    fn test_validate_seed_temperature() {
+        // (reasoning_effort_set, supports_temperature, custom_reasoning_model, temp, seed)
+        // Normal model with temp>0 + seed → conflict (temperature IS sent).
+        assert!(validate_seed_temperature(false, true, false, 0.2, 5).is_err());
+        // Reasoning model (reasoning_effort set) → temperature removed → OK.
+        assert!(validate_seed_temperature(true, true, false, 0.2, 5).is_ok());
+        // custom_reasoning_model → temperature suppressed → OK.
+        assert!(validate_seed_temperature(false, true, true, 0.2, 5).is_ok());
+        // No-temperature model → OK.
+        assert!(validate_seed_temperature(false, false, false, 0.2, 5).is_ok());
+        // Seed disabled (-1) → OK.
+        assert!(validate_seed_temperature(false, true, false, 0.2, -1).is_ok());
+        // Temperature 0 → OK.
+        assert!(validate_seed_temperature(false, true, false, 0.0, 5).is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_chat_completion_rejects_seed_with_temperature() {
+        // C12: a fixed seed with temperature > 0 must be rejected before any
+        // network call (mirrors Python's ValueError).
+        use crate::config::loader::with_settings;
+        let mut overrides = std::collections::HashMap::new();
+        overrides.insert("config.seed".into(), "5".into()); // default temperature 0.2 > 0
+        let settings = std::sync::Arc::new(
+            crate::config::loader::load_settings(&overrides, None, None).unwrap(),
+        );
+
+        let handler = test_handler();
+        let result = with_settings(
+            settings,
+            handler.chat_completion("gpt-4", "sys", "user", None, None),
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .to_lowercase()
+                .contains("seed"),
+            "error should mention seed"
+        );
     }
 
     #[tokio::test]

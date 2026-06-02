@@ -3,6 +3,7 @@ use std::fmt::Write;
 
 use async_trait::async_trait;
 use base64::Engine;
+use futures_util::stream::{self, StreamExt};
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use reqwest::Client;
 use serde::Serialize;
@@ -10,12 +11,77 @@ use serde_json::json;
 
 use super::GitProvider;
 use super::types::*;
-use super::url_parser::{ParsedPrUrl, parse_pr_url};
+use super::url_parser::{ParsedPrUrl, ProviderType, parse_pr_url};
 use crate::config::loader::get_settings;
 use crate::error::PrAgentError;
 
 /// Maximum characters in a single comment (GitHub limit ~65536).
 const MAX_COMMENT_CHARS: usize = 65000;
+
+/// Truncate a comment body to GitHub's character limit on a UTF-8 char
+/// boundary. Applied to every comment write (create AND edit) so large
+/// persistent comments don't get rejected with HTTP 422.
+fn truncate_comment(text: &str) -> &str {
+    if text.len() <= MAX_COMMENT_CHARS {
+        return text;
+    }
+    // Find the largest char boundary at or before MAX_COMMENT_CHARS.
+    let mut end = MAX_COMMENT_CHARS;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
+}
+
+/// Build the `repos/{repo}/contents/{path}?ref={ref}` URL with proper
+/// percent-encoding of the file path (slashes preserved) and the ref.
+fn build_contents_url(
+    base_url: &str,
+    repo_full: &str,
+    path: &str,
+    git_ref: &str,
+) -> Result<String, PrAgentError> {
+    let base = format!(
+        "{}/repos/{}/contents",
+        base_url.trim_end_matches('/'),
+        repo_full
+    );
+    let mut url = url::Url::parse(&base)
+        .map_err(|e| PrAgentError::Other(format!("invalid contents base url: {e}")))?;
+    {
+        let mut segments = url
+            .path_segments_mut()
+            .map_err(|_| PrAgentError::Other("contents url cannot be a base".into()))?;
+        for seg in path.split('/') {
+            segments.push(seg);
+        }
+    }
+    url.query_pairs_mut().append_pair("ref", git_ref);
+    Ok(url.into())
+}
+
+/// Map a GitHub comment JSON object to an [`IssueComment`] (None if it has no
+/// numeric `id`). Shared by the issue-comment and review-thread fetchers.
+fn issue_comment_from_json(c: &serde_json::Value) -> Option<IssueComment> {
+    Some(IssueComment {
+        id: c["id"].as_u64()?,
+        body: c["body"].as_str().unwrap_or_default().to_string(),
+        user: c["user"]["login"].as_str().unwrap_or_default().to_string(),
+        created_at: c["created_at"].as_str().unwrap_or_default().to_string(),
+        url: c["html_url"].as_str().map(|s| s.to_string()),
+    })
+}
+
+/// Owned per-file metadata extracted from the compare API, used to fetch base
+/// and head blobs concurrently in `get_diff_files`.
+struct DiffFileMeta {
+    filename: String,
+    patch: String,
+    previous_filename: Option<String>,
+    edit_type: EditType,
+    plus_lines: i32,
+    minus_lines: i32,
+}
 
 /// JWT claims for GitHub App authentication.
 #[derive(Debug, Serialize)]
@@ -45,10 +111,19 @@ impl GithubProvider {
     /// Supports both "user" (token) and "app" (JWT + installation token) auth.
     pub async fn new(pr_url: &str) -> Result<Self, PrAgentError> {
         let parsed = parse_pr_url(pr_url)?;
+        // GithubProvider is the only implementation. Reject non-GitHub URLs at
+        // the boundary instead of silently building a GitHub client for a
+        // GitLab/Bitbucket URL and failing later with a confusing API error.
+        if parsed.provider != ProviderType::GitHub {
+            return Err(PrAgentError::Other(format!(
+                "only GitHub URLs are supported, but '{pr_url}' parsed as {:?}",
+                parsed.provider
+            )));
+        }
         let settings = get_settings();
 
         let base_url = settings.github.base_url.clone();
-        let timeout = std::time::Duration::from_secs(settings.config.ai_timeout as u64);
+        let timeout = std::time::Duration::from_secs(settings.config.ai_timeout);
         let client = Client::builder()
             .timeout(timeout)
             .build()
@@ -116,12 +191,8 @@ impl GithubProvider {
             let resp = req.send().await.map_err(PrAgentError::Http)?;
 
             if resp.status().as_u16() == 429 {
-                let retry_after = resp
-                    .headers()
-                    .get("retry-after")
-                    .and_then(|v| v.to_str().ok())
-                    .and_then(|s| s.parse::<u64>().ok())
-                    .unwrap_or(2u64.pow(attempt + 1));
+                let retry_after =
+                    crate::util::parse_retry_after(resp.headers(), 2u64.pow(attempt + 1));
 
                 if attempt < max_retries {
                     tracing::warn!(
@@ -184,8 +255,9 @@ impl GithubProvider {
         let resp = Self::check_response(resp, "GET").await?;
         let mut next_url = parse_next_link(resp.headers());
         let page: serde_json::Value = resp.json().await.map_err(PrAgentError::Http)?;
-        if let Some(arr) = page.as_array() {
-            all_items.extend(arr.iter().cloned());
+        // Move the array's elements out of the owned page instead of cloning.
+        if let serde_json::Value::Array(arr) = page {
+            all_items.extend(arr);
         }
 
         // Follow pagination links
@@ -196,8 +268,8 @@ impl GithubProvider {
             let resp = Self::check_response(resp, "GET").await?;
             next_url = parse_next_link(resp.headers());
             let page: serde_json::Value = resp.json().await.map_err(PrAgentError::Http)?;
-            if let Some(arr) = page.as_array() {
-                all_items.extend(arr.iter().cloned());
+            if let serde_json::Value::Array(arr) = page {
+                all_items.extend(arr);
             }
         }
 
@@ -255,8 +327,15 @@ impl GithubProvider {
         path: &str,
         git_ref: &str,
     ) -> Result<String, PrAgentError> {
-        let api_path = format!("repos/{}/contents/{}?ref={}", repo_full, path, git_ref);
-        let resp = self.api_get(&api_path).await?;
+        // Build the URL with percent-encoding so a filename containing '?',
+        // '#' or a space doesn't corrupt the query string or split the path.
+        let url = build_contents_url(&self.base_url, repo_full, path, git_ref)?;
+
+        let resp = self
+            .api_request_with_retry_url(reqwest::Method::GET, &url, None)
+            .await?;
+        let resp = Self::check_response(resp, "GET").await?;
+        let resp: serde_json::Value = resp.json().await.map_err(PrAgentError::Http)?;
 
         let content = resp["content"]
             .as_str()
@@ -403,60 +482,95 @@ impl GitProvider for GithubProvider {
         );
         let compare_data = self.api_get(&compare_path).await?;
 
-        let files = compare_data["files"]
+        // Extract owned metadata first, borrowing the files array directly (no
+        // deep clone of the JSON — addresses the previous `.cloned()`).
+        let empty = Vec::new();
+        let metas: Vec<DiffFileMeta> = compare_data["files"]
             .as_array()
-            .cloned()
-            .unwrap_or_default();
+            .unwrap_or(&empty)
+            .iter()
+            .map(|file| {
+                let filename = file["filename"].as_str().unwrap_or_default().to_string();
+                let status = file["status"].as_str().unwrap_or("modified");
+                let patch = file["patch"].as_str().unwrap_or_default().to_string();
+                let previous_filename = file["previous_filename"].as_str().map(String::from);
 
-        let mut diff_files = Vec::with_capacity(files.len());
-
-        for file in &files {
-            let filename = file["filename"].as_str().unwrap_or_default().to_string();
-            let status = file["status"].as_str().unwrap_or("modified");
-            let patch = file["patch"].as_str().unwrap_or_default().to_string();
-            let previous_filename = file["previous_filename"].as_str().map(String::from);
-
-            let edit_type = match status {
-                "added" => EditType::Added,
-                "removed" => EditType::Deleted,
-                "renamed" => EditType::Renamed,
-                "modified" | "changed" => EditType::Modified,
-                _ => EditType::Unknown,
-            };
-
-            let (plus_lines, minus_lines) = count_patch_lines(&patch);
-
-            let base_file = if edit_type != EditType::Added {
-                let ref_name = if edit_type == EditType::Renamed {
-                    previous_filename.as_deref().unwrap_or(&filename)
-                } else {
-                    &filename
+                let edit_type = match status {
+                    "added" => EditType::Added,
+                    "removed" => EditType::Deleted,
+                    "renamed" => EditType::Renamed,
+                    "modified" | "changed" => EditType::Modified,
+                    _ => EditType::Unknown,
                 };
-                self.get_file_content(ref_name, &base_sha)
-                    .await
-                    .unwrap_or_default()
-            } else {
-                String::new()
-            };
+                let (plus_lines, minus_lines) = count_patch_lines(&patch);
+                DiffFileMeta {
+                    filename,
+                    patch,
+                    previous_filename,
+                    edit_type,
+                    plus_lines,
+                    minus_lines,
+                }
+            })
+            .collect();
 
-            let head_file = if edit_type != EditType::Deleted {
-                self.get_file_content(&filename, &head_sha)
-                    .await
-                    .unwrap_or_default()
-            } else {
-                String::new()
-            };
+        // Fetch base + head content for each file concurrently. Each file's two
+        // blobs run in parallel via `tokio::join!`, and files are processed with
+        // bounded concurrency via `buffered` (which preserves input order, so the
+        // resulting diff order is stable) to avoid hammering GitHub's rate limits.
+        const CONTENT_FETCH_CONCURRENCY: usize = 8;
+        let base_sha = base_sha.as_str();
+        let head_sha = head_sha.as_str();
 
-            let mut info = FilePatchInfo::new(base_file, head_file, patch, filename);
-            info.edit_type = edit_type;
-            info.old_filename = previous_filename;
-            info.num_plus_lines = plus_lines;
-            info.num_minus_lines = minus_lines;
+        let diff_files: Vec<FilePatchInfo> = stream::iter(metas)
+            .map(|meta| async move {
+                // Ref to fetch for the base blob (None for an added file).
+                let base_ref = match meta.edit_type {
+                    EditType::Added => None,
+                    EditType::Renamed => Some(
+                        meta.previous_filename
+                            .clone()
+                            .unwrap_or_else(|| meta.filename.clone()),
+                    ),
+                    _ => Some(meta.filename.clone()),
+                };
 
-            diff_files.push(info);
-        }
+                let base_fut = async {
+                    match &base_ref {
+                        Some(r) => self.get_file_content(r, base_sha).await.unwrap_or_default(),
+                        None => String::new(),
+                    }
+                };
+                let head_fut = async {
+                    if meta.edit_type != EditType::Deleted {
+                        self.get_file_content(&meta.filename, head_sha)
+                            .await
+                            .unwrap_or_default()
+                    } else {
+                        String::new()
+                    }
+                };
+                let (base_file, head_file) = tokio::join!(base_fut, head_fut);
+
+                let mut info = FilePatchInfo::new(base_file, head_file, meta.patch, meta.filename);
+                info.edit_type = meta.edit_type;
+                info.old_filename = meta.previous_filename;
+                info.num_plus_lines = meta.plus_lines;
+                info.num_minus_lines = meta.minus_lines;
+                info
+            })
+            .buffered(CONTENT_FETCH_CONCURRENCY)
+            .collect()
+            .await;
 
         Ok(diff_files)
+    }
+
+    fn get_pr_number(&self) -> Option<u64> {
+        // The default trait impl parses get_pr_id() (empty here), so override it
+        // with the parsed PR number — otherwise the linked-issue extractor can't
+        // skip the PR's own reference.
+        Some(self.parsed.pr_number)
     }
 
     async fn get_files(&self) -> Result<Vec<String>, PrAgentError> {
@@ -522,16 +636,7 @@ impl GitProvider for GithubProvider {
         text: &str,
         _is_temporary: bool,
     ) -> Result<Option<CommentId>, PrAgentError> {
-        let truncated = if text.len() > MAX_COMMENT_CHARS {
-            // Find the largest char boundary at or before MAX_COMMENT_CHARS
-            let mut end = MAX_COMMENT_CHARS;
-            while end > 0 && !text.is_char_boundary(end) {
-                end -= 1;
-            }
-            &text[..end]
-        } else {
-            text
-        };
+        let truncated = truncate_comment(text);
         let path = format!(
             "repos/{}/issues/{}/comments",
             self.repo_full, self.parsed.pr_number
@@ -796,18 +901,7 @@ impl GitProvider for GithubProvider {
             self.repo_full, self.parsed.pr_number
         );
         let items = self.api_get_all_pages(&path).await?;
-        let comments = items
-            .iter()
-            .filter_map(|c| {
-                Some(IssueComment {
-                    id: c["id"].as_u64()?,
-                    body: c["body"].as_str().unwrap_or_default().to_string(),
-                    user: c["user"]["login"].as_str().unwrap_or_default().to_string(),
-                    created_at: c["created_at"].as_str().unwrap_or_default().to_string(),
-                    url: c["html_url"].as_str().map(|s| s.to_string()),
-                })
-            })
-            .collect();
+        let comments = items.iter().filter_map(issue_comment_from_json).collect();
         Ok(comments)
     }
 
@@ -820,7 +914,8 @@ impl GitProvider for GithubProvider {
 
     async fn edit_comment(&self, comment_id: &CommentId, body: &str) -> Result<(), PrAgentError> {
         let path = format!("repos/{}/issues/comments/{}", self.repo_full, comment_id.0);
-        self.api_patch(&path, &json!({"body": body})).await?;
+        let truncated = truncate_comment(body);
+        self.api_patch(&path, &json!({"body": truncated})).await?;
         Ok(())
     }
 
@@ -867,15 +962,7 @@ impl GitProvider for GithubProvider {
                 let reply_to = c["in_reply_to_id"].as_u64().unwrap_or(0);
                 id == thread_root || reply_to == thread_root
             })
-            .filter_map(|c| {
-                Some(IssueComment {
-                    id: c["id"].as_u64()?,
-                    body: c["body"].as_str().unwrap_or_default().to_string(),
-                    user: c["user"]["login"].as_str().unwrap_or_default().to_string(),
-                    created_at: c["created_at"].as_str().unwrap_or_default().to_string(),
-                    url: c["html_url"].as_str().map(|s| s.to_string()),
-                })
-            })
+            .filter_map(issue_comment_from_json)
             .collect();
 
         Ok(comments)
@@ -1064,6 +1151,66 @@ mod tests {
         let (plus, minus) = count_patch_lines("");
         assert_eq!(plus, 0);
         assert_eq!(minus, 0);
+    }
+
+    #[test]
+    fn test_truncate_comment_under_limit() {
+        let text = "short comment";
+        assert_eq!(truncate_comment(text), text);
+    }
+
+    #[tokio::test]
+    async fn test_github_provider_rejects_non_github_url() {
+        // F7: a non-GitHub URL is rejected at construction (before any network).
+        let result =
+            GithubProvider::new("https://gitlab.com/group/project/-/merge_requests/10").await;
+        // Avoid unwrap_err (would require GithubProvider: Debug).
+        let err = result.err().expect("non-GitHub URL must be rejected");
+        assert!(
+            err.to_string().to_lowercase().contains("github"),
+            "error should mention GitHub"
+        );
+    }
+
+    #[test]
+    fn test_build_contents_url_encodes_path_and_ref() {
+        // C26: special chars in a filename must be percent-encoded (not break
+        // the query), while directory slashes are preserved.
+        let url =
+            build_contents_url("https://api.github.com", "o/r", "src/a b?.rs", "abc123").unwrap();
+        assert!(url.starts_with("https://api.github.com/repos/o/r/contents/src/"));
+        assert!(url.contains("ref=abc123"));
+        assert!(
+            !url.contains("a b?.rs"),
+            "raw special chars must not appear"
+        );
+        assert!(
+            url.contains("a%20b%3F.rs"),
+            "space and ? must be encoded: {url}"
+        );
+    }
+
+    #[test]
+    fn test_truncate_comment_over_limit() {
+        let text = "a".repeat(MAX_COMMENT_CHARS + 500);
+        let truncated = truncate_comment(&text);
+        assert_eq!(truncated.len(), MAX_COMMENT_CHARS);
+    }
+
+    #[test]
+    fn test_truncate_comment_respects_char_boundary() {
+        // Build a string that, at exactly MAX_COMMENT_CHARS bytes, would split a
+        // multibyte char. Truncation must back off to a valid boundary.
+        let mut text = "a".repeat(MAX_COMMENT_CHARS - 1);
+        text.push('é'); // 2 bytes → straddles the byte limit
+        text.push_str(&"b".repeat(100));
+        let truncated = truncate_comment(&text);
+        assert!(truncated.len() <= MAX_COMMENT_CHARS);
+        // Must remain valid UTF-8 (no panic on slice / valid str returned).
+        assert!(truncated.is_char_boundary(truncated.len()));
+        // The 'é' would start at byte MAX_COMMENT_CHARS-1 and end at +1, so it is
+        // dropped entirely, leaving only the leading run of 'a'.
+        assert_eq!(truncated.len(), MAX_COMMENT_CHARS - 1);
     }
 
     #[test]

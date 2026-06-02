@@ -1,12 +1,21 @@
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use axum::body::Bytes;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
+use tokio::sync::Semaphore;
 
-use crate::config::loader::{get_settings, load_settings, with_settings};
+/// Maximum number of webhook events processed concurrently. Bounds resource
+/// use (each task may run several AI calls) and provides backpressure: when the
+/// limit is reached, new deliveries are rejected with 503 so GitHub retries.
+const MAX_CONCURRENT_WEBHOOK_TASKS: usize = 16;
+
+static WEBHOOK_SEMAPHORE: LazyLock<Arc<Semaphore>> =
+    LazyLock::new(|| Arc::new(Semaphore::new(MAX_CONCURRENT_WEBHOOK_TASKS)));
+
+use crate::config::loader::{get_settings, load_settings};
 use crate::config::types::Settings;
 use crate::error::PrAgentError;
 use crate::git::GitProvider;
@@ -64,14 +73,31 @@ pub async fn handle_github_webhook(headers: HeaderMap, body: Bytes) -> impl Into
 
     tracing::info!(event = %event, action = %action, "received webhook");
 
-    // 3. Dispatch in background task
+    // 3. Acquire a concurrency permit BEFORE spawning (so in-flight tasks are
+    //    bounded — acquiring inside the task would let them pile up). If the
+    //    limit is reached, reject with 503 so GitHub retries the delivery later.
+    let permit = match WEBHOOK_SEMAPHORE.clone().try_acquire_owned() {
+        Ok(p) => p,
+        Err(_) => {
+            tracing::warn!(
+                event = %event,
+                action = %action,
+                limit = MAX_CONCURRENT_WEBHOOK_TASKS,
+                "webhook task limit reached, rejecting event"
+            );
+            return (StatusCode::SERVICE_UNAVAILABLE, "server busy").into_response();
+        }
+    };
+
+    // 4. Dispatch in a background task, holding the permit for its lifetime.
     tokio::spawn(async move {
+        let _permit = permit;
         if let Err(e) = dispatch_event(&event, &action, &payload).await {
             tracing::error!(event = %event, action = %action, error = %e, "webhook handler failed");
         }
     });
 
-    // 4. Return 200 immediately
+    // 5. Return 200 immediately
     (StatusCode::OK, "ok").into_response()
 }
 
@@ -253,8 +279,9 @@ async fn dispatch_event(
             let provider: Arc<dyn GitProvider> = Arc::new(GithubProvider::new(&pr_url).await?);
             let _ = provider.add_eyes_reaction(comment_id, disable_eyes).await;
 
-            // Fetch global + repo settings and scope them for this command
-            let scoped_settings = fetch_scoped_settings(provider.as_ref(), &settings).await;
+            // Fetch global + repo `.pr_agent.toml` once; threaded into the
+            // command so per-command overrides re-merge on top of these layers.
+            let (global_toml, repo_toml) = fetch_scoped_toml(provider.as_ref(), &settings).await;
 
             // Inject diff_hunk for ask_line when available
             if command == "ask_line"
@@ -263,11 +290,14 @@ async fn dispatch_event(
                 args.insert("_diff_hunk".to_string(), diff_hunk.to_string());
             }
 
-            if let Some(s) = scoped_settings {
-                with_settings(s, tools::handle_command(&command, provider, &args)).await?;
-            } else {
-                tools::handle_command(&command, provider, &args).await?;
-            }
+            tools::handle_command(
+                &command,
+                provider,
+                &args,
+                global_toml.as_deref(),
+                repo_toml.as_deref(),
+            )
+            .await?;
         }
         "pull_request_review_comment" => {
             if action != "created" {
@@ -278,8 +308,11 @@ async fn dispatch_event(
             let raw_comment = payload["comment"]["body"].as_str().unwrap_or("").trim();
             let comment_body = reformat_image_reply(raw_comment);
 
-            if !comment_body.contains("/ask") {
-                tracing::debug!("ignoring review comment without /ask command");
+            // Require a LEADING /ask (after reformat_image_reply moved any image
+            // reply's command to the front). A substring check fired on prose
+            // like "I'll /ask the author later", triggering a full ask_line run.
+            if !is_ask_line_command(&comment_body) {
+                tracing::debug!("ignoring review comment without a leading /ask command");
                 return Ok(());
             }
 
@@ -309,7 +342,7 @@ async fn dispatch_event(
             let provider: Arc<dyn GitProvider> = Arc::new(GithubProvider::new(&pr_url).await?);
             let _ = provider.add_eyes_reaction(comment_id, true).await;
 
-            let scoped_settings = fetch_scoped_settings(provider.as_ref(), &settings).await;
+            let (global_toml, repo_toml) = fetch_scoped_toml(provider.as_ref(), &settings).await;
             let (command, args) = tools::parse_command(&transformed);
 
             // Inject the diff_hunk from the webhook payload for ask_line
@@ -318,11 +351,14 @@ async fn dispatch_event(
                 args.insert("_diff_hunk".to_string(), diff_hunk.to_string());
             }
 
-            if let Some(s) = scoped_settings {
-                with_settings(s, tools::handle_command(&command, provider, &args)).await?;
-            } else {
-                tools::handle_command(&command, provider, &args).await?;
-            }
+            tools::handle_command(
+                &command,
+                provider,
+                &args,
+                global_toml.as_deref(),
+                repo_toml.as_deref(),
+            )
+            .await?;
         }
         _ => {
             tracing::debug!(event, "ignoring unsupported event type");
@@ -534,21 +570,19 @@ fn handle_closed_pr(payload: &serde_json::Value) {
         reviewers,
         comments,
         merged_by,
-        time_to_merge_hours,
+        time_to_merge_hours = ?time_to_merge_hours,
         "PR merged — statistics"
     );
 }
 
 /// Compute hours between two ISO 8601 timestamps.
-fn compute_hours_between(start: &str, end: &str) -> f64 {
-    let Ok(start_dt) = chrono::DateTime::parse_from_rfc3339(start) else {
-        return 0.0;
-    };
-    let Ok(end_dt) = chrono::DateTime::parse_from_rfc3339(end) else {
-        return 0.0;
-    };
+/// Hours between two RFC3339 timestamps, or `None` if either fails to parse
+/// (so a parse failure is not conflated with a genuine zero duration).
+fn compute_hours_between(start: &str, end: &str) -> Option<f64> {
+    let start_dt = chrono::DateTime::parse_from_rfc3339(start).ok()?;
+    let end_dt = chrono::DateTime::parse_from_rfc3339(end).ok()?;
     let duration = end_dt - start_dt;
-    duration.num_minutes() as f64 / 60.0
+    Some(duration.num_minutes() as f64 / 60.0)
 }
 
 /// Transform a line-level `/ask` comment into an `/ask_line` command string.
@@ -577,6 +611,13 @@ fn handle_line_comments(payload: &serde_json::Value, comment_body: &str) -> Stri
     format!(
         "/ask_line --line_start={start_line} --line_end={end_line} --side={side} --file_name={path} --comment_id={comment_id} {question}"
     )
+}
+
+/// Whether a review-comment body is an `/ask` command. Checked after
+/// [`reformat_image_reply`], so a genuine command sits at the front; prose that
+/// merely mentions "/ask" mid-sentence is correctly ignored.
+fn is_ask_line_command(comment_body: &str) -> bool {
+    comment_body.trim_start().starts_with("/ask")
 }
 
 /// Reformat image-reply comment: `> ![image](url)\n/ask question` → `/ask question \n> ![image](url)`.
@@ -624,13 +665,13 @@ async fn fetch_optional_toml(
     }
 }
 
-/// Fetch global org-level and repo-level settings, then build a scoped `Arc<Settings>`.
-///
-/// Returns `Some(settings)` if any overrides were loaded, `None` if neither exists.
-async fn fetch_scoped_settings(
+/// Fetch the raw global org-level and repo-level `.pr_agent.toml` strings for
+/// this PR. Threaded into `handle_command` so per-command overrides re-merge on
+/// top of these layers instead of discarding them.
+async fn fetch_scoped_toml(
     provider: &dyn GitProvider,
     settings: &Settings,
-) -> Option<Arc<Settings>> {
+) -> (Option<String>, Option<String>) {
     let global_toml = fetch_optional_toml(
         settings.config.use_global_settings_file,
         provider.get_global_settings(),
@@ -644,6 +685,20 @@ async fn fetch_scoped_settings(
         "repo-level",
     )
     .await;
+
+    (global_toml, repo_toml)
+}
+
+/// Fetch global org-level and repo-level settings, then build a scoped `Arc<Settings>`.
+///
+/// Returns `Some(settings)` if any overrides were loaded, `None` if neither exists.
+/// Used where the merged `Settings` object is needed directly (e.g. self-review
+/// flag checks); command dispatch uses [`fetch_scoped_toml`] instead.
+async fn fetch_scoped_settings(
+    provider: &dyn GitProvider,
+    settings: &Settings,
+) -> Option<Arc<Settings>> {
+    let (global_toml, repo_toml) = fetch_scoped_toml(provider, settings).await;
 
     if global_toml.is_some() || repo_toml.is_some() {
         match load_settings(
@@ -666,27 +721,33 @@ async fn fetch_scoped_settings(
 ///
 /// Fetches global org-level and repo-level `.pr_agent.toml` once, then runs
 /// all commands within a scoped settings context.
+///
+/// Commands run SEQUENTIALLY by design (S10): the order is significant —
+/// `describe` updates the PR description that a subsequent `review`/`improve`
+/// reads via PrMetadata, and the tools publish/update comments that could race.
+/// Parallelizing them would break that dependency, so it is intentionally avoided.
 async fn run_commands(pr_url: &str, commands: &[String]) -> Result<(), crate::error::PrAgentError> {
     let provider: Arc<dyn GitProvider> = Arc::new(GithubProvider::new(pr_url).await?);
     let settings = get_settings();
 
-    // Fetch global + repo settings once for all commands in this PR
-    let scoped_settings = fetch_scoped_settings(provider.as_ref(), &settings).await;
+    // Fetch global + repo `.pr_agent.toml` once for all commands in this PR.
+    let (global_toml, repo_toml) = fetch_scoped_toml(provider.as_ref(), &settings).await;
 
     for cmd_str in commands {
         let (command, args) = tools::parse_command(cmd_str);
-        let cmd_provider: Arc<dyn GitProvider> = Arc::new(GithubProvider::new(pr_url).await?);
 
         tracing::info!(command = %command, "running auto-command");
-        let result = if let Some(ref s) = scoped_settings {
-            with_settings(
-                s.clone(),
-                tools::handle_command(&command, cmd_provider, &args),
-            )
-            .await
-        } else {
-            tools::handle_command(&command, cmd_provider, &args).await
-        };
+        // Reuse the same provider for every command — GithubProvider is
+        // stateless after construction, and rebuilding it per command would
+        // repeat the (uncached) App token exchange and discard the HTTP pool.
+        let result = tools::handle_command(
+            &command,
+            provider.clone(),
+            &args,
+            global_toml.as_deref(),
+            repo_toml.as_deref(),
+        )
+        .await;
         if let Err(e) = result {
             tracing::error!(command = %command, error = %e, "auto-command failed");
             // Continue with other commands even if one fails
@@ -1528,6 +1589,20 @@ num_max_findings = 3
         assert_eq!(result, comment, "should return unchanged without image");
     }
 
+    #[test]
+    fn test_is_ask_line_command() {
+        // C16: only a LEADING /ask is a command.
+        assert!(is_ask_line_command("/ask what does this do?"));
+        assert!(is_ask_line_command("   /ask indented"));
+        // Prose merely mentioning /ask must NOT trigger a run.
+        assert!(!is_ask_line_command("I'll /ask the author later"));
+        assert!(!is_ask_line_command("some text /ask question"));
+        assert!(!is_ask_line_command(""));
+        // An image reply, once reformatted, leads with /ask and is accepted.
+        let image_reply = "> ![image](https://img.com/a.png)\n/ask what is this?";
+        assert!(is_ask_line_command(&reformat_image_reply(image_reply)));
+    }
+
     // ── Line comment transformation tests ───────────────────────────
 
     #[test]
@@ -1596,17 +1671,18 @@ num_max_findings = 3
 
     #[test]
     fn test_compute_hours_between() {
-        let hours = compute_hours_between("2025-01-01T00:00:00Z", "2025-01-01T02:30:00Z");
+        let hours = compute_hours_between("2025-01-01T00:00:00Z", "2025-01-01T02:30:00Z").unwrap();
         assert!((hours - 2.5).abs() < 0.01);
     }
 
     #[test]
     fn test_compute_hours_between_invalid() {
+        // S4: a parse failure is None, not a 0.0 that looks like a real duration.
         assert_eq!(
             compute_hours_between("invalid", "2025-01-01T00:00:00Z"),
-            0.0
+            None
         );
-        assert_eq!(compute_hours_between("", ""), 0.0);
+        assert_eq!(compute_hours_between("", ""), None);
     }
 
     #[test]

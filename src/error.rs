@@ -11,19 +11,17 @@ pub enum PrAgentError {
     #[error("AI handler error: {0}")]
     AiHandler(String),
 
+    /// A non-retryable AI client error (HTTP 4xx other than 429), e.g. bad
+    /// request or auth failure. Kept distinct from [`Self::AiHandler`] so the
+    /// retry loop doesn't waste attempts on it.
+    #[error("AI client error: {0}")]
+    AiClientError(String),
+
     #[error("HTTP request failed: {0}")]
     Http(#[from] reqwest::Error),
 
     #[error("Template rendering error: {0}")]
     Template(#[from] minijinja::Error),
-
-    #[allow(dead_code)]
-    #[error("YAML parsing error: {0}")]
-    YamlParse(String),
-
-    #[allow(dead_code)]
-    #[error("Token budget exceeded: needed {needed}, available {available}")]
-    TokenBudget { needed: u32, available: u32 },
 
     #[error("Unsupported operation: {0}")]
     Unsupported(String),
@@ -51,14 +49,40 @@ impl From<figment::Error> for PrAgentError {
 }
 
 impl PrAgentError {
-    #[allow(dead_code)]
+    /// Whether an operation that produced this error is worth retrying.
+    ///
+    /// Network/transport failures and server (5xx) errors are transient;
+    /// client (4xx) errors and rate limits are not (the latter is handled with
+    /// an explicit backoff at the call site, not by blind retry).
     pub fn is_retryable(&self) -> bool {
         match self {
             PrAgentError::Http(e) => {
                 e.is_timeout() || e.is_connect() || e.status().is_none_or(|s| s.is_server_error())
             }
-            PrAgentError::AiHandler(_) | PrAgentError::RateLimited { .. } => true,
+            // AiHandler is used for transient/5xx AI failures.
+            PrAgentError::AiHandler(_) => true,
+            // Client (4xx) errors and rate limits are not blindly retried.
+            PrAgentError::AiClientError(_) | PrAgentError::RateLimited { .. } => false,
             _ => false,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_is_retryable() {
+        // S7: transient/5xx is retryable; client errors and rate limits are not.
+        assert!(PrAgentError::AiHandler("server error".into()).is_retryable());
+        assert!(!PrAgentError::AiClientError("bad request".into()).is_retryable());
+        assert!(
+            !PrAgentError::RateLimited {
+                retry_after_secs: 1
+            }
+            .is_retryable()
+        );
+        assert!(!PrAgentError::Other("misc".into()).is_retryable());
     }
 }

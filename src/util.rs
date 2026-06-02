@@ -28,6 +28,17 @@ pub fn get_or_compile_regex(pattern: &str) -> Option<Arc<Regex>> {
     }
 }
 
+/// Parse a `Retry-After` header value (seconds) from an HTTP response,
+/// returning `default` when the header is absent or unparseable. Shared by the
+/// AI and GitHub rate-limit (429) handlers.
+pub fn parse_retry_after(headers: &reqwest::header::HeaderMap, default: u64) -> u64 {
+    headers
+        .get("retry-after")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(default)
+}
+
 /// Find the largest byte offset <= `max_bytes` that falls on a UTF-8 char boundary.
 pub(crate) fn floor_char_boundary(text: &str, max_bytes: usize) -> usize {
     if max_bytes >= text.len() {
@@ -107,6 +118,20 @@ mod tests {
         let second = get_or_compile_regex(pattern).unwrap();
         // Both should be the same Arc (cache hit)
         assert!(std::sync::Arc::ptr_eq(&first, &second));
+    }
+
+    #[test]
+    fn test_parse_retry_after() {
+        use reqwest::header::{HeaderMap, HeaderValue};
+        let mut headers = HeaderMap::new();
+        // Absent → default.
+        assert_eq!(parse_retry_after(&headers, 42), 42);
+        // Present and valid.
+        headers.insert("retry-after", HeaderValue::from_static("17"));
+        assert_eq!(parse_retry_after(&headers, 42), 17);
+        // Present but unparseable → default.
+        headers.insert("retry-after", HeaderValue::from_static("soon"));
+        assert_eq!(parse_retry_after(&headers, 42), 42);
     }
 
     #[test]

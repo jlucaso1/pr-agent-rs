@@ -58,6 +58,10 @@ pub fn get_settings() -> Arc<Settings> {
         match guard.as_ref() {
             Some(s) => s.clone(),
             None => {
+                // A3 (deliberate): in production init_settings() always runs at
+                // bootstrap, so this branch is effectively unreachable there.
+                // It is kept (rather than panicking) because the test suite
+                // relies on lazily loading defaults without an explicit init.
                 tracing::error!(
                     "get_settings() called before init_settings() — loading defaults as fallback"
                 );
@@ -196,17 +200,16 @@ pub fn load_settings(
             continue;
         };
 
+        // Reject keys with metacharacters that could break out of the fragment.
+        if !is_safe_toml_section(section) || !is_safe_toml_field(field) {
+            tracing::warn!("ignoring dotted env var with unsafe key: {key}");
+            continue;
+        }
+
         let is_array = value_trimmed.starts_with('[') && value_trimmed.ends_with(']');
 
         let fragment = if is_array {
-            // Normalize array values to valid TOML double-quoted strings.
-            // Docker/Coolify often backslash-escapes quotes in env vars:
-            //   [\'a\'] or [\"a\"] instead of ['a'] or ["a"]
-            // Order: strip escaped quotes first, then normalize ' → "
-            let toml_val = value_trimmed
-                .replace("\\'", "'")
-                .replace("\\\"", "\"")
-                .replace('\'', "\"");
+            let toml_val = normalize_toml_array(value_trimmed);
             format!("[{section}]\n{field} = {toml_val}")
         } else {
             // Scalar value — detect type for proper TOML encoding
@@ -221,11 +224,17 @@ pub fn load_settings(
 }
 
 /// Encode a scalar value as a TOML literal (bool/int/float) or escaped string.
+///
+/// Non-finite floats (`nan`, `inf`, `-inf`) are intentionally NOT treated as
+/// literals: `value.parse::<f64>()` accepts them, but emitting them bare would
+/// let untrusted input (e.g. a webhook comment `--config.temperature=nan`)
+/// poison the request body. They fall through to the quoted-string branch,
+/// where figment rejects them when extracting a numeric field.
 fn encode_toml_scalar(value: &str) -> String {
     let is_literal = value == "true"
         || value == "false"
         || value.parse::<i64>().is_ok()
-        || value.parse::<f64>().is_ok();
+        || value.parse::<f64>().map(f64::is_finite).unwrap_or(false);
     if is_literal {
         value.to_string()
     } else {
@@ -239,6 +248,84 @@ fn encode_toml_scalar(value: &str) -> String {
     }
 }
 
+/// Whether a TOML section name is safe to interpolate into a `[section]`
+/// header. Rejects anything that could break out of the header (brackets,
+/// quotes, whitespace, newlines, dots).
+fn is_safe_toml_section(s: &str) -> bool {
+    !s.is_empty() && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+}
+
+/// Whether a TOML field key is safe to interpolate before ` = value`. Dots are
+/// allowed (valid TOML dotted keys for nested fields); brackets, quotes,
+/// `=`, whitespace and newlines are not.
+fn is_safe_toml_field(s: &str) -> bool {
+    !s.is_empty()
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'.')
+}
+
+/// Normalize a `[...]` array env-var value into a valid TOML array.
+///
+/// Docker/Coolify often single-quote and backslash-escape array values
+/// (`[\'a\', \'b\']`). We split at top-level commas (commas inside quotes do
+/// NOT split), then strip one matching pair of surrounding quotes per element
+/// and re-encode it with [`encode_toml_scalar`]. A blanket `'` → `"` replace
+/// (the previous approach) corrupted values like `["it's_a_file.txt"]`.
+fn normalize_toml_array(value: &str) -> String {
+    let inner = value
+        .trim()
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .unwrap_or(value);
+    // Un-escape Docker-style escaped quotes before tokenizing.
+    let inner = inner.replace("\\'", "'").replace("\\\"", "\"");
+
+    // Split at top-level commas, keeping quotes so they can be stripped per element.
+    let mut segments: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut quote: Option<char> = None;
+    for ch in inner.chars() {
+        match quote {
+            Some(q) => {
+                current.push(ch);
+                if ch == q {
+                    quote = None;
+                }
+            }
+            None => match ch {
+                '\'' | '"' => {
+                    quote = Some(ch);
+                    current.push(ch);
+                }
+                ',' => segments.push(std::mem::take(&mut current)),
+                _ => current.push(ch),
+            },
+        }
+    }
+    segments.push(current);
+
+    let encoded: Vec<String> = segments
+        .iter()
+        .map(|seg| seg.trim())
+        .filter(|seg| !seg.is_empty())
+        .map(|seg| encode_toml_scalar(strip_matching_quotes(seg)))
+        .collect();
+    format!("[{}]", encoded.join(", "))
+}
+
+/// Strip a single matching pair of surrounding single/double quotes, preserving
+/// the inner content verbatim (so apostrophes inside a double-quoted value stay).
+fn strip_matching_quotes(s: &str) -> &str {
+    let bytes = s.as_bytes();
+    if bytes.len() >= 2 {
+        let (first, last) = (bytes[0], bytes[bytes.len() - 1]);
+        if (first == b'"' && last == b'"') || (first == b'\'' && last == b'\'') {
+            return &s[1..s.len() - 1];
+        }
+    }
+    s
+}
+
 /// Convert a CLI override like "pr_reviewer.num_max_findings=5" into a TOML fragment.
 fn cli_override_to_toml(key: &str, value: &str) -> Option<String> {
     let (section, field) = match key.split_once('.') {
@@ -248,6 +335,10 @@ fn cli_override_to_toml(key: &str, value: &str) -> Option<String> {
             return None;
         }
     };
+    if !is_safe_toml_section(section) || !is_safe_toml_field(field) {
+        tracing::warn!("ignoring CLI override with unsafe key: {key}");
+        return None;
+    }
     let toml_value = encode_toml_scalar(value);
     Some(format!("[{section}]\n{field} = {toml_value}"))
 }
@@ -260,6 +351,59 @@ mod tests {
     // `load_settings()` iterates ALL dotted env vars via `std::env::vars()`,
     // so concurrent tests setting env vars will contaminate each other.
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn test_encode_toml_scalar_rejects_non_finite_floats() {
+        // C14: nan/inf must NOT be emitted as bare TOML literals.
+        assert_eq!(encode_toml_scalar("nan"), "\"nan\"");
+        assert_eq!(encode_toml_scalar("inf"), "\"inf\"");
+        assert_eq!(encode_toml_scalar("-inf"), "\"-inf\"");
+        // Finite numbers and bools are still literals.
+        assert_eq!(encode_toml_scalar("0.2"), "0.2");
+        assert_eq!(encode_toml_scalar("42"), "42");
+        assert_eq!(encode_toml_scalar("true"), "true");
+        assert_eq!(encode_toml_scalar("gpt-4"), "\"gpt-4\"");
+    }
+
+    #[test]
+    fn test_normalize_toml_array_preserves_apostrophes() {
+        // C15: a double-quoted value containing an apostrophe must survive
+        // (the old blanket ' → " replace corrupted it into invalid TOML).
+        assert_eq!(
+            normalize_toml_array("[\"it's_a_file.txt\"]"),
+            "[\"it's_a_file.txt\"]"
+        );
+        // Single-quoted and escaped (Docker-style) inputs normalize to double quotes.
+        assert_eq!(normalize_toml_array("['a', 'b']"), "[\"a\", \"b\"]");
+        assert_eq!(normalize_toml_array("[\\'a\\', \\'b\\']"), "[\"a\", \"b\"]");
+        // Empty array.
+        assert_eq!(normalize_toml_array("[]"), "[]");
+    }
+
+    #[test]
+    fn test_normalize_toml_array_roundtrips_as_valid_toml() {
+        // The result must parse as TOML (the previous corruption broke load).
+        let frag = format!("[ignore]\nglob = {}", normalize_toml_array("[\"a's.txt\"]"));
+        let parsed: toml::Value = toml::from_str(&frag).expect("should be valid TOML");
+        let arr = parsed["ignore"]["glob"].as_array().unwrap();
+        assert_eq!(arr[0].as_str().unwrap(), "a's.txt");
+    }
+
+    #[test]
+    fn test_toml_key_safety_validation() {
+        // C13: only safe key segments are interpolated.
+        assert!(is_safe_toml_section("pr_reviewer"));
+        assert!(!is_safe_toml_section("evil]\n[other"));
+        assert!(!is_safe_toml_section("a.b")); // section has no dots
+        assert!(is_safe_toml_field("num_max_findings"));
+        assert!(is_safe_toml_field("nested.key")); // dotted fields allowed
+        assert!(!is_safe_toml_field("x = 1\n[evil"));
+        assert!(!is_safe_toml_field("k\"]"));
+
+        // cli_override_to_toml rejects unsafe keys.
+        assert!(cli_override_to_toml("config.model", "gpt-4").is_some());
+        assert!(cli_override_to_toml("config.x]\n[evil", "1").is_none());
+    }
 
     #[test]
     fn test_load_default_settings() {

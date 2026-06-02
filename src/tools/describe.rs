@@ -94,13 +94,12 @@ impl PRDescription {
         )
         .await;
         let image_ref = image_urls.as_deref();
-        let response = crate::ai::chat_completion_with_fallback(
+        let response = super::ai_call_with_fallback(
             ai.as_ref(),
+            &settings,
             model,
-            &settings.config.fallback_models,
             &rendered.system,
             &rendered.user,
-            Some(settings.config.temperature),
             image_ref,
         )
         .await?;
@@ -195,15 +194,14 @@ impl PRDescription {
                 .pr_description
                 .publish_description_as_comment_persistent
             {
-                self.provider
-                    .publish_persistent_comment(
-                        &output.body,
-                        "<!-- pr-agent:describe -->",
-                        "",
-                        "describe",
-                        settings.pr_description.final_update_message,
-                    )
-                    .await?;
+                super::publish_persistent_comment(
+                    self.provider.as_ref(),
+                    &output.body,
+                    "<!-- pr-agent:describe -->",
+                    "describe",
+                    settings.pr_description.final_update_message,
+                )
+                .await?;
             } else {
                 self.provider.publish_comment(&output.body, false).await?;
             }
@@ -231,10 +229,7 @@ impl PRDescription {
                     serde_yaml_ng::to_string(data).unwrap_or_else(|_| raw_response.to_string())
                 );
             }
-            None => {
-                eprintln!("Warning: could not parse YAML from AI response, printing raw:");
-                println!("{raw_response}");
-            }
+            None => super::print_raw_fallback(raw_response),
         }
     }
 }

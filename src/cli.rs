@@ -24,7 +24,7 @@ pub struct Cli {
     pub command: Command,
 
     /// Extra arguments passed as config overrides (--section.key=value).
-    /// Place after `--` separator: `pr-agent review --pr_url=<url> -- --config.model=gpt-4`
+    /// Place after `--` separator: `pr-agent --pr-url=<url> review -- --config.model=gpt-4`
     #[arg(last = true, allow_hyphen_values = true, global = true)]
     pub rest: Vec<String>,
 }
@@ -36,8 +36,6 @@ pub enum Command {
     Review,
     /// Automatic review (triggered by CI/webhooks).
     AutoReview,
-    /// Answer mode (for issue comments).
-    Answer,
     /// Modify PR title and description.
     #[command(alias = "describe_pr")]
     Describe,
@@ -49,16 +47,6 @@ pub enum Command {
     Ask,
     /// Ask questions at specific lines.
     AskLine,
-    /// Update changelog based on PR.
-    UpdateChangelog,
-    /// Add documentation.
-    AddDocs,
-    /// Generate PR labels.
-    GenerateLabels,
-    /// Get help on issues/PRs.
-    HelpDocs,
-    /// Find similar issues.
-    SimilarIssue,
     /// View/manage configuration.
     #[command(alias = "settings")]
     Config,
@@ -74,16 +62,10 @@ impl Command {
         match self {
             Command::Review => "review",
             Command::AutoReview => "auto_review",
-            Command::Answer => "answer",
             Command::Describe => "describe",
             Command::Improve => "improve",
             Command::Ask => "ask",
             Command::AskLine => "ask_line",
-            Command::UpdateChangelog => "update_changelog",
-            Command::AddDocs => "add_docs",
-            Command::GenerateLabels => "generate_labels",
-            Command::HelpDocs => "help_docs",
-            Command::SimilarIssue => "similar_issue",
             Command::Config => "config",
             Command::Serve => "serve",
             Command::Health => "health",
@@ -138,30 +120,33 @@ pub fn check_forbidden_key(key: &str) -> Option<&'static str> {
         .copied()
 }
 
+/// Normalize a `--section.key=value` (or `--section__key=value`) override token
+/// into its `(key, value)` pair, or `None` if it isn't a `key=value` override.
+///
+/// Strips leading dashes and converts double underscores to dots. The
+/// forbidden-key check is intentionally left to the caller, because the CLI
+/// errors on a forbidden key while the webhook drops it with a warning.
+pub fn parse_override_token(token: &str) -> Option<(String, String)> {
+    let stripped = token.trim_start_matches('-').replace("__", ".");
+    let (key, value) = stripped.split_once('=')?;
+    Some((key.to_string(), value.to_string()))
+}
+
 /// Parse the `rest` args into a HashMap of config overrides.
 /// Format: `--section.key=value` or `--section__key=value` (double underscores → dots).
 fn parse_config_overrides(rest: &[String]) -> Result<HashMap<String, String>, PrAgentError> {
     let mut overrides = HashMap::new();
 
     for arg in rest {
-        let stripped = arg.trim_start_matches('-');
-        if stripped.is_empty() {
-            continue;
-        }
-
-        // Convert double underscore to dot (e.g., pr_reviewer__num_code_suggestions → pr_reviewer.num_code_suggestions)
-        let stripped = stripped.replace("__", ".");
-
-        if let Some((key, value)) = stripped.split_once('=') {
-            if let Some(forbidden) = check_forbidden_key(key) {
+        // Non-config args (no `=`) are ignored for config; commands inspect rest directly.
+        if let Some((key, value)) = parse_override_token(arg) {
+            if let Some(forbidden) = check_forbidden_key(&key) {
                 return Err(PrAgentError::Other(format!(
                     "forbidden CLI override: '{key}' (matches '{forbidden}')"
                 )));
             }
-
-            overrides.insert(key.to_string(), value.to_string());
+            overrides.insert(key, value);
         }
-        // Non-config args (no `=`) are ignored for config; commands can inspect rest directly
     }
 
     Ok(overrides)
@@ -201,12 +186,20 @@ pub async fn run() -> Result<(), PrAgentError> {
             crate::server::start_server().await?;
         }
         _ => {
-            let url = pr_url.ok_or_else(|| {
-                PrAgentError::Other(format!(
-                    "--pr-url is required for {}",
-                    cli.command.canonical_name()
-                ))
-            })?;
+            // Defense-in-depth: reject any command without a dispatch path before
+            // doing network/auth work, mirroring the webhook's is_known_command
+            // guard. After removing the unimplemented scaffolding variants this is
+            // future-proofing — a new CLI variant added without wiring
+            // `resolve_command` fails fast instead of after creating the provider.
+            let name = cli.command.canonical_name();
+            if !tools::is_known_command(name) {
+                return Err(PrAgentError::Other(format!(
+                    "command '{name}' is not implemented"
+                )));
+            }
+
+            let url = pr_url
+                .ok_or_else(|| PrAgentError::Other(format!("--pr-url is required for {name}")))?;
 
             let provider: Arc<dyn crate::git::GitProvider> =
                 Arc::new(GithubProvider::new(url).await?);
@@ -250,7 +243,8 @@ pub async fn run() -> Result<(), PrAgentError> {
                 None
             };
 
-            // Re-initialize settings with global + repo overrides if either was found
+            // Re-initialize global settings with global + repo overrides if either
+            // was found, so any non-scoped reads also see the merged config.
             if global_toml.is_some() || repo_toml.is_some() {
                 init_settings(
                     &config_overrides,
@@ -259,8 +253,16 @@ pub async fn run() -> Result<(), PrAgentError> {
                 )?;
             }
 
-            tools::handle_command(cli.command.canonical_name(), provider, &config_overrides)
-                .await?;
+            // Thread the global/repo TOML into handle_command so its scoped
+            // re-load (when overrides are present) keeps all config layers.
+            tools::handle_command(
+                cli.command.canonical_name(),
+                provider,
+                &config_overrides,
+                global_toml.as_deref(),
+                repo_toml.as_deref(),
+            )
+            .await?;
         }
     }
 
@@ -275,9 +277,13 @@ async fn health_check() -> Result<(), PrAgentError> {
         .unwrap_or(3000);
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
     let timeout = std::time::Duration::from_secs(5);
-    std::net::TcpStream::connect_timeout(&addr, timeout)
-        .map_err(|e| PrAgentError::Other(format!("health check failed: {e}")))?;
-    Ok(())
+    // Async connect — never block the runtime thread (the previous
+    // std::net::TcpStream::connect_timeout blocked for up to 5s).
+    match tokio::time::timeout(timeout, tokio::net::TcpStream::connect(addr)).await {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(e)) => Err(PrAgentError::Other(format!("health check failed: {e}"))),
+        Err(_) => Err(PrAgentError::Other("health check timed out".into())),
+    }
 }
 
 #[cfg(test)]
@@ -298,6 +304,22 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_override_token() {
+        assert_eq!(
+            parse_override_token("--config.model=gpt-4"),
+            Some(("config.model".into(), "gpt-4".into()))
+        );
+        // Double underscores become dots.
+        assert_eq!(
+            parse_override_token("--config__model=gpt-4"),
+            Some(("config.model".into(), "gpt-4".into()))
+        );
+        // Not a key=value override.
+        assert_eq!(parse_override_token("review"), None);
+        assert_eq!(parse_override_token("--flag"), None);
+    }
+
+    #[test]
     fn test_forbidden_overrides() {
         let args = vec!["--openai.key=sk-secret".into()];
         let result = parse_config_overrides(&args);
@@ -313,5 +335,31 @@ mod tests {
         assert_eq!(Command::Improve.canonical_name(), "improve");
         assert_eq!(Command::Ask.canonical_name(), "ask");
         assert_eq!(Command::Config.canonical_name(), "config");
+    }
+
+    #[test]
+    fn test_all_cli_commands_have_a_dispatch_path() {
+        // Every exposed CLI subcommand must either be handled directly in run()
+        // (config/serve/health) or be a dispatchable tool command. This guards
+        // against re-introducing "announced but always-failing" commands (A1/F1).
+        let directly_handled = ["config", "serve", "health"];
+        let all = [
+            Command::Review,
+            Command::AutoReview,
+            Command::Describe,
+            Command::Improve,
+            Command::Ask,
+            Command::AskLine,
+            Command::Config,
+            Command::Serve,
+            Command::Health,
+        ];
+        for cmd in all {
+            let name = cmd.canonical_name();
+            assert!(
+                directly_handled.contains(&name) || tools::is_known_command(name),
+                "CLI command '{name}' has no dispatch path"
+            );
+        }
     }
 }

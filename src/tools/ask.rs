@@ -60,8 +60,15 @@ impl PRAsk {
         drop(files);
         let diff = diff_result.diff;
 
-        // 3. Detect images in the question
-        let image_url = extract_image_url(question);
+        // 3. Detect and validate images in the question. Gated on enable_vision
+        //    and routed through the shared extractor (markdown/HTML/bare URLs +
+        //    HEAD validation), matching /ask_line instead of a weaker inline one.
+        let image_urls = if settings.config.enable_vision {
+            let urls = crate::tools::image::extract_and_validate_image_urls(question).await;
+            if urls.is_empty() { None } else { Some(urls) }
+        } else {
+            None
+        };
 
         // 4. Build template variables
         let mut vars = build_common_vars(&meta, &diff);
@@ -72,20 +79,13 @@ impl PRAsk {
 
         // 6. Call AI
         let ai = resolve_ai_handler(&self.ai)?;
-        let image_urls: Vec<String> = image_url.into_iter().collect();
-        let image_ref = if image_urls.is_empty() {
-            None
-        } else {
-            Some(image_urls.as_slice())
-        };
-
         let response = ai
             .chat_completion(
                 model,
                 &rendered.system,
                 &rendered.user,
                 Some(settings.config.temperature),
-                image_ref,
+                image_urls.as_deref(),
             )
             .await?;
 
@@ -100,55 +100,6 @@ impl PRAsk {
 
         Ok(())
     }
-}
-
-/// Extract image URL from question text.
-fn extract_image_url(question: &str) -> Option<String> {
-    if let Some(marker_pos) = question.find("![image]") {
-        // Pattern: "question text ![image](url)"
-        // Find the '(' after "![image]" and scan for the matching ')'
-        let after_marker = &question[marker_pos + "![image]".len()..];
-        let after = after_marker.trim();
-        if after.starts_with('(') {
-            let inner = after.strip_prefix('(').unwrap();
-            // Find the matching closing ')' (handle balanced parens)
-            let mut depth = 1u32;
-            let mut end = inner.len();
-            for (i, ch) in inner.char_indices() {
-                match ch {
-                    '(' => depth += 1,
-                    ')' => {
-                        depth -= 1;
-                        if depth == 0 {
-                            end = i;
-                            break;
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            let url = inner[..end].trim();
-            if !url.is_empty() {
-                return Some(url.to_string());
-            }
-        }
-    } else if question.contains("https://") {
-        // Direct image link — extract the URL token up to whitespace
-        let after = question.split("https://").nth(1)?;
-        let token = format!(
-            "https://{}",
-            after.split_whitespace().next().unwrap_or(after)
-        );
-        // Strip common trailing punctuation that isn't part of the URL
-        let token = token.trim_end_matches(['.', ',', ';']);
-        // Validate extension: extract path before any query/fragment and check suffix
-        let path_part = token.split(['?', '#']).next().unwrap_or(token);
-        let lower = path_part.to_lowercase();
-        if lower.ends_with(".png") || lower.ends_with(".jpg") || lower.ends_with(".jpeg") {
-            return Some(token.to_string());
-        }
-    }
-    None
 }
 
 /// Sanitize AI answer to prevent accidental GitHub slash commands.
@@ -182,70 +133,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_extract_image_url_markdown() {
-        let q = "What is this? ![image](https://example.com/img.png)";
-        assert_eq!(
-            extract_image_url(q),
-            Some("https://example.com/img.png".to_string())
-        );
-    }
-
-    #[test]
-    fn test_extract_image_url_direct() {
-        let q = "Explain this https://example.com/screenshot.png please";
-        assert_eq!(
-            extract_image_url(q),
-            Some("https://example.com/screenshot.png".to_string())
-        );
-    }
-
-    #[test]
-    fn test_extract_image_url_none() {
-        assert_eq!(extract_image_url("What does this PR do?"), None);
-    }
-
-    #[test]
-    fn test_extract_image_url_non_image_https() {
-        assert_eq!(extract_image_url("See https://example.com/docs"), None);
-    }
-
-    #[test]
-    fn test_extract_image_url_parens_in_url() {
-        // URL with balanced parentheses (e.g. Wikipedia)
-        let q = "![image](https://example.com/File_(edit).png)";
-        assert_eq!(
-            extract_image_url(q),
-            Some("https://example.com/File_(edit).png".to_string())
-        );
-    }
-
-    #[test]
-    fn test_extract_image_url_query_string() {
-        // Direct URL with query params — extension is before '?'
-        let q = "See https://example.com/img.png?token=abc123";
-        assert_eq!(
-            extract_image_url(q),
-            Some("https://example.com/img.png?token=abc123".to_string())
-        );
-    }
-
-    #[test]
-    fn test_extract_image_url_trailing_punctuation() {
-        // Trailing period should be stripped
-        let q = "Look at https://example.com/shot.jpg.";
-        assert_eq!(
-            extract_image_url(q),
-            Some("https://example.com/shot.jpg".to_string())
-        );
-    }
-
-    #[test]
-    fn test_extract_image_url_no_false_positive_contains() {
-        // ".png" in a non-extension position should not match
-        assert_eq!(extract_image_url("See https://example.com/png-docs"), None);
-    }
-
-    #[test]
     fn test_sanitize_answer_leading_slash() {
         assert_eq!(sanitize_answer("/approve"), " /approve");
     }
@@ -275,5 +162,41 @@ mod tests {
         let output = format_ask_output(question, "Answer here.");
         assert!(!output.contains("![image]"));
         assert!(output.contains("What is this?"));
+    }
+
+    #[tokio::test]
+    async fn test_ask_no_images_when_vision_disabled() {
+        // C19: /ask must respect enable_vision. With vision off, an image in the
+        // question must NOT be sent to the model (and the gate short-circuits
+        // before any HEAD validation, so this is deterministic/offline).
+        use crate::config::loader::with_settings;
+        use crate::testing::fixtures::{SAMPLE_PATCH, sample_diff_file};
+        use crate::testing::mock_ai::MockAiHandler;
+        use crate::testing::mock_git::MockGitProvider;
+
+        let provider = Arc::new(
+            MockGitProvider::new()
+                .with_diff_files(vec![sample_diff_file("src/main.rs", SAMPLE_PATCH)]),
+        );
+        let ai = Arc::new(MockAiHandler::new("An answer."));
+        let ask = PRAsk::new_with_ai(provider.clone(), ai.clone());
+
+        let mut overrides = std::collections::HashMap::new();
+        overrides.insert("config.publish_output".into(), "true".into());
+        overrides.insert("config.publish_output_progress".into(), "false".into());
+        overrides.insert("config.enable_vision".into(), "false".into());
+        let settings =
+            Arc::new(crate::config::loader::load_settings(&overrides, None, None).unwrap());
+
+        let question = "What is shown here? ![image](https://example.com/x.png)";
+        with_settings(settings, ask.run(question)).await.unwrap();
+
+        let calls = ai.get_recorded_calls();
+        assert_eq!(calls.len(), 1, "should call AI once");
+        assert!(
+            calls[0].image_urls.is_none(),
+            "vision disabled → no images passed to AI, got {:?}",
+            calls[0].image_urls
+        );
     }
 }

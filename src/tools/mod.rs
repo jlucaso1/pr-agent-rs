@@ -50,19 +50,31 @@ impl PrMetadata {
         provider: &dyn GitProvider,
         settings: &Settings,
     ) -> Result<Self, PrAgentError> {
-        let (title, description) = provider.get_pr_description_full().await?;
-        let branch = provider.get_pr_branch().await?;
-        let commit_messages = provider.get_commit_messages().await?;
+        // These fetches are independent, so run them concurrently. Error
+        // handling is preserved per field: the first three propagate (`?`),
+        // the last two degrade to a default. best_practices still prefers the
+        // configured content and only fetches when it is empty.
+        let bp_from_config = !settings.best_practices.content.is_empty();
 
-        let best_practices = {
-            let bp = &settings.best_practices.content;
-            if !bp.is_empty() {
-                bp.clone()
-            } else {
-                provider.get_best_practices().await.unwrap_or_default()
-            }
-        };
-        let repo_metadata = provider.get_repo_metadata().await.unwrap_or_default();
+        let (desc_res, branch_res, commits_res, bp_res, repo_res) = tokio::join!(
+            provider.get_pr_description_full(),
+            provider.get_pr_branch(),
+            provider.get_commit_messages(),
+            async {
+                if bp_from_config {
+                    Ok(settings.best_practices.content.clone())
+                } else {
+                    provider.get_best_practices().await
+                }
+            },
+            provider.get_repo_metadata(),
+        );
+
+        let (title, description) = desc_res?;
+        let branch = branch_res?;
+        let commit_messages = commits_res?;
+        let best_practices = bp_res.unwrap_or_default();
+        let repo_metadata = repo_res.unwrap_or_default();
 
         Ok(Self {
             title,
@@ -73,6 +85,36 @@ impl PrMetadata {
             repo_metadata,
         })
     }
+}
+
+/// Call the AI with the configured fallback models, reading model/fallbacks/
+/// temperature from settings. Shared by review/describe/improve (which all use
+/// the fallback path). NOT used by ask/ask_line, which intentionally call the
+/// model directly without fallback.
+pub(crate) async fn ai_call_with_fallback(
+    ai: &dyn AiHandler,
+    settings: &Settings,
+    model: &str,
+    system: &str,
+    user: &str,
+    image_urls: Option<&[String]>,
+) -> Result<crate::ai::types::ChatResponse, PrAgentError> {
+    crate::ai::chat_completion_with_fallback(
+        ai,
+        model,
+        &settings.config.fallback_models,
+        system,
+        user,
+        Some(settings.config.temperature),
+        image_urls,
+    )
+    .await
+}
+
+/// Print a raw AI response to stdout when its YAML couldn't be parsed (CLI mode).
+pub(crate) fn print_raw_fallback(raw_response: &str) {
+    eprintln!("Warning: could not parse YAML from AI response, printing raw:");
+    println!("{raw_response}");
 }
 
 /// Run a tool's inner logic wrapped with progress comment lifecycle.
@@ -265,12 +307,69 @@ pub async fn publish_as_comment(
 ) -> Result<(), PrAgentError> {
     if persistent {
         let marker = format!("<!-- pr-agent:{tool_name} -->");
-        provider
-            .publish_persistent_comment(content, &marker, "", tool_name, final_update_message)
+        publish_persistent_comment(provider, content, &marker, tool_name, final_update_message)
             .await?;
     } else {
         provider.publish_comment(content, false).await?;
     }
+    Ok(())
+}
+
+/// Find an existing persistent comment by its header marker and update it in
+/// place (appending an "updated until commit" header and an optional
+/// notification), or create a new one if none exists.
+///
+/// This is pr-agent's *usage* of the provider (business orchestration), so it
+/// lives here as a free function over `&dyn GitProvider` rather than as a
+/// GitProvider trait default — the trait stays about provider capabilities.
+pub async fn publish_persistent_comment(
+    provider: &dyn GitProvider,
+    text: &str,
+    initial_header: &str,
+    name: &str,
+    final_update_message: bool,
+) -> Result<(), PrAgentError> {
+    use crate::git::capitalize_first;
+    use crate::git::types::CommentId;
+
+    let comments = provider.get_issue_comments().await?;
+    for comment in &comments {
+        if comment.body.starts_with(initial_header) {
+            tracing::info!(
+                comment_id = comment.id,
+                "updating existing persistent comment"
+            );
+            let comment_url = comment.url.as_deref().unwrap_or("");
+
+            // Add "updated until commit" header
+            let latest_commit_url = provider.get_latest_commit_url().await.unwrap_or_default();
+            let updated_text = if !latest_commit_url.is_empty() {
+                let cap_name = capitalize_first(name);
+                let updated_header = format!(
+                    "{initial_header}\n\n#### ({cap_name} updated until commit {latest_commit_url})\n"
+                );
+                text.replace(initial_header, &updated_header)
+            } else {
+                text.to_string()
+            };
+
+            provider
+                .edit_comment(&CommentId(comment.id.to_string()), &updated_text)
+                .await?;
+
+            // Post notification comment linking to the updated persistent comment
+            if final_update_message && !comment_url.is_empty() && !latest_commit_url.is_empty() {
+                let notification = format!(
+                    "**[Persistent {name}]({comment_url})** updated to latest commit {latest_commit_url}"
+                );
+                let _ = provider.publish_comment(&notification, false).await;
+            }
+
+            return Ok(());
+        }
+    }
+    tracing::info!("creating new persistent comment");
+    provider.publish_comment(text, false).await?;
     Ok(())
 }
 
@@ -292,21 +391,19 @@ pub fn parse_command(input: &str) -> (String, HashMap<String, String>) {
     let mut overrides = HashMap::new();
     let mut text_parts: Vec<&str> = Vec::new();
     for part in parts {
-        if part.starts_with('-') && part.contains('=') {
-            let stripped = part.trim_start_matches('-');
-            // Convert double underscore to dot
-            let stripped = stripped.replace("__", ".");
-            if let Some((key, value)) = stripped.split_once('=') {
-                if let Some(forbidden) = crate::cli::check_forbidden_key(key) {
-                    tracing::warn!(
-                        key,
-                        forbidden,
-                        "dropping forbidden override from comment command"
-                    );
-                    continue;
-                }
-                overrides.insert(key.to_string(), value.to_string());
+        if part.starts_with('-')
+            && part.contains('=')
+            && let Some((key, value)) = crate::cli::parse_override_token(part)
+        {
+            if let Some(forbidden) = crate::cli::check_forbidden_key(&key) {
+                tracing::warn!(
+                    key,
+                    forbidden,
+                    "dropping forbidden override from comment command"
+                );
+                continue;
             }
+            overrides.insert(key, value);
         } else {
             text_parts.push(part);
         }
@@ -330,6 +427,7 @@ enum Command {
     Improve,
     Ask,
     AskLine,
+    Help,
 }
 
 /// Map a command name string to its `Command` variant, if recognized.
@@ -340,8 +438,26 @@ fn resolve_command(name: &str) -> Option<Command> {
         "improve" | "improve_code" => Some(Command::Improve),
         "ask" => Some(Command::Ask),
         "ask_line" => Some(Command::AskLine),
+        "help" => Some(Command::Help),
         _ => None,
     }
+}
+
+/// Build the static `/help` message listing the supported commands.
+fn build_help_message() -> String {
+    let mut out = String::with_capacity(512);
+    out.push_str("## PR-Agent Commands 🤖\n\n");
+    out.push_str("| Command | Description |\n");
+    out.push_str("|---------|-------------|\n");
+    out.push_str("| `/review` | Review the PR: summary, key issues, and effort estimate |\n");
+    out.push_str("| `/describe` | Generate a PR title, type, and description |\n");
+    out.push_str("| `/improve` | Suggest committable code improvements |\n");
+    out.push_str("| `/ask <question>` | Ask a free-form question about the PR |\n");
+    out.push_str(
+        "| `/ask_line <question>` | Ask about specific lines (reply to a line comment) |\n",
+    );
+    out.push_str("| `/help` | Show this help message |\n");
+    out
 }
 
 /// Check whether a command name is one that pr-agent-rs can handle.
@@ -354,12 +470,18 @@ pub fn is_known_command(name: &str) -> bool {
 
 /// Dispatch a command to the appropriate tool.
 ///
-/// If `args` contains per-command overrides (from `/command --key=value` parsing),
-/// creates a scoped settings override for this command execution.
+/// `global_toml` / `repo_toml` are the org-level and repo-level `.pr_agent.toml`
+/// contents already fetched by the caller. They are threaded all the way down so
+/// that, when `args` also carries per-command overrides (`/command --key=value`),
+/// the scoped re-load merges ALL layers (defaults → secrets → global → repo →
+/// overrides → env). Previously the override re-load passed `None, None`, which
+/// silently discarded the repo/global config whenever any override was present.
 pub async fn handle_command(
     command: &str,
     provider: Arc<dyn GitProvider>,
     args: &HashMap<String, String>,
+    global_toml: Option<&str>,
+    repo_toml: Option<&str>,
 ) -> Result<(), PrAgentError> {
     // Separate config overrides (key=value flags) from tool data (_text, _diff_hunk, etc.)
     let config_overrides: HashMap<String, String> = args
@@ -368,24 +490,41 @@ pub async fn handle_command(
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
 
-    // If there are per-command config overrides, scope them as settings overrides
-    if !config_overrides.is_empty() {
-        let current = get_settings();
-        let scoped = Arc::new(match load_settings(&config_overrides, None, None) {
+    match build_scoped_settings(&config_overrides, global_toml, repo_toml) {
+        Some(scoped) => with_settings(scoped, dispatch(command, provider, args)).await,
+        None => dispatch(command, provider, args).await,
+    }
+}
+
+/// Build the scoped settings for a command execution, merging per-command
+/// overrides on TOP of the global + repo `.pr_agent.toml` layers.
+///
+/// Returns `None` when there is nothing to scope (no overrides and no
+/// repo/global TOML), in which case the caller dispatches against the ambient
+/// settings. Including `global_toml`/`repo_toml` here is the fix for the bug
+/// where any per-command override silently discarded the repo/global config.
+fn build_scoped_settings(
+    config_overrides: &HashMap<String, String>,
+    global_toml: Option<&str>,
+    repo_toml: Option<&str>,
+) -> Option<Arc<Settings>> {
+    if config_overrides.is_empty() && global_toml.is_none() && repo_toml.is_none() {
+        return None;
+    }
+
+    Some(Arc::new(
+        match load_settings(config_overrides, global_toml, repo_toml) {
             Ok(s) => s,
             Err(e) => {
                 tracing::warn!(
                     error = %e,
                     ?config_overrides,
-                    "failed to apply command config overrides, using current settings"
+                    "failed to apply scoped settings, using current settings"
                 );
-                (*current).clone()
+                (*get_settings()).clone()
             }
-        });
-        return with_settings(scoped, dispatch(command, provider, args)).await;
-    }
-
-    dispatch(command, provider, args).await
+        },
+    ))
 }
 
 async fn dispatch(
@@ -405,6 +544,14 @@ async fn dispatch(
             ask::PRAsk::new(provider).run(question).await
         }
         Command::AskLine => ask_line::PRAskLine::new(provider).run(args).await,
+        Command::Help => {
+            // Static help table — no AI call, mirrors the Python PRHelpMessage
+            // else-branch.
+            provider
+                .publish_comment(&build_help_message(), false)
+                .await
+                .map(|_| ())
+        }
     }
 }
 
@@ -417,6 +564,94 @@ mod tests {
         let (cmd, args) = parse_command("/review");
         assert_eq!(cmd, "review");
         assert!(args.is_empty());
+    }
+
+    #[test]
+    fn test_build_help_message_and_known() {
+        // F2: /help is a known command and lists every supported command.
+        assert!(is_known_command("help"));
+        let msg = build_help_message();
+        for cmd in [
+            "/review",
+            "/describe",
+            "/improve",
+            "/ask",
+            "/ask_line",
+            "/help",
+        ] {
+            assert!(msg.contains(cmd), "help should mention {cmd}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_dispatch_help_publishes_comment() {
+        use crate::testing::mock_git::MockGitProvider;
+        let provider = Arc::new(MockGitProvider::new());
+        dispatch("help", provider.clone(), &HashMap::new())
+            .await
+            .unwrap();
+        let calls = provider.get_calls();
+        assert!(!calls.comments.is_empty(), "/help should publish a comment");
+        assert!(calls.comments[0].0.contains("PR-Agent Commands"));
+    }
+
+    #[test]
+    fn test_scoped_settings_overrides_preserve_repo_toml() {
+        // Regression for C3: a per-command override must NOT discard the
+        // repo-level `.pr_agent.toml`. Both layers have to survive.
+        let mut overrides = HashMap::new();
+        overrides.insert("config.temperature".to_string(), "0.9".to_string());
+        let repo_toml = "[pr_reviewer]\nnum_max_findings = 7\n";
+
+        let scoped = build_scoped_settings(&overrides, None, Some(repo_toml))
+            .expect("overrides present → must produce scoped settings");
+
+        // The CLI/comment override is applied...
+        assert!((scoped.config.temperature - 0.9).abs() < 1e-6);
+        // ...AND the repo toml is preserved (previously dropped to its default of 3).
+        assert_eq!(scoped.pr_reviewer.num_max_findings, 7);
+    }
+
+    #[test]
+    fn test_scoped_settings_none_when_nothing_to_scope() {
+        // No overrides and no repo/global TOML → dispatch against ambient settings.
+        assert!(build_scoped_settings(&HashMap::new(), None, None).is_none());
+    }
+
+    #[tokio::test]
+    async fn test_pr_metadata_fetch_populates_fields() {
+        // P2: the concurrent fetch still returns the correct fields.
+        use crate::testing::mock_git::MockGitProvider;
+        let provider = MockGitProvider::new().with_pr_description("My Title", "My Desc");
+        let settings = crate::config::loader::load_settings(&HashMap::new(), None, None).unwrap();
+
+        let meta = PrMetadata::fetch(&provider, &settings).await.unwrap();
+        assert_eq!(meta.title, "My Title");
+        assert_eq!(meta.description, "My Desc");
+        assert_eq!(meta.branch, "feature/test");
+    }
+
+    #[tokio::test]
+    async fn test_pr_metadata_prefers_configured_best_practices() {
+        // P2: the best_practices gate is preserved — configured content wins and
+        // the provider is not consulted for it.
+        use crate::testing::mock_git::MockGitProvider;
+        let provider = MockGitProvider::new();
+        let mut overrides = HashMap::new();
+        overrides.insert("best_practices.content".to_string(), "MY BP".to_string());
+        let settings = crate::config::loader::load_settings(&overrides, None, None).unwrap();
+
+        let meta = PrMetadata::fetch(&provider, &settings).await.unwrap();
+        assert_eq!(meta.best_practices, "MY BP");
+    }
+
+    #[test]
+    fn test_scoped_settings_repo_toml_only() {
+        // Repo TOML with no overrides must still scope (so the layer applies).
+        let repo_toml = "[pr_reviewer]\nnum_max_findings = 5\n";
+        let scoped = build_scoped_settings(&HashMap::new(), None, Some(repo_toml))
+            .expect("repo toml present → must produce scoped settings");
+        assert_eq!(scoped.pr_reviewer.num_max_findings, 5);
     }
 
     #[test]
@@ -631,7 +866,8 @@ mod tests {
 
     #[test]
     fn test_is_known_command_rejects_unknown() {
-        for cmd in ["qa-verify", "qa-review", "help", "deploy", "", "REVIEW"] {
+        // Note: "help" IS known (see test_build_help_message_and_known).
+        for cmd in ["qa-verify", "qa-review", "deploy", "", "REVIEW"] {
             assert!(
                 !is_known_command(cmd),
                 "'{cmd}' should NOT be a known command"

@@ -1,7 +1,10 @@
+use std::sync::Arc;
+
 use regex::Regex;
 
 use crate::config::loader::get_settings;
 use crate::git::types::FilePatchInfo;
+use crate::util::get_or_compile_regex;
 
 /// Common binary file extensions that should be excluded from diff processing.
 const BINARY_EXTENSIONS: &[&str] = &[
@@ -23,29 +26,32 @@ pub fn is_binary(filename: &str) -> bool {
 
 /// Build the list of compiled ignore patterns from settings.
 /// Combines regex patterns and glob patterns (converted to regex).
-pub fn build_ignore_patterns() -> Vec<Regex> {
+///
+/// Patterns go through the shared `Arc<Regex>` cache, so `filter_files`
+/// (called repeatedly, e.g. twice per improve run) reuses already-compiled
+/// regexes instead of recompiling them every time.
+pub fn build_ignore_patterns() -> Vec<Arc<Regex>> {
     let settings = get_settings();
     let mut patterns = Vec::new();
 
     // Regex patterns from settings
     for pattern in &settings.ignore.regex {
-        if let Ok(re) = Regex::new(pattern) {
-            patterns.push(re);
-        } else {
-            tracing::warn!(pattern, "invalid ignore regex pattern");
+        match get_or_compile_regex(pattern) {
+            Some(re) => patterns.push(re),
+            None => tracing::warn!(pattern, "invalid ignore regex pattern"),
         }
     }
 
     // Glob patterns from settings (convert to regex)
     for glob in &settings.ignore.glob {
         let regex_str = glob_to_regex(glob);
-        if let Ok(re) = Regex::new(&regex_str) {
+        if let Some(re) = get_or_compile_regex(&regex_str) {
             patterns.push(re);
         }
         // Also cover root-level files for `**/` prefixed globs
         if let Some(root_glob) = glob.strip_prefix("**/") {
             let root_regex = glob_to_regex(root_glob);
-            if let Ok(re) = Regex::new(&root_regex) {
+            if let Some(re) = get_or_compile_regex(&root_regex) {
                 patterns.push(re);
             }
         }
@@ -125,6 +131,37 @@ mod tests {
         assert!(is_binary("doc.PDF")); // case-insensitive
         assert!(!is_binary("main.rs"));
         assert!(!is_binary("README.md"));
+    }
+
+    #[tokio::test]
+    async fn test_build_ignore_patterns_uses_cache() {
+        // P5: repeated calls reuse the cached Arc<Regex> instead of recompiling.
+        use crate::config::loader::with_settings;
+        // A unique pattern string keeps the global cache deterministic here.
+        let repo_toml = "[ignore]\nregex = [\"^vendor/p5_cache_probe/\"]\n";
+        let settings = Arc::new(
+            crate::config::loader::load_settings(
+                &std::collections::HashMap::new(),
+                None,
+                Some(repo_toml),
+            )
+            .unwrap(),
+        );
+
+        let (a, b) = with_settings(settings, async {
+            (build_ignore_patterns(), build_ignore_patterns())
+        })
+        .await;
+
+        assert!(!a.is_empty(), "at least the configured regex is present");
+        assert_eq!(a.len(), b.len());
+        // Every pattern is the same cached Arc across the two calls.
+        for (x, y) in a.iter().zip(b.iter()) {
+            assert!(
+                Arc::ptr_eq(x, y),
+                "the same pattern must return the cached Arc"
+            );
+        }
     }
 
     #[test]

@@ -63,11 +63,10 @@ impl PRCodeSuggestions {
 
         let max_calls = settings.pr_code_suggestions.max_number_of_calls as usize;
 
-        // Generate batches without line numbers (for the suggestion prompt)
-        let batches_no_lines = get_pr_diff_multiple_patches(&mut files, model, false, max_calls);
-        // Generate batches with line numbers (for the reflect prompt).
-        // filter_files is idempotent so this operates on the already-filtered set.
-        let batches_with_lines = get_pr_diff_multiple_patches(&mut files, model, true, max_calls);
+        // Generate batches formatted in both variants in a SINGLE packing pass,
+        // so batch i carries the same files for the suggestion (no line numbers)
+        // and reflect (with line numbers) prompts.
+        let batches = get_pr_diff_multiple_patches(&mut files, model, max_calls);
 
         // Release large file contents — base_file/head_file are no longer needed
         // after patches have been extended above.
@@ -77,13 +76,13 @@ impl PRCodeSuggestions {
         }
         drop(files);
 
-        if batches_no_lines.is_empty() {
+        if batches.is_empty() {
             tracing::info!("no diff content, skipping improve");
             return Ok(());
         }
 
         let ai = super::resolve_ai_handler(&self.ai)?;
-        let num_batches = batches_no_lines.len();
+        let num_batches = batches.len();
         tracing::info!(num_batches, num_files, "processing PR in extended mode");
 
         // Extract images from PR body for vision-capable models
@@ -95,76 +94,79 @@ impl PRCodeSuggestions {
         .await;
         let image_ref = image_urls.as_deref();
 
-        // 3. Process batches (parallel or sequential)
+        // 3. Process batches (parallel or sequential). Track whether any batch's
+        // self-review (reflect) pass failed, so the output can flag degraded scores.
+        let mut reflect_failed = false;
         let all_suggestions = if settings.pr_code_suggestions.parallel_calls && num_batches > 1 {
-            let futures: Vec<_> = batches_no_lines
+            let futures: Vec<_> = batches
                 .iter()
-                .zip(batches_with_lines.iter())
                 .enumerate()
-                .map(|(i, (batch, batch_lines))| {
+                .map(|(i, batch)| {
                     self.process_single_batch(
                         ai.as_ref(),
                         model,
                         &meta,
                         &batch.patches,
-                        &batch_lines.patches,
+                        &batch.patches_with_lines,
                         i,
                         image_ref,
                     )
                 })
                 .collect();
             let results = join_all(futures).await;
-            results
-                .into_iter()
-                .enumerate()
-                .flat_map(|(i, r)| match r {
-                    Ok(s) => s,
-                    Err(e) => {
-                        tracing::error!(batch = i, error = %e, "batch failed");
-                        Vec::new()
+            let mut all = Vec::new();
+            for (i, r) in results.into_iter().enumerate() {
+                match r {
+                    Ok((suggestions, failed)) => {
+                        reflect_failed |= failed;
+                        all.extend(suggestions);
                     }
-                })
-                .collect::<Vec<_>>()
+                    Err(e) => tracing::error!(batch = i, error = %e, "batch failed"),
+                }
+            }
+            all
         } else {
             let mut all = Vec::new();
-            for (i, (batch, batch_lines)) in batches_no_lines
-                .iter()
-                .zip(batches_with_lines.iter())
-                .enumerate()
-            {
+            for (i, batch) in batches.iter().enumerate() {
                 match self
                     .process_single_batch(
                         ai.as_ref(),
                         model,
                         &meta,
                         &batch.patches,
-                        &batch_lines.patches,
+                        &batch.patches_with_lines,
                         i,
                         image_ref,
                     )
                     .await
                 {
-                    Ok(suggestions) => all.extend(suggestions),
+                    Ok((suggestions, failed)) => {
+                        reflect_failed |= failed;
+                        all.extend(suggestions);
+                    }
                     Err(e) => tracing::error!(batch = i, error = %e, "batch failed"),
                 }
             }
             all
         };
 
-        // 4. Filter by score threshold, sort, deduplicate
+        // 4. Filter by score threshold and sort (highest score first).
+        // score_threshold is at least 1, so `score >= score_threshold` already
+        // excludes zero-scored suggestions — no extra `> 0` check needed.
         let score_threshold = settings
             .pr_code_suggestions
             .suggestions_score_threshold
             .max(1);
         let mut suggestions: Vec<ParsedSuggestion> = all_suggestions
             .into_iter()
-            .filter(|s| s.score >= score_threshold && s.score > 0)
+            .filter(|s| s.score >= score_threshold)
             .collect();
-        suggestions.sort_by(|a, b| b.score.cmp(&a.score));
+        suggestions.sort_by_key(|s| std::cmp::Reverse(s.score));
 
         // 5. Format and publish
         if settings.config.publish_output {
-            self.publish_suggestions(&suggestions, false).await?;
+            self.publish_suggestions(&suggestions, reflect_failed)
+                .await?;
         } else {
             self.print_suggestions(&suggestions);
         }
@@ -185,7 +187,7 @@ impl PRCodeSuggestions {
         diff_with_lines: &str,
         batch_index: usize,
         image_urls: Option<&[String]>,
-    ) -> Result<Vec<ParsedSuggestion>, PrAgentError> {
+    ) -> Result<(Vec<ParsedSuggestion>, bool), PrAgentError> {
         let settings = get_settings();
 
         // 1. Build template variables
@@ -196,13 +198,12 @@ impl PRCodeSuggestions {
 
         // 3. Call AI (generate suggestions, with fallback models)
         tracing::info!(model, batch = batch_index, "calling AI model for improve");
-        let response = crate::ai::chat_completion_with_fallback(
+        let response = super::ai_call_with_fallback(
             ai,
+            &settings,
             model,
-            &settings.config.fallback_models,
             &rendered.system,
             &rendered.user,
-            Some(settings.config.temperature),
             image_urls,
         )
         .await?;
@@ -221,10 +222,12 @@ impl PRCodeSuggestions {
             .unwrap_or_default();
 
         if suggestions.is_empty() {
-            return Ok(suggestions);
+            return Ok((suggestions, false));
         }
 
-        // 5. Self-reflect pass (per-batch)
+        // 5. Self-reflect pass (per-batch). Report whether it failed so the
+        // caller can warn the user that scores are less reliable.
+        let mut reflect_failed = false;
         match self
             .self_reflect_on_suggestions(ai, model, &suggestions, diff_with_lines, &settings)
             .await
@@ -239,6 +242,7 @@ impl PRCodeSuggestions {
             }
             Err(e) => {
                 tracing::warn!(batch = batch_index, error = %e, "reflect pass failed, using default scores");
+                reflect_failed = true;
                 for s in &mut suggestions {
                     if s.score == 0 {
                         s.score = 7;
@@ -247,7 +251,7 @@ impl PRCodeSuggestions {
             }
         }
 
-        Ok(suggestions)
+        Ok((suggestions, reflect_failed))
     }
 
     /// Self-reflect on suggestions: second AI call to score and locate them.
@@ -300,13 +304,12 @@ impl PRCodeSuggestions {
 
         // Call AI (second pass -- reflect, with fallback models)
         tracing::info!(model, "calling AI model for improve reflect pass");
-        let response = crate::ai::chat_completion_with_fallback(
+        let response = super::ai_call_with_fallback(
             ai,
+            settings,
             model,
-            &settings.config.fallback_models,
             &rendered.system,
             &rendered.user,
-            Some(settings.config.temperature),
             None,
         )
         .await?;
@@ -369,13 +372,16 @@ impl PRCodeSuggestions {
 
     /// Publish suggestions to the PR.
     ///
-    /// Three modes:
-    /// 1. **Dual publishing** (`dual_publishing_score_threshold > -1`): publish
-    ///    high-scoring suggestions as inline committable comments AND all
-    ///    suggestions as a summary table.
-    /// 2. **Inline-only** (`commitable_code_suggestions = true`): publish as
-    ///    inline GitHub code suggestions; fall back to table on failure.
-    /// 3. **Table-only** (default): publish as persistent comment table.
+    /// The PRIMARY mode is chosen by `commitable_code_suggestions` (mirroring
+    /// the Python original):
+    /// - **Table mode** (default, `commitable_code_suggestions = false` and the
+    ///   provider supports GFM): publish all suggestions as a persistent-comment
+    ///   table. Then, ADDITIVELY, when `dual_publishing_score_threshold > 0`,
+    ///   also push suggestions scoring `>= threshold` as inline committable
+    ///   comments.
+    /// - **Inline-only mode** (`commitable_code_suggestions = true`, or GFM
+    ///   unsupported): publish as inline GitHub code suggestions; fall back to
+    ///   the table on failure or when none have valid line numbers.
     async fn publish_suggestions(
         &self,
         suggestions: &[ParsedSuggestion],
@@ -390,43 +396,47 @@ impl PRCodeSuggestions {
 
         tracing::info!(count = suggestions.len(), "publishing code suggestions");
 
-        let threshold = settings.pr_code_suggestions.dual_publishing_score_threshold;
+        let commitable = settings.pr_code_suggestions.commitable_code_suggestions;
+        let gfm_supported = self.provider.is_supported("gfm_markdown");
 
-        if threshold > -1 {
-            // Dual publishing mode: inline high-scoring + table for all
-            let threshold_u32 = threshold.max(0) as u32;
-            let high_scoring: Vec<ParsedSuggestion> = suggestions
-                .iter()
-                .filter(|s| s.score >= threshold_u32)
-                .cloned()
-                .collect();
+        if !commitable && gfm_supported {
+            // Table mode (primary): publish the full summary table.
+            self.publish_table(suggestions, reflect_failed).await?;
 
-            if !high_scoring.is_empty() {
-                let code_suggestions = suggestions_to_code_suggestions(&high_scoring);
-                if !code_suggestions.is_empty() {
-                    match self
-                        .provider
-                        .publish_code_suggestions(&code_suggestions)
-                        .await
-                    {
-                        Ok(_) => {
-                            tracing::info!(
+            // Dual publishing is ADDITIVE on top of the table, and only when the
+            // threshold is strictly positive (a threshold of 0 means "off",
+            // matching Python's `> 0` gate). It never disables the table.
+            let threshold = settings.pr_code_suggestions.dual_publishing_score_threshold;
+            if threshold > 0 {
+                let threshold_u32 = threshold as u32;
+                // parse_suggestions already guarantees non-empty improved_code.
+                let above_threshold: Vec<ParsedSuggestion> = suggestions
+                    .iter()
+                    .filter(|s| s.score >= threshold_u32)
+                    .cloned()
+                    .collect();
+                if !above_threshold.is_empty() {
+                    let code_suggestions = suggestions_to_code_suggestions(&above_threshold);
+                    if !code_suggestions.is_empty() {
+                        match self
+                            .provider
+                            .publish_code_suggestions(&code_suggestions)
+                            .await
+                        {
+                            Ok(_) => tracing::info!(
                                 count = code_suggestions.len(),
                                 threshold = threshold_u32,
                                 "published inline suggestions (dual mode)"
-                            );
-                        }
-                        Err(e) => {
-                            tracing::warn!(error = %e, "failed to publish inline suggestions in dual mode");
+                            ),
+                            Err(e) => {
+                                tracing::warn!(error = %e, "failed to publish inline suggestions in dual mode")
+                            }
                         }
                     }
                 }
             }
-
-            // Always publish the full table as well
-            self.publish_table(suggestions, reflect_failed).await?;
-        } else if settings.pr_code_suggestions.commitable_code_suggestions {
-            // Inline-only mode
+        } else {
+            // Inline-only mode (committable, or GFM unsupported).
             let code_suggestions = suggestions_to_code_suggestions(suggestions);
             if code_suggestions.is_empty() {
                 tracing::warn!(
@@ -447,9 +457,6 @@ impl PRCodeSuggestions {
                     }
                 }
             }
-        } else {
-            // Table-only mode
-            self.publish_table(suggestions, reflect_failed).await?;
         }
 
         Ok(())
@@ -936,6 +943,127 @@ code_suggestions:
         assert!(
             reflect_call.image_urls.is_none(),
             "reflect pass should NOT include images"
+        );
+    }
+
+    // ── Publishing-mode tests (C7) ──────────────────────────────────
+
+    fn sample_suggestion(score: u32) -> ParsedSuggestion {
+        ParsedSuggestion {
+            label: "bug".into(),
+            relevant_file: "src/main.rs".into(),
+            relevant_lines_start: 10,
+            relevant_lines_end: 12,
+            existing_code: "old".into(),
+            improved_code: "new".into(),
+            one_sentence_summary: "Fix".into(),
+            suggestion_content: "Fix it".into(),
+            score,
+        }
+    }
+
+    fn publish_settings(extra: &[(&str, &str)]) -> Arc<Settings> {
+        let mut overrides = std::collections::HashMap::new();
+        overrides.insert("config.publish_output".into(), "true".into());
+        overrides.insert("config.publish_output_progress".into(), "false".into());
+        for (k, v) in extra {
+            overrides.insert((*k).into(), (*v).into());
+        }
+        Arc::new(crate::config::loader::load_settings(&overrides, None, None).unwrap())
+    }
+
+    #[tokio::test]
+    async fn test_publish_dual_mode_adds_inline_on_top_of_table() {
+        // C7: dual publishing is ADDITIVE — table AND inline (only high-scoring).
+        let provider = Arc::new(MockGitProvider::new());
+        let improver = PRCodeSuggestions::new(provider.clone());
+        let settings =
+            publish_settings(&[("pr_code_suggestions.dual_publishing_score_threshold", "50")]);
+
+        let suggestions = vec![sample_suggestion(80), sample_suggestion(20)];
+        with_settings(settings, improver.publish_suggestions(&suggestions, false))
+            .await
+            .unwrap();
+
+        let calls = provider.get_calls();
+        assert!(!calls.comments.is_empty(), "table must still be published");
+        assert_eq!(
+            calls.code_suggestions.len(),
+            1,
+            "inline suggestions must be published in dual mode"
+        );
+        assert_eq!(
+            calls.code_suggestions[0].len(),
+            1,
+            "only the suggestion scoring >= threshold goes inline"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_publish_table_warns_on_reflect_failure() {
+        // C18: reflect_failed=true must surface the degraded-scoring note.
+        let provider = Arc::new(MockGitProvider::new());
+        let improver = PRCodeSuggestions::new(provider.clone());
+        let settings = publish_settings(&[]);
+
+        let suggestions = vec![sample_suggestion(80)];
+        with_settings(settings, improver.publish_suggestions(&suggestions, true))
+            .await
+            .unwrap();
+
+        let calls = provider.get_calls();
+        assert!(!calls.comments.is_empty());
+        assert!(
+            calls.comments[0].0.contains("less accurate"),
+            "table should warn that scoring is degraded when reflect failed"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_publish_threshold_zero_publishes_no_inline() {
+        // C7 (divergence #1): threshold 0 means OFF — table only, no inline.
+        let provider = Arc::new(MockGitProvider::new());
+        let improver = PRCodeSuggestions::new(provider.clone());
+        let settings =
+            publish_settings(&[("pr_code_suggestions.dual_publishing_score_threshold", "0")]);
+
+        let suggestions = vec![sample_suggestion(80)];
+        with_settings(settings, improver.publish_suggestions(&suggestions, false))
+            .await
+            .unwrap();
+
+        let calls = provider.get_calls();
+        assert!(!calls.comments.is_empty(), "table must be published");
+        assert!(
+            calls.code_suggestions.is_empty(),
+            "threshold 0 must NOT publish inline suggestions"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_publish_commitable_is_inline_only() {
+        // C7 (divergence #2): commitable mode is inline-only even with a dual
+        // threshold set — it must NOT publish a table.
+        let provider = Arc::new(MockGitProvider::new());
+        let improver = PRCodeSuggestions::new(provider.clone());
+        let settings = publish_settings(&[
+            ("pr_code_suggestions.commitable_code_suggestions", "true"),
+            ("pr_code_suggestions.dual_publishing_score_threshold", "50"),
+        ]);
+
+        let suggestions = vec![sample_suggestion(80)];
+        with_settings(settings, improver.publish_suggestions(&suggestions, false))
+            .await
+            .unwrap();
+
+        let calls = provider.get_calls();
+        assert!(
+            !calls.code_suggestions.is_empty(),
+            "commitable mode publishes inline"
+        );
+        assert!(
+            calls.comments.is_empty(),
+            "commitable mode must NOT publish a table"
         );
     }
 }

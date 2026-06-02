@@ -25,14 +25,6 @@ impl PRAskLine {
         Self { provider, ai: None }
     }
 
-    #[cfg(test)]
-    pub fn new_with_ai(provider: Arc<dyn GitProvider>, ai: Arc<dyn AiHandler>) -> Self {
-        Self {
-            provider,
-            ai: Some(ai),
-        }
-    }
-
     /// Run the ask_line pipeline with parsed arguments from the comment command.
     ///
     /// Expected args keys: `line_start`, `line_end`, `side`, `file_name`,
@@ -67,7 +59,10 @@ impl PRAskLine {
         let (full_hunk, selected_lines) = if !diff_hunk.is_empty() {
             extract_hunk_lines_from_patch(diff_hunk, file_name, line_start, line_end, side)
         } else {
-            // Fallback: fetch diff files and find the matching file
+            // Fallback: fetch diff files and find the matching file. This only
+            // runs when the webhook did NOT supply `_diff_hunk` (a rare path);
+            // get_diff_files is heavier than needed here (it also fetches file
+            // contents), but the trait exposes no single-file patch accessor.
             let files = self.provider.get_diff_files().await?;
             let mut result = (String::new(), String::new());
             for file in &files {
@@ -103,9 +98,13 @@ impl PRAskLine {
                 String::new()
             };
 
-        // 3. Build template variables
-        let title = self.provider.get_pr_description_full().await?.0;
-        let branch = self.provider.get_pr_branch().await?;
+        // 3. Build template variables. Title and branch come from the same
+        // `pulls/{n}` endpoint, so fetch them concurrently.
+        let (description, branch) = tokio::try_join!(
+            self.provider.get_pr_description_full(),
+            self.provider.get_pr_branch(),
+        )?;
+        let title = description.0;
 
         let mut vars: HashMap<String, Value> = HashMap::new();
         vars.insert("title".into(), Value::from(title));
@@ -157,6 +156,11 @@ impl PRAskLine {
     ///
     /// Fetches all comments in the same review thread and formats them as a
     /// numbered list: "1. username: message"
+    ///
+    /// NOTE (C28): comment bodies are user-authored and injected into the
+    /// prompt verbatim. This is an inherent prompt-injection surface for any
+    /// LLM-backed PR tool and matches the Python original 1:1 — the contents are
+    /// untrusted and must not be treated as instructions by downstream logic.
     async fn load_conversation_history(&self, comment_id: u64) -> String {
         match self.provider.get_review_thread_comments(comment_id).await {
             Ok(comments) => {

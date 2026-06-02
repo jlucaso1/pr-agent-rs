@@ -62,6 +62,10 @@ pub fn parse_pr_url(pr_url: &str) -> Result<ParsedPrUrl, PrAgentError> {
 
     // Clean path and strip /api/v3 or /api/v1 prefix
     let raw_path = url.path().to_string();
+    // Whether the URL carried an API-version prefix. Computed with the SAME
+    // matching as the strip below, so provider parsers detect API URLs
+    // consistently (previously parse_github re-checked only `/api/v3`).
+    let api_prefix = raw_path.starts_with("/api/v3") || raw_path.starts_with("/api/v1");
     let cleaned_path = raw_path
         .strip_prefix("/api/v3")
         .or_else(|| raw_path.strip_prefix("/api/v1"))
@@ -75,7 +79,7 @@ pub fn parse_pr_url(pr_url: &str) -> Result<ParsedPrUrl, PrAgentError> {
 
     // Detect provider by host
     if host.contains("github") || host == "api.github.com" {
-        return parse_github(&parts, host, &raw_path);
+        return parse_github(&parts, host, api_prefix);
     }
     if host.contains("gitlab") {
         return parse_gitlab(&parts);
@@ -91,9 +95,9 @@ pub fn parse_pr_url(pr_url: &str) -> Result<ParsedPrUrl, PrAgentError> {
     parse_gitea(&parts)
 }
 
-fn parse_github(parts: &[&str], host: &str, raw_path: &str) -> Result<ParsedPrUrl, PrAgentError> {
+fn parse_github(parts: &[&str], host: &str, api_prefix: bool) -> Result<ParsedPrUrl, PrAgentError> {
     // API URL: /repos/{owner}/{repo}/pulls/{pr_number}
-    if host == "api.github.com" || raw_path.contains("/api/v3") {
+    if host == "api.github.com" || api_prefix {
         if parts.len() < 5 {
             return Err(PrAgentError::Other(
                 "invalid GitHub API URL: too few path components".into(),
@@ -330,6 +334,18 @@ mod tests {
         assert_eq!(parsed.owner, "org");
         assert_eq!(parsed.repo, "repo");
         assert_eq!(parsed.pr_number, 99);
+    }
+
+    #[test]
+    fn test_github_api_prefix_detection_consistent() {
+        // C29: the path strip handles /api/v1 too, so GitHub API detection must
+        // agree — previously this fell through to web parsing and errored.
+        let parsed =
+            parse_pr_url("https://github.example.com/api/v1/repos/org/repo/pulls/7").unwrap();
+        assert_eq!(parsed.provider, ProviderType::GitHub);
+        assert_eq!(parsed.owner, "org");
+        assert_eq!(parsed.repo, "repo");
+        assert_eq!(parsed.pr_number, 7);
     }
 
     #[test]
