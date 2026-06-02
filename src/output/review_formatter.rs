@@ -462,9 +462,17 @@ fn format_can_be_split_row(value: &serde_yaml_ng::Value, out: &mut String) {
 
 /// Normalize a requirement bucket: AI placeholders such as "None.", "No", or
 /// "N/A" mean "no items", so collapse them to empty before deriving compliance.
-/// Trailing sentence punctuation is stripped first so "None." matches.
+/// The prompt asks for bullet lists, so a lone bullet marker and trailing
+/// sentence punctuation are stripped first (e.g. "* None." / "- No" also match).
+/// Only the emptiness *check* uses the stripped form — the original text (with
+/// its bullets) is returned for display when the bucket is real.
 fn normalize_requirement_bucket(raw: &str) -> String {
-    let stripped = raw.trim().trim_end_matches(['.', '!']).trim();
+    let stripped = raw
+        .trim()
+        .trim_start_matches(['*', '-', '+', '•'])
+        .trim()
+        .trim_end_matches(['.', '!'])
+        .trim();
     if is_value_no(stripped) || stripped.eq_ignore_ascii_case("n/a") {
         String::new()
     } else {
@@ -1031,6 +1039,65 @@ review:
             !result.contains("ticket_requirements:"),
             "raw field key leaked: {result}"
         );
+    }
+
+    #[test]
+    fn test_normalize_requirement_bucket() {
+        // Placeholders → empty, with or without bullet markers / trailing punct.
+        for placeholder in [
+            "None.",
+            "None",
+            "no",
+            "N/A",
+            "* None.",
+            "- No",
+            "+ none",
+            "•  None",
+            "",
+        ] {
+            assert!(
+                normalize_requirement_bucket(placeholder).is_empty(),
+                "placeholder {placeholder:?} should normalize to empty"
+            );
+        }
+        // Real content is preserved verbatim (bullets and all).
+        assert_eq!(
+            normalize_requirement_bucket("* Migrated the router"),
+            "* Migrated the router"
+        );
+        // A real multi-item list that merely starts with a bullet stays.
+        assert_eq!(
+            normalize_requirement_bucket("- None of the inputs are validated"),
+            "- None of the inputs are validated"
+        );
+    }
+
+    #[test]
+    fn test_ticket_compliance_bullet_placeholder_not_compliant() {
+        // The model follows the "bullet list" prompt shape but has nothing to
+        // report: "* None." must not count as a non-compliant requirement.
+        let yaml = "\
+review:
+  ticket_compliance_check:
+    - ticket_url: |
+        https://github.com/acme/repo/issues/7
+      fully_compliant_requirements: |
+        * Implemented the feature
+      not_compliant_requirements: |
+        * None.
+      requires_further_human_verification: |
+";
+        let data: serde_yaml_ng::Value = serde_yaml_ng::from_str(yaml).unwrap();
+        let result = format_review_markdown(&data, true, None);
+        assert!(
+            result.contains("Fully compliant"),
+            "bullet placeholder should yield Fully compliant: {result}"
+        );
+        assert!(
+            !result.contains("Non-compliant requirements:"),
+            "bullet placeholder must not render a non-compliant section: {result}"
+        );
+        assert!(result.contains("Ticket compliance analysis ✅"));
     }
 
     #[test]
