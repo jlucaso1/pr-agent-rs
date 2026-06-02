@@ -282,8 +282,11 @@ async fn dispatch_event(
             let raw_comment = payload["comment"]["body"].as_str().unwrap_or("").trim();
             let comment_body = reformat_image_reply(raw_comment);
 
-            if !comment_body.contains("/ask") {
-                tracing::debug!("ignoring review comment without /ask command");
+            // Require a LEADING /ask (after reformat_image_reply moved any image
+            // reply's command to the front). A substring check fired on prose
+            // like "I'll /ask the author later", triggering a full ask_line run.
+            if !is_ask_line_command(&comment_body) {
+                tracing::debug!("ignoring review comment without a leading /ask command");
                 return Ok(());
             }
 
@@ -584,6 +587,13 @@ fn handle_line_comments(payload: &serde_json::Value, comment_body: &str) -> Stri
     format!(
         "/ask_line --line_start={start_line} --line_end={end_line} --side={side} --file_name={path} --comment_id={comment_id} {question}"
     )
+}
+
+/// Whether a review-comment body is an `/ask` command. Checked after
+/// [`reformat_image_reply`], so a genuine command sits at the front; prose that
+/// merely mentions "/ask" mid-sentence is correctly ignored.
+fn is_ask_line_command(comment_body: &str) -> bool {
+    comment_body.trim_start().starts_with("/ask")
 }
 
 /// Reformat image-reply comment: `> ![image](url)\n/ask question` → `/ask question \n> ![image](url)`.
@@ -1548,6 +1558,20 @@ num_max_findings = 3
         let comment = "some text /ask question";
         let result = reformat_image_reply(comment);
         assert_eq!(result, comment, "should return unchanged without image");
+    }
+
+    #[test]
+    fn test_is_ask_line_command() {
+        // C16: only a LEADING /ask is a command.
+        assert!(is_ask_line_command("/ask what does this do?"));
+        assert!(is_ask_line_command("   /ask indented"));
+        // Prose merely mentioning /ask must NOT trigger a run.
+        assert!(!is_ask_line_command("I'll /ask the author later"));
+        assert!(!is_ask_line_command("some text /ask question"));
+        assert!(!is_ask_line_command(""));
+        // An image reply, once reformatted, leads with /ask and is accepted.
+        let image_reply = "> ![image](https://img.com/a.png)\n/ask what is this?";
+        assert!(is_ask_line_command(&reformat_image_reply(image_reply)));
     }
 
     // ── Line comment transformation tests ───────────────────────────
