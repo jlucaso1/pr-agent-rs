@@ -199,7 +199,10 @@ fn generate_full_patch(
             continue;
         }
 
-        // Hard stop: no more tokens available
+        // Hard stop: no more tokens available. NOTE (C35): the soft threshold
+        // below (a larger buffer) always defers a file before `total_tokens`
+        // can exceed this hard limit, so this branch is effectively unreachable
+        // in practice. It is kept intentionally as a defensive backstop.
         if total_tokens > max_tokens.saturating_sub(OUTPUT_BUFFER_TOKENS_HARD_THRESHOLD) {
             tracing::warn!(file = %filename, "skipped: hard token limit reached");
             continue;

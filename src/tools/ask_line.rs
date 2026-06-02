@@ -164,6 +164,11 @@ impl PRAskLine {
     ///
     /// Fetches all comments in the same review thread and formats them as a
     /// numbered list: "1. username: message"
+    ///
+    /// NOTE (C28): comment bodies are user-authored and injected into the
+    /// prompt verbatim. This is an inherent prompt-injection surface for any
+    /// LLM-backed PR tool and matches the Python original 1:1 — the contents are
+    /// untrusted and must not be treated as instructions by downstream logic.
     async fn load_conversation_history(&self, comment_id: u64) -> String {
         match self.provider.get_review_thread_comments(comment_id).await {
             Ok(comments) => {

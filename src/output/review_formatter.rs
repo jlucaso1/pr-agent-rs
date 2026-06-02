@@ -299,8 +299,15 @@ fn format_key_issues_rows(
             None
         };
 
-        // Build the issue entry in GFM format
-        // All issues are within the same <td>, not separate rows
+        // Build the issue entry in GFM format. All issues are within the same
+        // <td>, not separate rows.
+        //
+        // NOTE (C27): `header`/`body`/`file` are AI-controlled and interpolated
+        // into HTML without escaping. This deliberately matches the Python
+        // original (which also emits these verbatim) and relies on GitHub's
+        // markdown sanitizer to neutralize any HTML. The `href` uses a link
+        // generated from file/line + commit SHA, not raw AI text. Treat these
+        // fields as untrusted display content.
         let header_html = match &reference_link {
             Some(link) if !link.is_empty() => {
                 format!("<a href='{link}'><strong>{header}</strong></a>")
@@ -402,6 +409,13 @@ fn format_contribution_time_cost_row(value: &serde_yaml_ng::Value, out: &mut Str
 }
 
 /// Format review using plain markdown (no HTML tables).
+// NOTE (C33): this plain (non-GFM) path renders structured fields like
+// `key_issues_to_review`/`can_be_split` via `yaml_value_to_string`, which
+// serializes a list of objects back to a raw YAML blob. It is only reached for
+// providers that report no `gfm_markdown` support — none today (GitHub is the
+// only provider and always supports GFM), so this is effectively unreachable.
+// If a non-GFM provider is ever added, these fields need dedicated plain-text
+// rendering mirroring the GFM helpers above.
 fn format_review_plain(review: &serde_yaml_ng::Value, out: &mut String) {
     let Some(mapping) = review.as_mapping() else {
         return;
