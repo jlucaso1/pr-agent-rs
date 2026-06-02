@@ -60,6 +60,18 @@ fn build_contents_url(
     Ok(url.into())
 }
 
+/// Map a GitHub comment JSON object to an [`IssueComment`] (None if it has no
+/// numeric `id`). Shared by the issue-comment and review-thread fetchers.
+fn issue_comment_from_json(c: &serde_json::Value) -> Option<IssueComment> {
+    Some(IssueComment {
+        id: c["id"].as_u64()?,
+        body: c["body"].as_str().unwrap_or_default().to_string(),
+        user: c["user"]["login"].as_str().unwrap_or_default().to_string(),
+        created_at: c["created_at"].as_str().unwrap_or_default().to_string(),
+        url: c["html_url"].as_str().map(|s| s.to_string()),
+    })
+}
+
 /// Owned per-file metadata extracted from the compare API, used to fetch base
 /// and head blobs concurrently in `get_diff_files`.
 struct DiffFileMeta {
@@ -880,18 +892,7 @@ impl GitProvider for GithubProvider {
             self.repo_full, self.parsed.pr_number
         );
         let items = self.api_get_all_pages(&path).await?;
-        let comments = items
-            .iter()
-            .filter_map(|c| {
-                Some(IssueComment {
-                    id: c["id"].as_u64()?,
-                    body: c["body"].as_str().unwrap_or_default().to_string(),
-                    user: c["user"]["login"].as_str().unwrap_or_default().to_string(),
-                    created_at: c["created_at"].as_str().unwrap_or_default().to_string(),
-                    url: c["html_url"].as_str().map(|s| s.to_string()),
-                })
-            })
-            .collect();
+        let comments = items.iter().filter_map(issue_comment_from_json).collect();
         Ok(comments)
     }
 
@@ -952,15 +953,7 @@ impl GitProvider for GithubProvider {
                 let reply_to = c["in_reply_to_id"].as_u64().unwrap_or(0);
                 id == thread_root || reply_to == thread_root
             })
-            .filter_map(|c| {
-                Some(IssueComment {
-                    id: c["id"].as_u64()?,
-                    body: c["body"].as_str().unwrap_or_default().to_string(),
-                    user: c["user"]["login"].as_str().unwrap_or_default().to_string(),
-                    created_at: c["created_at"].as_str().unwrap_or_default().to_string(),
-                    url: c["html_url"].as_str().map(|s| s.to_string()),
-                })
-            })
+            .filter_map(issue_comment_from_json)
             .collect();
 
         Ok(comments)
