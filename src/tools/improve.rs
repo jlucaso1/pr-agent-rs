@@ -161,7 +161,7 @@ impl PRCodeSuggestions {
             .into_iter()
             .filter(|s| s.score >= score_threshold)
             .collect();
-        suggestions.sort_by(|a, b| b.score.cmp(&a.score));
+        suggestions.sort_by_key(|s| std::cmp::Reverse(s.score));
 
         // 5. Format and publish
         if settings.config.publish_output {

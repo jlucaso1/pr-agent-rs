@@ -25,14 +25,6 @@ impl PRAskLine {
         Self { provider, ai: None }
     }
 
-    #[cfg(test)]
-    pub fn new_with_ai(provider: Arc<dyn GitProvider>, ai: Arc<dyn AiHandler>) -> Self {
-        Self {
-            provider,
-            ai: Some(ai),
-        }
-    }
-
     /// Run the ask_line pipeline with parsed arguments from the comment command.
     ///
     /// Expected args keys: `line_start`, `line_end`, `side`, `file_name`,

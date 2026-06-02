@@ -172,7 +172,7 @@ fn build_file_dict(
     }
 
     // Sort by tokens descending (largest first get priority)
-    entries.sort_by(|a, b| b.1.tokens.cmp(&a.1.tokens));
+    entries.sort_by_key(|e| std::cmp::Reverse(e.1.tokens));
     entries
 }
 
@@ -378,7 +378,7 @@ pub fn get_pr_diff_multiple_patches(
         .collect();
 
     // Largest files first (same priority order as build_file_dict).
-    entries.sort_by(|a, b| b.1.tokens.cmp(&a.1.tokens));
+    entries.sort_by_key(|e| std::cmp::Reverse(e.1.tokens));
 
     let mut remaining: Vec<String> = entries.iter().map(|(f, _)| f.clone()).collect();
     let mut batches = Vec::new();

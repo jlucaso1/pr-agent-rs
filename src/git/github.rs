@@ -102,7 +102,7 @@ impl GithubProvider {
         let settings = get_settings();
 
         let base_url = settings.github.base_url.clone();
-        let timeout = std::time::Duration::from_secs(settings.config.ai_timeout as u64);
+        let timeout = std::time::Duration::from_secs(settings.config.ai_timeout);
         let client = Client::builder()
             .timeout(timeout)
             .build()

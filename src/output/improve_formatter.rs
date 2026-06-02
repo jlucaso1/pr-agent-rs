@@ -77,7 +77,7 @@ pub fn parse_suggestions(data: &serde_yaml_ng::Value) -> Vec<ParsedSuggestion> {
     }
 
     // Sort by score descending
-    suggestions.sort_by(|a, b| b.score.cmp(&a.score));
+    suggestions.sort_by_key(|s| std::cmp::Reverse(s.score));
     suggestions
 }
 

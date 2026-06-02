@@ -40,7 +40,7 @@ impl OpenAiCompatibleHandler {
             settings.openai.api_base.clone()
         };
         let deployment_id = settings.openai.deployment_id.clone();
-        let timeout_secs = settings.config.ai_timeout as u64;
+        let timeout_secs = settings.config.ai_timeout;
 
         let client = Client::builder()
             .timeout(Duration::from_secs(timeout_secs))
