@@ -36,8 +36,6 @@ pub enum Command {
     Review,
     /// Automatic review (triggered by CI/webhooks).
     AutoReview,
-    /// Answer mode (for issue comments).
-    Answer,
     /// Modify PR title and description.
     #[command(alias = "describe_pr")]
     Describe,
@@ -49,16 +47,6 @@ pub enum Command {
     Ask,
     /// Ask questions at specific lines.
     AskLine,
-    /// Update changelog based on PR.
-    UpdateChangelog,
-    /// Add documentation.
-    AddDocs,
-    /// Generate PR labels.
-    GenerateLabels,
-    /// Get help on issues/PRs.
-    HelpDocs,
-    /// Find similar issues.
-    SimilarIssue,
     /// View/manage configuration.
     #[command(alias = "settings")]
     Config,
@@ -74,16 +62,10 @@ impl Command {
         match self {
             Command::Review => "review",
             Command::AutoReview => "auto_review",
-            Command::Answer => "answer",
             Command::Describe => "describe",
             Command::Improve => "improve",
             Command::Ask => "ask",
             Command::AskLine => "ask_line",
-            Command::UpdateChangelog => "update_changelog",
-            Command::AddDocs => "add_docs",
-            Command::GenerateLabels => "generate_labels",
-            Command::HelpDocs => "help_docs",
-            Command::SimilarIssue => "similar_issue",
             Command::Config => "config",
             Command::Serve => "serve",
             Command::Health => "health",
@@ -201,11 +183,20 @@ pub async fn run() -> Result<(), PrAgentError> {
             crate::server::start_server().await?;
         }
         _ => {
+            // Defense-in-depth: reject any command without a dispatch path before
+            // doing network/auth work, mirroring the webhook's is_known_command
+            // guard. After removing the unimplemented scaffolding variants this is
+            // future-proofing — a new CLI variant added without wiring
+            // `resolve_command` fails fast instead of after creating the provider.
+            let name = cli.command.canonical_name();
+            if !tools::is_known_command(name) {
+                return Err(PrAgentError::Other(format!(
+                    "command '{name}' is not implemented"
+                )));
+            }
+
             let url = pr_url.ok_or_else(|| {
-                PrAgentError::Other(format!(
-                    "--pr-url is required for {}",
-                    cli.command.canonical_name()
-                ))
+                PrAgentError::Other(format!("--pr-url is required for {name}"))
             })?;
 
             let provider: Arc<dyn crate::git::GitProvider> =
@@ -322,5 +313,31 @@ mod tests {
         assert_eq!(Command::Improve.canonical_name(), "improve");
         assert_eq!(Command::Ask.canonical_name(), "ask");
         assert_eq!(Command::Config.canonical_name(), "config");
+    }
+
+    #[test]
+    fn test_all_cli_commands_have_a_dispatch_path() {
+        // Every exposed CLI subcommand must either be handled directly in run()
+        // (config/serve/health) or be a dispatchable tool command. This guards
+        // against re-introducing "announced but always-failing" commands (A1/F1).
+        let directly_handled = ["config", "serve", "health"];
+        let all = [
+            Command::Review,
+            Command::AutoReview,
+            Command::Describe,
+            Command::Improve,
+            Command::Ask,
+            Command::AskLine,
+            Command::Config,
+            Command::Serve,
+            Command::Health,
+        ];
+        for cmd in all {
+            let name = cmd.canonical_name();
+            assert!(
+                directly_handled.contains(&name) || tools::is_known_command(name),
+                "CLI command '{name}' has no dispatch path"
+            );
+        }
     }
 }
