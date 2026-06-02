@@ -124,7 +124,7 @@ fn verify_signature(body: &[u8], secret: &str, signature_header: &str) -> Result
 /// Route webhook events to the appropriate handler.
 ///
 /// Route webhook events to the appropriate tool handler.
-async fn dispatch_event(
+pub(crate) async fn dispatch_event(
     event: &str,
     action: &str,
     payload: &serde_json::Value,

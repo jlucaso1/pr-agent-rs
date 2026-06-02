@@ -52,6 +52,8 @@ pub enum Command {
     Config,
     /// Start the webhook server.
     Serve,
+    /// Run as a GitHub Action (reads the event from GITHUB_EVENT_PATH).
+    GithubAction,
     /// Check if the server is healthy (for Docker HEALTHCHECK).
     Health,
 }
@@ -68,6 +70,7 @@ impl Command {
             Command::AskLine => "ask_line",
             Command::Config => "config",
             Command::Serve => "serve",
+            Command::GithubAction => "github_action",
             Command::Health => "health",
         }
     }
@@ -184,6 +187,9 @@ pub async fn run() -> Result<(), PrAgentError> {
         }
         Command::Serve => {
             crate::server::start_server().await?;
+        }
+        Command::GithubAction => {
+            crate::server::github_action::run_action(&config_overrides).await?;
         }
         _ => {
             // Defense-in-depth: reject any command without a dispatch path before
@@ -346,7 +352,7 @@ mod tests {
         // Every exposed CLI subcommand must either be handled directly in run()
         // (config/serve/health) or be a dispatchable tool command. This guards
         // against re-introducing "announced but always-failing" commands (A1/F1).
-        let directly_handled = ["config", "serve", "health"];
+        let directly_handled = ["config", "serve", "github_action", "health"];
         let all = [
             Command::Review,
             Command::AutoReview,
@@ -356,6 +362,7 @@ mod tests {
             Command::AskLine,
             Command::Config,
             Command::Serve,
+            Command::GithubAction,
             Command::Health,
         ];
         for cmd in all {
