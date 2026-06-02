@@ -83,7 +83,10 @@ fn format_review_gfm(
                 format_key_issues_rows(value, out, link_gen);
             }
             "can_be_split" => {
-                format_simple_row("🔀 Can be split", value, out);
+                format_can_be_split_row(value, out);
+            }
+            "contribution_time_cost_estimate" => {
+                format_contribution_time_cost_row(value, out);
             }
             "ticket_compliance_check" => {
                 format_simple_row("🎫 Ticket compliance", value, out);
@@ -336,6 +339,68 @@ fn format_simple_row(label: &str, value: &serde_yaml_ng::Value, out: &mut String
     let _ = writeln!(out, "<tr><td><strong>{label}</strong>: {text}</td></tr>");
 }
 
+/// Format the `can_be_split` row — a `List[SubPR]` where each item has a
+/// `title` and `relevant_files`. Mirrors Python `process_can_be_split`: render
+/// a collapsible `<details>` per sub-PR theme, or "No multiple PR themes" when
+/// the list is missing, empty, or has a single theme. Without this, the value
+/// was serialized as a raw YAML blob into the table cell.
+fn format_can_be_split_row(value: &serde_yaml_ng::Value, out: &mut String) {
+    let emoji = section_emoji("Can be split");
+    let splits = value.as_sequence();
+    let is_no = match splits {
+        None => true,
+        Some(seq) => seq.len() <= 1,
+    };
+
+    out.push_str("<tr><td>");
+    if is_no {
+        let _ = write!(out, "{emoji} <strong>No multiple PR themes</strong>\n\n");
+    } else {
+        let _ = write!(
+            out,
+            "{emoji} <strong>Multiple PR themes</strong><br><br>\n\n"
+        );
+        for split in splits.into_iter().flatten() {
+            let title = split.get("title").and_then(|v| v.as_str()).unwrap_or("");
+            let _ = write!(
+                out,
+                "<details><summary>\nSub-PR theme: <b>{title}</b></summary>\n\n___\n\nRelevant files:\n\n"
+            );
+            if let Some(files) = split.get("relevant_files").and_then(|v| v.as_sequence()) {
+                for file in files {
+                    if let Some(f) = file.as_str() {
+                        let _ = writeln!(out, "- {f}");
+                    }
+                }
+            }
+            out.push_str("___\n\n</details>\n\n");
+        }
+    }
+    out.push_str("</td></tr>\n");
+}
+
+/// Format the `contribution_time_cost_estimate` row (best/average/worst case).
+/// Mirrors Python: render the three cases inline, expanding the `m` suffix to
+/// " minutes". Without this, the mapping was serialized as a raw YAML blob.
+fn format_contribution_time_cost_row(value: &serde_yaml_ng::Value, out: &mut String) {
+    let emoji = section_emoji("Contribution time cost estimate");
+    let case = |key: &str| {
+        value
+            .get(key)
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .replace('m', " minutes")
+    };
+    let _ = writeln!(
+        out,
+        "<tr><td>{emoji}&nbsp;<strong>Contribution time estimate</strong> (best, average, worst case): {} | {} | {}</td></tr>",
+        case("best_case"),
+        case("average_case"),
+        case("worst_case")
+    );
+}
+
 /// Format review using plain markdown (no HTML tables).
 fn format_review_plain(review: &serde_yaml_ng::Value, out: &mut String) {
     let Some(mapping) = review.as_mapping() else {
@@ -566,5 +631,65 @@ review:
         assert!(is_value_no("  no  "));
         assert!(!is_value_no("Yes"));
         assert!(!is_value_no("Some value"));
+    }
+
+    #[test]
+    fn test_can_be_split_multiple_themes() {
+        let yaml = "\
+review:
+  can_be_split:
+    - title: Refactor auth
+      relevant_files:
+        - src/auth.rs
+        - src/token.rs
+    - title: Add tests
+      relevant_files:
+        - tests/auth.rs
+";
+        let data: serde_yaml_ng::Value = serde_yaml_ng::from_str(yaml).unwrap();
+        let result = format_review_markdown(&data, true, None);
+
+        assert!(result.contains("Multiple PR themes"));
+        assert!(result.contains("Sub-PR theme: <b>Refactor auth</b>"));
+        assert!(result.contains("<details>"));
+        assert!(result.contains("- src/auth.rs"));
+        assert!(result.contains("- tests/auth.rs"));
+        // Must NOT leak raw YAML mapping syntax into the cell.
+        assert!(!result.contains("relevant_files:"));
+    }
+
+    #[test]
+    fn test_can_be_split_single_theme_is_no() {
+        let yaml = "\
+review:
+  can_be_split:
+    - title: Only theme
+      relevant_files:
+        - src/a.rs
+";
+        let data: serde_yaml_ng::Value = serde_yaml_ng::from_str(yaml).unwrap();
+        let result = format_review_markdown(&data, true, None);
+        assert!(result.contains("No multiple PR themes"));
+        assert!(!result.contains("<details>"));
+    }
+
+    #[test]
+    fn test_contribution_time_cost_estimate() {
+        let yaml = "\
+review:
+  contribution_time_cost_estimate:
+    best_case: \"45m\"
+    average_case: \"5h\"
+    worst_case: \"30m\"
+";
+        let data: serde_yaml_ng::Value = serde_yaml_ng::from_str(yaml).unwrap();
+        let result = format_review_markdown(&data, true, None);
+
+        assert!(result.contains("Contribution time estimate"));
+        assert!(result.contains("45 minutes"));
+        assert!(result.contains("5h"));
+        assert!(result.contains("30 minutes"));
+        // Must NOT leak the raw YAML keys.
+        assert!(!result.contains("best_case:"));
     }
 }
