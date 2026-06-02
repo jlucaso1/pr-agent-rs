@@ -1164,13 +1164,10 @@ mod tests {
         // F7: a non-GitHub URL is rejected at construction (before any network).
         let result =
             GithubProvider::new("https://gitlab.com/group/project/-/merge_requests/10").await;
-        assert!(result.is_err());
+        // Avoid unwrap_err (would require GithubProvider: Debug).
+        let err = result.err().expect("non-GitHub URL must be rejected");
         assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .to_lowercase()
-                .contains("github"),
+            err.to_string().to_lowercase().contains("github"),
             "error should mention GitHub"
         );
     }
