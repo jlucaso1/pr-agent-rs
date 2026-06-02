@@ -33,6 +33,33 @@ fn truncate_comment(text: &str) -> &str {
     &text[..end]
 }
 
+/// Build the `repos/{repo}/contents/{path}?ref={ref}` URL with proper
+/// percent-encoding of the file path (slashes preserved) and the ref.
+fn build_contents_url(
+    base_url: &str,
+    repo_full: &str,
+    path: &str,
+    git_ref: &str,
+) -> Result<String, PrAgentError> {
+    let base = format!(
+        "{}/repos/{}/contents",
+        base_url.trim_end_matches('/'),
+        repo_full
+    );
+    let mut url = url::Url::parse(&base)
+        .map_err(|e| PrAgentError::Other(format!("invalid contents base url: {e}")))?;
+    {
+        let mut segments = url
+            .path_segments_mut()
+            .map_err(|_| PrAgentError::Other("contents url cannot be a base".into()))?;
+        for seg in path.split('/') {
+            segments.push(seg);
+        }
+    }
+    url.query_pairs_mut().append_pair("ref", git_ref);
+    Ok(url.into())
+}
+
 /// Owned per-file metadata extracted from the compare API, used to fetch base
 /// and head blobs concurrently in `get_diff_files`.
 struct DiffFileMeta {
@@ -283,8 +310,15 @@ impl GithubProvider {
         path: &str,
         git_ref: &str,
     ) -> Result<String, PrAgentError> {
-        let api_path = format!("repos/{}/contents/{}?ref={}", repo_full, path, git_ref);
-        let resp = self.api_get(&api_path).await?;
+        // Build the URL with percent-encoding so a filename containing '?',
+        // '#' or a space doesn't corrupt the query string or split the path.
+        let url = build_contents_url(&self.base_url, repo_full, path, git_ref)?;
+
+        let resp = self
+            .api_request_with_retry_url(reqwest::Method::GET, &url, None)
+            .await?;
+        let resp = Self::check_response(resp, "GET").await?;
+        let resp: serde_json::Value = resp.json().await.map_err(PrAgentError::Http)?;
 
         let content = resp["content"]
             .as_str()
@@ -1125,6 +1159,24 @@ mod tests {
     fn test_truncate_comment_under_limit() {
         let text = "short comment";
         assert_eq!(truncate_comment(text), text);
+    }
+
+    #[test]
+    fn test_build_contents_url_encodes_path_and_ref() {
+        // C26: special chars in a filename must be percent-encoded (not break
+        // the query), while directory slashes are preserved.
+        let url =
+            build_contents_url("https://api.github.com", "o/r", "src/a b?.rs", "abc123").unwrap();
+        assert!(url.starts_with("https://api.github.com/repos/o/r/contents/src/"));
+        assert!(url.contains("ref=abc123"));
+        assert!(
+            !url.contains("a b?.rs"),
+            "raw special chars must not appear"
+        );
+        assert!(
+            url.contains("a%20b%3F.rs"),
+            "space and ? must be encoded: {url}"
+        );
     }
 
     #[test]
