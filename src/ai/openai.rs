@@ -181,7 +181,9 @@ impl OpenAiCompatibleHandler {
         // Surface truncated output — otherwise the caller silently parses a
         // half-finished (often invalid) response.
         if finish_reason == FinishReason::Length {
-            tracing::warn!("AI response was truncated (finish_reason=length); output may be incomplete");
+            tracing::warn!(
+                "AI response was truncated (finish_reason=length); output may be incomplete"
+            );
         }
 
         let usage = api_resp.usage.map(|u| Usage {

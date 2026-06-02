@@ -97,22 +97,28 @@ pub fn effort_bar(effort: u8) -> &'static str {
 }
 
 /// Emoji map for review section headers.
+///
+/// Accepts BOTH the display label ("Score") and the canonical snake_case YAML
+/// key ("score"), so call sites passing either form get the right emoji (the
+/// generic GFM arm and the plain-text path pass the raw key).
 pub fn section_emoji(section: &str) -> &'static str {
     match section {
-        "Can be split" => "\u{1F500}",                            // 🔀
-        "Key issues to review" => "\u{26A1}",                     // ⚡
-        "Recommended focus areas for review" => "\u{26A1}",       // ⚡
-        "Score" => "\u{1F3C5}",                                   // 🏅
-        "Relevant tests" => "\u{1F9EA}",                          // 🧪
-        "Focused PR" => "\u{2728}",                               // ✨
-        "Relevant ticket" => "\u{1F3AB}",                         // 🎫
-        "Security concerns" => "\u{1F512}",                       // 🔒
-        "Todo sections" => "\u{1F4DD}",                           // 📝
-        "Insights from user's answers" => "\u{1F4DD}",            // 📝
-        "Code feedback" => "\u{1F916}",                           // 🤖
-        "Estimated effort to review [1-5]" => "\u{23F1}\u{FE0F}", // ⏱️
-        "Contribution time cost estimate" => "\u{23F3}",          // ⏳
-        "Ticket compliance check" => "\u{1F3AB}",                 // 🎫
+        "Can be split" | "can_be_split" => "\u{1F500}", // 🔀
+        "Key issues to review" | "key_issues_to_review" => "\u{26A1}", // ⚡
+        "Recommended focus areas for review" => "\u{26A1}", // ⚡
+        "Score" | "score" => "\u{1F3C5}",               // 🏅
+        "Relevant tests" | "relevant_tests" => "\u{1F9EA}", // 🧪
+        "Focused PR" => "\u{2728}",                     // ✨
+        "Relevant ticket" => "\u{1F3AB}",               // 🎫
+        "Security concerns" | "security_concerns" => "\u{1F512}", // 🔒
+        "Todo sections" | "todo_sections" => "\u{1F4DD}", // 📝
+        "Insights from user's answers" | "insights_from_user_answers" => "\u{1F4DD}", // 📝
+        "Code feedback" => "\u{1F916}",                 // 🤖
+        "Estimated effort to review [1-5]"
+        | "estimated_effort_to_review_[1-5]"
+        | "estimated_effort_to_review" => "\u{23F1}\u{FE0F}", // ⏱️
+        "Contribution time cost estimate" | "contribution_time_cost_estimate" => "\u{23F3}", // ⏳
+        "Ticket compliance check" | "ticket_compliance_check" => "\u{1F3AB}", // 🎫
         _ => "",
     }
 }
@@ -190,6 +196,10 @@ mod tests {
     fn test_section_emoji() {
         assert_eq!(section_emoji("Security concerns"), "🔒");
         assert_eq!(section_emoji("Score"), "🏅");
+        // Canonical snake_case keys map to the same emoji (S3).
+        assert_eq!(section_emoji("security_concerns"), "🔒");
+        assert_eq!(section_emoji("score"), "🏅");
+        assert_eq!(section_emoji("can_be_split"), "🔀");
         assert_eq!(section_emoji("Unknown"), "");
     }
 
