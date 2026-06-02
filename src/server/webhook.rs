@@ -544,21 +544,19 @@ fn handle_closed_pr(payload: &serde_json::Value) {
         reviewers,
         comments,
         merged_by,
-        time_to_merge_hours,
+        time_to_merge_hours = ?time_to_merge_hours,
         "PR merged — statistics"
     );
 }
 
 /// Compute hours between two ISO 8601 timestamps.
-fn compute_hours_between(start: &str, end: &str) -> f64 {
-    let Ok(start_dt) = chrono::DateTime::parse_from_rfc3339(start) else {
-        return 0.0;
-    };
-    let Ok(end_dt) = chrono::DateTime::parse_from_rfc3339(end) else {
-        return 0.0;
-    };
+/// Hours between two RFC3339 timestamps, or `None` if either fails to parse
+/// (so a parse failure is not conflated with a genuine zero duration).
+fn compute_hours_between(start: &str, end: &str) -> Option<f64> {
+    let start_dt = chrono::DateTime::parse_from_rfc3339(start).ok()?;
+    let end_dt = chrono::DateTime::parse_from_rfc3339(end).ok()?;
     let duration = end_dt - start_dt;
-    duration.num_minutes() as f64 / 60.0
+    Some(duration.num_minutes() as f64 / 60.0)
 }
 
 /// Transform a line-level `/ask` comment into an `/ask_line` command string.
@@ -1642,17 +1640,18 @@ num_max_findings = 3
 
     #[test]
     fn test_compute_hours_between() {
-        let hours = compute_hours_between("2025-01-01T00:00:00Z", "2025-01-01T02:30:00Z");
+        let hours = compute_hours_between("2025-01-01T00:00:00Z", "2025-01-01T02:30:00Z").unwrap();
         assert!((hours - 2.5).abs() < 0.01);
     }
 
     #[test]
     fn test_compute_hours_between_invalid() {
+        // S4: a parse failure is None, not a 0.0 that looks like a real duration.
         assert_eq!(
             compute_hours_between("invalid", "2025-01-01T00:00:00Z"),
-            0.0
+            None
         );
-        assert_eq!(compute_hours_between("", ""), 0.0);
+        assert_eq!(compute_hours_between("", ""), None);
     }
 
     #[test]
