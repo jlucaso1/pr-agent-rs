@@ -142,6 +142,7 @@ pub struct Settings {
     pub azure_devops: AzureDevopsConfig,
     pub azure_devops_server: AzureDevopsServerConfig,
     pub ignore: IgnoreConfig,
+    pub bad_extensions: BadExtensionsConfig,
     pub custom_labels: HashMap<String, CustomLabelEntry>,
     // Prompt templates (loaded from *_prompts.toml files)
     pub pr_review_prompt: PromptTemplate,
@@ -1099,6 +1100,18 @@ pub struct CustomLabelEntry {
 pub struct IgnoreConfig {
     pub glob: Vec<String>,
     pub regex: Vec<String>,
+}
+
+// ── [bad_extensions] ────────────────────────────────────────────────
+
+/// File extensions excluded from diff processing (noise: archives, binaries,
+/// lockfiles, generated data). `extra` is added only when
+/// `config.use_extra_bad_extensions` is enabled.
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+#[serde(default)]
+pub struct BadExtensionsConfig {
+    pub default: Vec<String>,
+    pub extra: Vec<String>,
 }
 
 // ── Secrets ─────────────────────────────────────────────────────────
