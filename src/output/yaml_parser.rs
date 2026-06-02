@@ -73,6 +73,33 @@ pub fn yaml_value_as_u64(value: &serde_yaml_ng::Value) -> Option<u64> {
         .or_else(|| value.as_str().and_then(|s| s.trim().parse().ok()))
 }
 
+/// Extract a trimmed string field from a YAML mapping, with a fallback default.
+///
+/// Distinct from `yaml_value_to_string` (which coerces non-string types); this
+/// only reads `as_str()` and trims, matching how formatters read AI fields.
+pub fn yaml_str_field(item: &serde_yaml_ng::Value, key: &str, default: &str) -> String {
+    item.get(key)
+        .and_then(|v| v.as_str())
+        .unwrap_or(default)
+        .trim()
+        .to_string()
+}
+
+/// Like [`yaml_str_field`] but tries `key` then `alt_key` before the default.
+pub fn yaml_str_field_alt(
+    item: &serde_yaml_ng::Value,
+    key: &str,
+    alt_key: &str,
+    default: &str,
+) -> String {
+    item.get(key)
+        .or_else(|| item.get(alt_key))
+        .and_then(|v| v.as_str())
+        .unwrap_or(default)
+        .trim()
+        .to_string()
+}
+
 /// 9-level fallback cascade to handle common AI YAML formatting issues.
 fn try_fix_yaml(
     text: &str,

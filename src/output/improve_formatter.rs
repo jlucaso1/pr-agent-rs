@@ -2,7 +2,7 @@ use std::fmt::Write;
 
 use crate::git::types::CodeSuggestion;
 use crate::output::markdown::persistent_comment_marker;
-use crate::output::yaml_parser::{yaml_value_as_i64, yaml_value_as_u64};
+use crate::output::yaml_parser::{yaml_str_field, yaml_value_as_i64, yaml_value_as_u64};
 
 /// A parsed code suggestion from the AI response.
 #[derive(Debug, Clone)]
@@ -16,15 +16,6 @@ pub struct ParsedSuggestion {
     pub one_sentence_summary: String,
     pub suggestion_content: String,
     pub score: u32,
-}
-
-/// Extract a trimmed string field from a YAML mapping, with a fallback default.
-fn yaml_str_field(item: &serde_yaml_ng::Value, key: &str, default: &str) -> String {
-    item.get(key)
-        .and_then(|v| v.as_str())
-        .unwrap_or(default)
-        .trim()
-        .to_string()
 }
 
 /// Parse code suggestions from the AI YAML response.

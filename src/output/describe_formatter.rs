@@ -7,6 +7,7 @@ use regex::Regex;
 
 use crate::config::types::{BoolOrString, PrDescriptionConfig};
 use crate::output::markdown::persistent_comment_marker;
+use crate::output::yaml_parser::{yaml_str_field, yaml_str_field_alt};
 
 /// Formatted describe result ready for publishing.
 pub struct DescribeOutput {
@@ -250,31 +251,10 @@ struct FileEntry {
 
 impl FileEntry {
     fn from_yaml(item: &serde_yaml_ng::Value) -> Self {
-        let filename = item
-            .get("filename")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .trim()
-            .replace('\'', "`");
-        let changes_title = item
-            .get("changes_title")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .trim()
-            .to_string();
-        let changes_summary = item
-            .get("changes_summary")
-            .or_else(|| item.get("changes_content"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .trim()
-            .to_string();
-        let label = item
-            .get("label")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .trim()
-            .to_lowercase();
+        let filename = yaml_str_field(item, "filename", "").replace('\'', "`");
+        let changes_title = yaml_str_field(item, "changes_title", "");
+        let changes_summary = yaml_str_field_alt(item, "changes_summary", "changes_content", "");
+        let label = yaml_str_field(item, "label", "").to_lowercase();
         Self {
             filename,
             changes_title,
