@@ -1,3 +1,5 @@
+use std::fmt::Write;
+
 use crate::ai::token::{
     OUTPUT_BUFFER_TOKENS_HARD_THRESHOLD, OUTPUT_BUFFER_TOKENS_SOFT_THRESHOLD, clip_tokens,
     count_tokens, get_max_tokens_with_fallback,
@@ -277,19 +279,22 @@ fn append_remaining_file_lists(
         if files.is_empty() || *budget < delta_tokens {
             return;
         }
-        let list_str = format!(
-            "\n\n### Additional {} files (not included in diff):\n{}",
-            label,
-            files
-                .iter()
-                .map(|f| format!("- {f}"))
-                .collect::<Vec<_>>()
-                .join("\n")
-        );
+        // Build the list directly into a String (no intermediate Vec<String> +
+        // join). Each entry is separated by a newline with NO trailing newline,
+        // so the token count matches the previous join-based string exactly.
+        let mut list_str = format!("\n\n### Additional {label} files (not included in diff):\n");
+        for (i, f) in files.iter().enumerate() {
+            if i > 0 {
+                list_str.push('\n');
+            }
+            let _ = write!(list_str, "- {f}");
+        }
         let clipped = clip_tokens(&list_str, *budget, true);
         if !clipped.is_empty() {
             let tokens = count_tokens(&clipped);
             result.push_str(&clipped);
+            // Subtract the clipped tokens plus a small allowance for the "\n\n"
+            // section separator (carried over from the Python original).
             *budget = budget.saturating_sub(tokens + 2);
         }
     };
