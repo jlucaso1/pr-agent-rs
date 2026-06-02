@@ -696,12 +696,14 @@ async fn run_commands(pr_url: &str, commands: &[String]) -> Result<(), crate::er
 
     for cmd_str in commands {
         let (command, args) = tools::parse_command(cmd_str);
-        let cmd_provider: Arc<dyn GitProvider> = Arc::new(GithubProvider::new(pr_url).await?);
 
         tracing::info!(command = %command, "running auto-command");
+        // Reuse the same provider for every command — GithubProvider is
+        // stateless after construction, and rebuilding it per command would
+        // repeat the (uncached) App token exchange and discard the HTTP pool.
         let result = tools::handle_command(
             &command,
-            cmd_provider,
+            provider.clone(),
             &args,
             global_toml.as_deref(),
             repo_toml.as_deref(),
