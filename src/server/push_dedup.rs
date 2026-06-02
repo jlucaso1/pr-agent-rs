@@ -60,9 +60,14 @@ impl PushDeduplicator {
     ) -> AcquireResult {
         let mut map = self.entries.lock().unwrap();
 
-        // Clean expired entries opportunistically
+        // Clean expired entries opportunistically — but NEVER evict an entry
+        // that still has active tasks. Otherwise a parked waiter is never
+        // notified, and a fresh push restarts active_count at 0, silently
+        // violating the max_tasks cap this module exists to enforce.
         let now = Instant::now();
-        map.retain(|_, e| now.duration_since(e.last_access).as_secs() < ttl_secs);
+        map.retain(|_, e| {
+            e.active_count > 0 || now.duration_since(e.last_access).as_secs() < ttl_secs
+        });
 
         let entry = map.entry(api_url.to_string()).or_insert_with(|| Entry {
             active_count: 0,
@@ -97,10 +102,18 @@ impl PushDeduplicator {
         let mut map = self.entries.lock().unwrap();
         if let Some(entry) = map.get_mut(api_url) {
             entry.active_count = entry.active_count.saturating_sub(1);
+            // Refresh last_access on release so the entry survives a further
+            // ttl window after the task completes (a quick follow-up push
+            // reuses the same accounting instead of restarting from zero).
+            entry.last_access = Instant::now();
             let notify = entry.notify.clone();
             drop(map);
             // Wake one waiting task
             notify.notify_one();
+        } else {
+            // Active entries are never evicted, so a missing entry here means a
+            // guard outlived its accounting — a logic bug worth surfacing.
+            tracing::warn!(api_url, "push dedup: release found no entry (unexpected)");
         }
     }
 }
@@ -233,6 +246,30 @@ mod tests {
 
         let waited = handle.await.unwrap();
         assert!(waited, "second task should have waited and then proceeded");
+    }
+
+    #[test]
+    fn test_active_entry_not_evicted_by_ttl() {
+        // Regression for C17: an entry with an in-flight task must survive the
+        // opportunistic TTL sweep, so the max_tasks cap keeps holding even when
+        // the entry looks "expired" by age.
+        let dedup = make_dedup();
+        let url = "https://api.github.com/repos/o/r/pulls/1";
+
+        // Hold an active task with TTL=0 (would be evicted purely by age).
+        let _g1 = match dedup.try_acquire(url, 1, 0) {
+            AcquireResult::Proceed(g) => g,
+            _ => panic!("expected Proceed for first task"),
+        };
+
+        // A second acquire runs the retain sweep. Previously the active entry
+        // was wrongly evicted and recreated → Proceed (cap violated). Now it
+        // must be Rejected.
+        let result = dedup.try_acquire(url, 1, 0);
+        assert!(
+            matches!(result, AcquireResult::Rejected),
+            "active entry must not be evicted by TTL — the max_tasks cap must hold"
+        );
     }
 
     #[test]
