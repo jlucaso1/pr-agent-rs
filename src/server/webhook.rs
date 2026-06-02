@@ -721,6 +721,11 @@ async fn fetch_scoped_settings(
 ///
 /// Fetches global org-level and repo-level `.pr_agent.toml` once, then runs
 /// all commands within a scoped settings context.
+///
+/// Commands run SEQUENTIALLY by design (S10): the order is significant —
+/// `describe` updates the PR description that a subsequent `review`/`improve`
+/// reads via PrMetadata, and the tools publish/update comments that could race.
+/// Parallelizing them would break that dependency, so it is intentionally avoided.
 async fn run_commands(pr_url: &str, commands: &[String]) -> Result<(), crate::error::PrAgentError> {
     let provider: Arc<dyn GitProvider> = Arc::new(GithubProvider::new(pr_url).await?);
     let settings = get_settings();

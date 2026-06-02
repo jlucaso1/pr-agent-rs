@@ -58,6 +58,10 @@ pub fn get_settings() -> Arc<Settings> {
         match guard.as_ref() {
             Some(s) => s.clone(),
             None => {
+                // A3 (deliberate): in production init_settings() always runs at
+                // bootstrap, so this branch is effectively unreachable there.
+                // It is kept (rather than panicking) because the test suite
+                // relies on lazily loading defaults without an explicit init.
                 tracing::error!(
                     "get_settings() called before init_settings() — loading defaults as fallback"
                 );
