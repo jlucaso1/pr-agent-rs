@@ -243,6 +243,10 @@ pub async fn run() -> Result<(), PrAgentError> {
                 None
             };
 
+            // Validate the repo TOML; on a parse error this reports it to the PR
+            // and drops the file so the run proceeds with default config.
+            let repo_toml = tools::validate_repo_settings_toml(provider.as_ref(), repo_toml).await;
+
             // Re-initialize global settings with global + repo overrides if either
             // was found, so any non-scoped reads also see the merged config.
             if global_toml.is_some() || repo_toml.is_some() {

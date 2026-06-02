@@ -498,6 +498,51 @@ pub async fn publish_persistent_comment(
     Ok(())
 }
 
+/// Marker header for the "invalid repo configuration" persistent comment.
+const CONFIG_ERROR_HEADER: &str = "❌ **PR-Agent failed to apply repo settings**";
+
+/// Validate a repo-level `.pr_agent.toml` before it is merged into the config.
+///
+/// If the file fails to parse as TOML, publish a persistent comment to the PR
+/// describing the error (so the author can fix it) and return `None` so the
+/// caller proceeds with the remaining config layers instead of crashing.
+/// A `None`/empty input passes through unchanged. Mirrors the Python
+/// `handle_configurations_errors`.
+pub async fn validate_repo_settings_toml(
+    provider: &dyn GitProvider,
+    repo_toml: Option<String>,
+) -> Option<String> {
+    let toml_str = repo_toml?;
+    if toml_str.trim().is_empty() {
+        return Some(toml_str);
+    }
+    match toml::from_str::<toml::Value>(&toml_str) {
+        Ok(_) => Some(toml_str),
+        Err(e) => {
+            let body = format!(
+                "{CONFIG_ERROR_HEADER}\n\nThe configuration file needs to be a valid \
+                 [TOML](https://qodo-merge-docs.qodo.ai/usage-guide/configuration_options/), \
+                 please fix it.\n\n___\n\n**Error message:**\n`{e}`\n\n\
+                 <details><summary>Configuration content:</summary>\n\n\
+                 ```toml\n{toml_str}\n```\n\n</details>"
+            );
+            tracing::warn!(error = %e, "repo .pr_agent.toml is invalid; reporting to PR");
+            if let Err(pub_err) = publish_persistent_comment(
+                provider,
+                &body,
+                CONFIG_ERROR_HEADER,
+                "configuration error",
+                false,
+            )
+            .await
+            {
+                tracing::warn!(error = %pub_err, "failed to publish config-error comment");
+            }
+            None
+        }
+    }
+}
+
 /// Parse a "/command --arg=value text" string into (command_name, args_overrides).
 ///
 /// Splits on whitespace and extracts `--key=value` pairs as config overrides.
@@ -1003,6 +1048,57 @@ mod tests {
         ];
         let user = get_user_labels(&current, &settings);
         assert_eq!(user, vec!["keep-me"]);
+    }
+
+    #[tokio::test]
+    async fn test_validate_repo_settings_toml_valid_passes_through() {
+        use crate::testing::mock_git::MockGitProvider;
+
+        let provider = MockGitProvider::new();
+        let toml = "[pr_reviewer]\nnum_max_findings = 5\n".to_string();
+        let result = validate_repo_settings_toml(&provider, Some(toml.clone())).await;
+        assert_eq!(result, Some(toml));
+        // No error comment published for valid TOML.
+        assert!(provider.get_calls().comments.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_validate_repo_settings_toml_invalid_reports_and_drops() {
+        use crate::testing::mock_git::MockGitProvider;
+
+        let provider = MockGitProvider::new();
+        // Missing closing bracket / dangling key — invalid TOML.
+        let bad = "[pr_reviewer\nnum_max_findings = ".to_string();
+        let result = validate_repo_settings_toml(&provider, Some(bad)).await;
+        // Invalid TOML is dropped so the run continues with defaults.
+        assert_eq!(result, None);
+        // An error comment was published to the PR.
+        let calls = provider.get_calls();
+        assert_eq!(calls.comments.len(), 1);
+        assert!(
+            calls.comments[0]
+                .0
+                .contains("failed to apply repo settings"),
+            "comment should explain the config error: {}",
+            calls.comments[0].0
+        );
+        assert!(
+            calls.comments[0].0.contains("```toml"),
+            "comment should include the offending config content"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_validate_repo_settings_toml_none_and_empty() {
+        use crate::testing::mock_git::MockGitProvider;
+
+        let provider = MockGitProvider::new();
+        assert_eq!(validate_repo_settings_toml(&provider, None).await, None);
+        assert_eq!(
+            validate_repo_settings_toml(&provider, Some(String::new())).await,
+            Some(String::new())
+        );
+        assert!(provider.get_calls().comments.is_empty());
     }
 
     #[tokio::test]

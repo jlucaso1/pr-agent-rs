@@ -686,6 +686,10 @@ async fn fetch_scoped_toml(
     )
     .await;
 
+    // Validate the repo TOML; on a parse error this reports it to the PR and
+    // drops the file so the rest of the run proceeds with default config.
+    let repo_toml = tools::validate_repo_settings_toml(provider, repo_toml).await;
+
     (global_toml, repo_toml)
 }
 
