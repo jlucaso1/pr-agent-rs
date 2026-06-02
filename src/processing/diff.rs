@@ -191,12 +191,11 @@ pub fn extract_hunk_lines_from_patch(
 
     let mut full_hunk = format!("## File: '{}'\n\n", filename.trim());
     let mut selected = String::new();
-    let mut start1: usize = 0;
-    let mut start2: usize = 0;
     let mut skip_hunk = false;
-    // Counter relative to the hunk start, incremented for every non-deleted
-    // line (matching Python's selected_lines_num).
-    let mut selected_lines_num: usize = 0;
+    // Current line number on each side of the diff. The old side advances on
+    // context + removed lines; the new side on context + added lines.
+    let mut old_line: usize = 0;
+    let mut new_line: usize = 0;
 
     for line in patch.lines() {
         if line.to_lowercase().contains("no newline at end of file") {
@@ -205,15 +204,14 @@ pub fn extract_hunk_lines_from_patch(
 
         if let Some(header) = HunkHeader::parse(line) {
             skip_hunk = false;
-            selected_lines_num = 0;
-            start1 = header.start1;
-            start2 = header.start2;
+            old_line = header.start1;
+            new_line = header.start2;
 
             // Only include the hunk that contains the requested start line.
             let in_range = if use_left {
-                start1 <= line_start && line_start <= start1 + header.size1
+                header.start1 <= line_start && line_start <= header.start1 + header.size1
             } else {
-                start2 <= line_start && line_start <= start2 + header.size2
+                header.start2 <= line_start && line_start <= header.start2 + header.size2
             };
             if !in_range {
                 skip_hunk = true;
@@ -226,19 +224,28 @@ pub fn extract_hunk_lines_from_patch(
             // Lines are emitted RAW (with their -/+/space prefix), NOT prefixed
             // with line numbers — the pr_line_questions template tells the model
             // to read those change markers.
-            let in_selection = if use_left {
-                start1 <= selected_lines_num + start1 && selected_lines_num + start1 <= line_end
-            } else {
-                line_start <= start2 + selected_lines_num && start2 + selected_lines_num <= line_end
-            };
-            if in_selection {
+            //
+            // Select by the side's CURRENT line number, with BOTH bounds. The
+            // Python original is buggy on the LEFT side (its lower bound is a
+            // tautology and it tracks the new-side count), so a LEFT query would
+            // select everything from the hunk start; here we track the proper
+            // old/new line numbers, so only the requested range is selected.
+            let line_no = if use_left { old_line } else { new_line };
+            if line_start <= line_no && line_no <= line_end {
                 selected.push_str(line);
                 selected.push('\n');
             }
             full_hunk.push_str(line);
             full_hunk.push('\n');
-            if !line.starts_with('-') {
-                selected_lines_num += 1;
+
+            // Advance the side(s) this line exists on.
+            if line.starts_with('-') {
+                old_line += 1;
+            } else if line.starts_with('+') {
+                new_line += 1;
+            } else {
+                old_line += 1;
+                new_line += 1;
             }
         }
     }
@@ -374,6 +381,32 @@ mod tests {
         assert!(
             !full.contains("11 +new"),
             "must not prefix line numbers: {full:?}"
+        );
+    }
+
+    #[test]
+    fn test_extract_hunk_lines_left_respects_lower_bound() {
+        // LEFT side: asking about old line 12 (a removed line mid-hunk) must
+        // select ONLY that line — not the context/lines from the hunk start.
+        // The previous behavior (a faithful port of the buggy Python) lacked a
+        // lower bound on the LEFT side and selected everything up to line_end.
+        let patch = "@@ -10,4 +10,3 @@\n context10\n-removed11\n-removed12\n context13";
+        let (_full, selected) = extract_hunk_lines_from_patch(patch, "f.rs", 12, 12, "LEFT");
+        assert!(
+            selected.contains("-removed12"),
+            "the queried old line must be selected: {selected:?}"
+        );
+        assert!(
+            !selected.contains("context10"),
+            "lines before the range must NOT be selected: {selected:?}"
+        );
+        assert!(
+            !selected.contains("removed11"),
+            "old line 11 is out of range: {selected:?}"
+        );
+        assert!(
+            !selected.contains("context13"),
+            "old line 13 is out of range: {selected:?}"
         );
     }
 
