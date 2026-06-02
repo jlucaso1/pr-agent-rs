@@ -371,6 +371,32 @@ pub async fn get_pr_images(
     }
 }
 
+/// Keep only labels that were added by the user.
+///
+/// Filters out the standard PR-type set (bug fix / tests / enhancement /
+/// documentation / other) and, when custom labels are configured, any label
+/// whose name matches a configured custom label. Mirrors the Python
+/// `get_user_labels`. Used before a `publish_labels` PUT (which replaces *all*
+/// labels) so user-applied labels are preserved instead of clobbered.
+pub fn get_user_labels(current_labels: &[String], settings: &Settings) -> Vec<String> {
+    const STANDARD: [&str; 5] = ["bug fix", "tests", "enhancement", "documentation", "other"];
+    let has_custom = !settings.custom_labels.is_empty();
+    current_labels
+        .iter()
+        .filter(|label| {
+            let lower = label.to_lowercase();
+            if STANDARD.contains(&lower.as_str()) {
+                return false;
+            }
+            if has_custom && settings.custom_labels.contains_key(label.as_str()) {
+                return false;
+            }
+            true
+        })
+        .cloned()
+        .collect()
+}
+
 /// Insert custom-labels template variables into the vars map.
 ///
 /// Shared by review and describe, which both need `enable_custom_labels`,
@@ -945,6 +971,38 @@ mod tests {
 
         assert_eq!(vars["enable_custom_labels"].to_string(), "false");
         assert_eq!(vars["custom_labels_class"].to_string(), "");
+    }
+
+    #[test]
+    fn test_get_user_labels_filters_standard_set() {
+        let settings = Settings::default();
+        let current = vec![
+            "Bug fix".to_string(),
+            "Enhancement".to_string(),
+            "needs-review".to_string(),
+            "priority/high".to_string(),
+        ];
+        let user = get_user_labels(&current, &settings);
+        // Standard PR-type labels dropped (case-insensitive); user labels kept.
+        assert_eq!(user, vec!["needs-review", "priority/high"]);
+    }
+
+    #[test]
+    fn test_get_user_labels_filters_custom_labels() {
+        let mut settings = Settings::default();
+        settings.custom_labels.insert(
+            "Performance".into(),
+            CustomLabelEntry {
+                description: "Perf".into(),
+            },
+        );
+        let current = vec![
+            "Performance".to_string(),
+            "tests".to_string(),
+            "keep-me".to_string(),
+        ];
+        let user = get_user_labels(&current, &settings);
+        assert_eq!(user, vec!["keep-me"]);
     }
 
     #[tokio::test]

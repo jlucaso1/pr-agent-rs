@@ -292,9 +292,29 @@ impl PRReviewer {
             }
         }
 
-        if !labels.is_empty() {
-            tracing::info!(?labels, "publishing review labels");
-            self.provider.publish_labels(&labels).await?;
+        // publish_labels replaces the entire label set, so merge in the labels
+        // already on the PR — minus any previously-generated review labels
+        // (effort / security), which we re-derive each run. Only publish when
+        // the resulting set actually differs, to avoid a no-op API write.
+        let current = self.provider.get_pr_labels().await.unwrap_or_default();
+        let current_filtered: Vec<String> = current
+            .iter()
+            .filter(|l| {
+                let lower = l.to_lowercase();
+                !lower.starts_with("review effort") && !lower.contains("security concern")
+            })
+            .cloned()
+            .collect();
+
+        let mut new_labels = labels.clone();
+        new_labels.extend(current_filtered);
+
+        let cur_set: std::collections::BTreeSet<&String> = current.iter().collect();
+        let new_set: std::collections::BTreeSet<&String> = new_labels.iter().collect();
+
+        if (!current.is_empty() || !labels.is_empty()) && new_set != cur_set {
+            tracing::info!(?new_labels, "publishing review labels");
+            self.provider.publish_labels(&new_labels).await?;
         }
 
         Ok(())
@@ -470,6 +490,52 @@ mod tests {
         assert!(
             labels.iter().any(|l| l.contains("Review effort")),
             "should include effort score label"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_review_preserves_user_labels_and_replaces_stale_review_labels() {
+        let provider = Arc::new(
+            MockGitProvider::new()
+                .with_diff_files(vec![sample_diff_file("src/main.rs", SAMPLE_PATCH)])
+                // A user label to preserve + a stale review label to drop.
+                .with_existing_labels(vec![
+                    "needs-review".to_string(),
+                    "Review effort [1-5]: 1".to_string(),
+                ]),
+        );
+        let ai = Arc::new(MockAiHandler::new(REVIEW_YAML));
+        let reviewer = PRReviewer::new_with_ai(provider.clone(), ai);
+
+        let mut overrides = std::collections::HashMap::new();
+        overrides.insert("config.publish_output".into(), "true".into());
+        overrides.insert("config.publish_output_progress".into(), "false".into());
+        overrides.insert(
+            "pr_reviewer.enable_review_labels_effort".into(),
+            "true".into(),
+        );
+        let settings =
+            Arc::new(crate::config::loader::load_settings(&overrides, None, None).unwrap());
+
+        with_settings(settings, reviewer.run()).await.unwrap();
+
+        let calls = provider.get_calls();
+        assert!(!calls.labels.is_empty(), "should publish merged labels");
+        let labels = &calls.labels[0];
+        // User label preserved.
+        assert!(
+            labels.contains(&"needs-review".to_string()),
+            "user label must be preserved: {labels:?}"
+        );
+        // The freshly-computed review effort label is present...
+        assert!(
+            labels.iter().any(|l| l.contains("Review effort")),
+            "fresh effort label present: {labels:?}"
+        );
+        // ...but the stale one (effort 1) is not duplicated/kept.
+        assert!(
+            !labels.contains(&"Review effort [1-5]: 1".to_string()),
+            "stale review label must be replaced: {labels:?}"
         );
     }
 

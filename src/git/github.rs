@@ -302,6 +302,19 @@ impl GithubProvider {
         resp.json().await.map_err(PrAgentError::Http)
     }
 
+    /// Make an authenticated PUT request.
+    async fn api_put(
+        &self,
+        path: &str,
+        body: &serde_json::Value,
+    ) -> Result<serde_json::Value, PrAgentError> {
+        let resp = self
+            .api_request_with_retry(reqwest::Method::PUT, path, Some(body))
+            .await?;
+        let resp = Self::check_response(resp, "PUT").await?;
+        resp.json().await.map_err(PrAgentError::Http)
+    }
+
     /// Make an authenticated DELETE request.
     async fn api_delete(&self, path: &str) -> Result<(), PrAgentError> {
         let resp = self
@@ -802,7 +815,10 @@ impl GitProvider for GithubProvider {
             "repos/{}/issues/{}/labels",
             self.repo_full, self.parsed.pr_number
         );
-        self.api_post(&path, &json!({"labels": labels})).await?;
+        // PUT replaces the full label set (vs POST which only adds). Callers
+        // are expected to have merged in any user labels to preserve, so stale
+        // AI-generated labels get cleared instead of accumulating.
+        self.api_put(&path, &json!({"labels": labels})).await?;
         Ok(())
     }
 

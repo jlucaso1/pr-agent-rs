@@ -35,6 +35,7 @@ pub struct MockGitProvider {
     pub issue_bodies: HashMap<u64, (String, String)>,
     pub repo_settings_toml: Option<String>,
     pub global_settings_toml: Option<String>,
+    pub existing_labels: Vec<String>,
     pub calls: Mutex<MockCalls>,
 }
 
@@ -50,8 +51,14 @@ impl MockGitProvider {
             issue_bodies: HashMap::new(),
             repo_settings_toml: None,
             global_settings_toml: None,
+            existing_labels: Vec::new(),
             calls: Mutex::new(MockCalls::default()),
         }
+    }
+
+    pub fn with_existing_labels(mut self, labels: Vec<String>) -> Self {
+        self.existing_labels = labels;
+        self
     }
 
     pub fn with_diff_files(mut self, files: Vec<FilePatchInfo>) -> Self {
@@ -191,7 +198,7 @@ impl GitProvider for MockGitProvider {
     }
 
     async fn get_pr_labels(&self) -> Result<Vec<String>, PrAgentError> {
-        Ok(vec![])
+        Ok(self.existing_labels.clone())
     }
 
     async fn add_eyes_reaction(
