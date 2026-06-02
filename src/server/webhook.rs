@@ -1,10 +1,19 @@
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use axum::body::Bytes;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
+use tokio::sync::Semaphore;
+
+/// Maximum number of webhook events processed concurrently. Bounds resource
+/// use (each task may run several AI calls) and provides backpressure: when the
+/// limit is reached, new deliveries are rejected with 503 so GitHub retries.
+const MAX_CONCURRENT_WEBHOOK_TASKS: usize = 16;
+
+static WEBHOOK_SEMAPHORE: LazyLock<Arc<Semaphore>> =
+    LazyLock::new(|| Arc::new(Semaphore::new(MAX_CONCURRENT_WEBHOOK_TASKS)));
 
 use crate::config::loader::{get_settings, load_settings};
 use crate::config::types::Settings;
@@ -64,14 +73,31 @@ pub async fn handle_github_webhook(headers: HeaderMap, body: Bytes) -> impl Into
 
     tracing::info!(event = %event, action = %action, "received webhook");
 
-    // 3. Dispatch in background task
+    // 3. Acquire a concurrency permit BEFORE spawning (so in-flight tasks are
+    //    bounded — acquiring inside the task would let them pile up). If the
+    //    limit is reached, reject with 503 so GitHub retries the delivery later.
+    let permit = match WEBHOOK_SEMAPHORE.clone().try_acquire_owned() {
+        Ok(p) => p,
+        Err(_) => {
+            tracing::warn!(
+                event = %event,
+                action = %action,
+                limit = MAX_CONCURRENT_WEBHOOK_TASKS,
+                "webhook task limit reached, rejecting event"
+            );
+            return (StatusCode::SERVICE_UNAVAILABLE, "server busy").into_response();
+        }
+    };
+
+    // 4. Dispatch in a background task, holding the permit for its lifetime.
     tokio::spawn(async move {
+        let _permit = permit;
         if let Err(e) = dispatch_event(&event, &action, &payload).await {
             tracing::error!(event = %event, action = %action, error = %e, "webhook handler failed");
         }
     });
 
-    // 4. Return 200 immediately
+    // 5. Return 200 immediately
     (StatusCode::OK, "ok").into_response()
 }
 
