@@ -229,7 +229,7 @@ impl PRCodeSuggestions {
         // caller can warn the user that scores are less reliable.
         let mut reflect_failed = false;
         match self
-            .self_reflect_on_suggestions(ai, model, &suggestions, diff_with_lines, &settings)
+            .self_reflect_on_suggestions(ai, &suggestions, diff_with_lines, &settings)
             .await
         {
             Ok(feedback) => {
@@ -260,7 +260,6 @@ impl PRCodeSuggestions {
     async fn self_reflect_on_suggestions(
         &self,
         ai: &dyn AiHandler,
-        model: &str,
         suggestions: &[ParsedSuggestion],
         diff_with_lines: &str,
         settings: &crate::config::types::Settings,
@@ -302,12 +301,14 @@ impl PRCodeSuggestions {
         // Render reflect prompt
         let rendered = render_prompt(&settings.pr_code_suggestions_reflect_prompt, vars)?;
 
-        // Call AI (second pass -- reflect, with fallback models)
-        tracing::info!(model, "calling AI model for improve reflect pass");
+        // Call AI (second pass -- reflect). Use the configured reasoning model
+        // (falls back to the default model when model_reasoning is unset).
+        let reflect_model = super::select_model(super::ModelKind::Reasoning);
+        tracing::info!(model = %reflect_model, "calling AI model for improve reflect pass");
         let response = super::ai_call_with_fallback(
             ai,
             settings,
-            model,
+            &reflect_model,
             &rendered.system,
             &rendered.user,
             None,

@@ -147,6 +147,27 @@ where
     result
 }
 
+/// Which configured model a tool should use.
+#[derive(Clone, Copy)]
+pub(crate) enum ModelKind {
+    /// A cheaper/faster model for lighter tasks (describe, ask, ask_line).
+    Weak,
+    /// A reasoning model (e.g. improve's self-reflect pass).
+    Reasoning,
+}
+
+/// Resolve the model for a task: the kind-specific model (`model_weak` /
+/// `model_reasoning`) when configured, otherwise the default `config.model`.
+/// Mirrors the Python `get_model`.
+pub(crate) fn select_model(kind: ModelKind) -> String {
+    let cfg = &get_settings().config;
+    match kind {
+        ModelKind::Weak if !cfg.model_weak.is_empty() => cfg.model_weak.clone(),
+        ModelKind::Reasoning if !cfg.model_reasoning.is_empty() => cfg.model_reasoning.clone(),
+        _ => cfg.model.clone(),
+    }
+}
+
 /// Append the response-language instruction to a tool's `extra_instructions`
 /// when a non-default `response_language` is configured, mirroring the Python
 /// original (which injects it into every section's extra_instructions). The
@@ -694,6 +715,41 @@ mod tests {
     fn test_scoped_settings_none_when_nothing_to_scope() {
         // No overrides and no repo/global TOML → dispatch against ambient settings.
         assert!(build_scoped_settings(&HashMap::new(), None, None).is_none());
+    }
+
+    #[tokio::test]
+    async fn test_select_model() {
+        use crate::config::loader::with_settings;
+
+        // Defaults: weak/reasoning empty → fall back to config.model.
+        let settings =
+            Arc::new(crate::config::loader::load_settings(&HashMap::new(), None, None).unwrap());
+        let default_model = settings.config.model.clone();
+        let (weak, reasoning) = with_settings(settings, async {
+            (
+                select_model(ModelKind::Weak),
+                select_model(ModelKind::Reasoning),
+            )
+        })
+        .await;
+        assert_eq!(weak, default_model);
+        assert_eq!(reasoning, default_model);
+
+        // Configured → the specific model is used.
+        let mut overrides = HashMap::new();
+        overrides.insert("config.model_weak".to_string(), "gpt-4o-mini".to_string());
+        overrides.insert("config.model_reasoning".to_string(), "o3-mini".to_string());
+        let settings =
+            Arc::new(crate::config::loader::load_settings(&overrides, None, None).unwrap());
+        let (weak, reasoning) = with_settings(settings, async {
+            (
+                select_model(ModelKind::Weak),
+                select_model(ModelKind::Reasoning),
+            )
+        })
+        .await;
+        assert_eq!(weak, "gpt-4o-mini");
+        assert_eq!(reasoning, "o3-mini");
     }
 
     #[tokio::test]

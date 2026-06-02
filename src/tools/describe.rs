@@ -48,7 +48,8 @@ impl PRDescription {
 
     async fn run_inner(&self) -> Result<(), PrAgentError> {
         let settings = get_settings();
-        let model = &settings.config.model;
+        let model = super::select_model(super::ModelKind::Weak);
+        let model = model.as_str();
 
         // 1. Fetch PR metadata
         let meta = PrMetadata::fetch(self.provider.as_ref(), &settings).await?;

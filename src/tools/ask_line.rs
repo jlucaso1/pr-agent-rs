@@ -52,7 +52,8 @@ impl PRAskLine {
             .unwrap_or(0);
 
         let settings = get_settings();
-        let model = &settings.config.model;
+        let model = super::select_model(super::ModelKind::Weak);
+        let model = model.as_str();
 
         // 1. Get the diff hunk — either from webhook-provided diff_hunk or by fetching files
         let diff_hunk = args.get("_diff_hunk").map(|s| s.as_str()).unwrap_or("");
