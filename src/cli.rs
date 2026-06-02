@@ -120,30 +120,33 @@ pub fn check_forbidden_key(key: &str) -> Option<&'static str> {
         .copied()
 }
 
+/// Normalize a `--section.key=value` (or `--section__key=value`) override token
+/// into its `(key, value)` pair, or `None` if it isn't a `key=value` override.
+///
+/// Strips leading dashes and converts double underscores to dots. The
+/// forbidden-key check is intentionally left to the caller, because the CLI
+/// errors on a forbidden key while the webhook drops it with a warning.
+pub fn parse_override_token(token: &str) -> Option<(String, String)> {
+    let stripped = token.trim_start_matches('-').replace("__", ".");
+    let (key, value) = stripped.split_once('=')?;
+    Some((key.to_string(), value.to_string()))
+}
+
 /// Parse the `rest` args into a HashMap of config overrides.
 /// Format: `--section.key=value` or `--section__key=value` (double underscores → dots).
 fn parse_config_overrides(rest: &[String]) -> Result<HashMap<String, String>, PrAgentError> {
     let mut overrides = HashMap::new();
 
     for arg in rest {
-        let stripped = arg.trim_start_matches('-');
-        if stripped.is_empty() {
-            continue;
-        }
-
-        // Convert double underscore to dot (e.g., pr_reviewer__num_code_suggestions → pr_reviewer.num_code_suggestions)
-        let stripped = stripped.replace("__", ".");
-
-        if let Some((key, value)) = stripped.split_once('=') {
-            if let Some(forbidden) = check_forbidden_key(key) {
+        // Non-config args (no `=`) are ignored for config; commands inspect rest directly.
+        if let Some((key, value)) = parse_override_token(arg) {
+            if let Some(forbidden) = check_forbidden_key(&key) {
                 return Err(PrAgentError::Other(format!(
                     "forbidden CLI override: '{key}' (matches '{forbidden}')"
                 )));
             }
-
-            overrides.insert(key.to_string(), value.to_string());
+            overrides.insert(key, value);
         }
-        // Non-config args (no `=`) are ignored for config; commands can inspect rest directly
     }
 
     Ok(overrides)
@@ -294,6 +297,22 @@ mod tests {
         assert_eq!(overrides.get("pr_reviewer.num_max_findings").unwrap(), "10");
         assert_eq!(overrides.get("config.temperature").unwrap(), "0.5");
         assert_eq!(overrides.get("config.model").unwrap(), "gpt-4");
+    }
+
+    #[test]
+    fn test_parse_override_token() {
+        assert_eq!(
+            parse_override_token("--config.model=gpt-4"),
+            Some(("config.model".into(), "gpt-4".into()))
+        );
+        // Double underscores become dots.
+        assert_eq!(
+            parse_override_token("--config__model=gpt-4"),
+            Some(("config.model".into(), "gpt-4".into()))
+        );
+        // Not a key=value override.
+        assert_eq!(parse_override_token("review"), None);
+        assert_eq!(parse_override_token("--flag"), None);
     }
 
     #[test]

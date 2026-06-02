@@ -334,21 +334,19 @@ pub fn parse_command(input: &str) -> (String, HashMap<String, String>) {
     let mut overrides = HashMap::new();
     let mut text_parts: Vec<&str> = Vec::new();
     for part in parts {
-        if part.starts_with('-') && part.contains('=') {
-            let stripped = part.trim_start_matches('-');
-            // Convert double underscore to dot
-            let stripped = stripped.replace("__", ".");
-            if let Some((key, value)) = stripped.split_once('=') {
-                if let Some(forbidden) = crate::cli::check_forbidden_key(key) {
-                    tracing::warn!(
-                        key,
-                        forbidden,
-                        "dropping forbidden override from comment command"
-                    );
-                    continue;
-                }
-                overrides.insert(key.to_string(), value.to_string());
+        if part.starts_with('-')
+            && part.contains('=')
+            && let Some((key, value)) = crate::cli::parse_override_token(part)
+        {
+            if let Some(forbidden) = crate::cli::check_forbidden_key(&key) {
+                tracing::warn!(
+                    key,
+                    forbidden,
+                    "dropping forbidden override from comment command"
+                );
+                continue;
             }
+            overrides.insert(key, value);
         } else {
             text_parts.push(part);
         }
