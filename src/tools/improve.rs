@@ -63,11 +63,10 @@ impl PRCodeSuggestions {
 
         let max_calls = settings.pr_code_suggestions.max_number_of_calls as usize;
 
-        // Generate batches without line numbers (for the suggestion prompt)
-        let batches_no_lines = get_pr_diff_multiple_patches(&mut files, model, false, max_calls);
-        // Generate batches with line numbers (for the reflect prompt).
-        // filter_files is idempotent so this operates on the already-filtered set.
-        let batches_with_lines = get_pr_diff_multiple_patches(&mut files, model, true, max_calls);
+        // Generate batches formatted in both variants in a SINGLE packing pass,
+        // so batch i carries the same files for the suggestion (no line numbers)
+        // and reflect (with line numbers) prompts.
+        let batches = get_pr_diff_multiple_patches(&mut files, model, max_calls);
 
         // Release large file contents — base_file/head_file are no longer needed
         // after patches have been extended above.
@@ -77,13 +76,13 @@ impl PRCodeSuggestions {
         }
         drop(files);
 
-        if batches_no_lines.is_empty() {
+        if batches.is_empty() {
             tracing::info!("no diff content, skipping improve");
             return Ok(());
         }
 
         let ai = super::resolve_ai_handler(&self.ai)?;
-        let num_batches = batches_no_lines.len();
+        let num_batches = batches.len();
         tracing::info!(num_batches, num_files, "processing PR in extended mode");
 
         // Extract images from PR body for vision-capable models
@@ -97,17 +96,16 @@ impl PRCodeSuggestions {
 
         // 3. Process batches (parallel or sequential)
         let all_suggestions = if settings.pr_code_suggestions.parallel_calls && num_batches > 1 {
-            let futures: Vec<_> = batches_no_lines
+            let futures: Vec<_> = batches
                 .iter()
-                .zip(batches_with_lines.iter())
                 .enumerate()
-                .map(|(i, (batch, batch_lines))| {
+                .map(|(i, batch)| {
                     self.process_single_batch(
                         ai.as_ref(),
                         model,
                         &meta,
                         &batch.patches,
-                        &batch_lines.patches,
+                        &batch.patches_with_lines,
                         i,
                         image_ref,
                     )
@@ -127,18 +125,14 @@ impl PRCodeSuggestions {
                 .collect::<Vec<_>>()
         } else {
             let mut all = Vec::new();
-            for (i, (batch, batch_lines)) in batches_no_lines
-                .iter()
-                .zip(batches_with_lines.iter())
-                .enumerate()
-            {
+            for (i, batch) in batches.iter().enumerate() {
                 match self
                     .process_single_batch(
                         ai.as_ref(),
                         model,
                         &meta,
                         &batch.patches,
-                        &batch_lines.patches,
+                        &batch.patches_with_lines,
                         i,
                         image_ref,
                     )

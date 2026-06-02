@@ -301,16 +301,37 @@ fn append_remaining_file_lists(
     result
 }
 
-/// Generate multiple compressed diff batches for large PRs.
+/// A diff batch formatted in BOTH variants for the same set of files:
+/// `patches` (no line numbers, for the suggestion prompt) and
+/// `patches_with_lines` (for the reflect prompt).
+pub struct DualDiffBatch {
+    pub patches: String,
+    pub patches_with_lines: String,
+    pub files_in_patch: Vec<String>,
+}
+
+/// Per-file entry holding both formatted variants and the (line-numbered)
+/// token count used as the packing budget.
+struct DualFileEntry {
+    no_lines: String,
+    with_lines: String,
+    tokens: u32,
+}
+
+/// Generate multiple compressed diff batches for large PRs, formatted in BOTH
+/// the no-line-numbers and with-line-numbers variants.
 ///
-/// Generates up to `max_calls` batches, each within the token budget.
-#[allow(dead_code)]
+/// The packing runs ONCE (over the line-numbered token budget, mirroring the
+/// Python original), so batch *i* always contains the exact same files in both
+/// variants. Previously two independent packings could place a file in
+/// different batch indices, and the caller's `zip` would silently pair
+/// mismatched file sets between the suggestion and reflect prompts. `extend_patch`
+/// also runs only once per file.
 pub fn get_pr_diff_multiple_patches(
     files: &mut Vec<FilePatchInfo>,
     model: &str,
-    add_line_numbers: bool,
     max_calls: usize,
-) -> Vec<CompressedDiffResult> {
+) -> Vec<DualDiffBatch> {
     let settings = get_settings();
     let extra_before = settings.config.patch_extra_lines_before;
     let extra_after = settings.config.patch_extra_lines_after;
@@ -326,20 +347,102 @@ pub fn get_pr_diff_multiple_patches(
         settings.config.max_model_tokens,
         settings.config.custom_model_max_tokens,
     );
-    let file_dict = build_file_dict(files, add_line_numbers, extra_before, extra_after);
-    let mut remaining: Vec<String> = file_dict.iter().map(|(f, _)| f.clone()).collect();
+
+    // Extend each patch once, format both variants, and count tokens on the
+    // line-numbered variant (the packing budget).
+    let mut entries: Vec<(String, DualFileEntry)> = files
+        .iter()
+        .map(|file| {
+            let extended = extend_patch(&file.base_file, &file.patch, extra_before, extra_after);
+            let no_lines = format_patch_simple(&file.filename, &extended, file.edit_type);
+            let with_lines =
+                convert_to_hunks_with_line_numbers(&file.filename, &extended, file.edit_type);
+            let tokens = count_tokens(&with_lines);
+            (
+                file.filename.clone(),
+                DualFileEntry {
+                    no_lines,
+                    with_lines,
+                    tokens,
+                },
+            )
+        })
+        .collect();
+
+    // Largest files first (same priority order as build_file_dict).
+    entries.sort_by(|a, b| b.1.tokens.cmp(&a.1.tokens));
+
+    let mut remaining: Vec<String> = entries.iter().map(|(f, _)| f.clone()).collect();
     let mut batches = Vec::new();
 
     for _ in 0..max_calls {
         if remaining.is_empty() {
             break;
         }
-        let result = generate_full_patch(&file_dict, max_tokens, &remaining);
-        remaining.clone_from(&result.remaining_files);
-        batches.push(result);
+        let (batch, new_remaining) = pack_dual_batch(&entries, max_tokens, &remaining);
+        // Stop if no progress was made (avoids an infinite loop on a single
+        // file larger than the whole budget).
+        if batch.files_in_patch.is_empty() {
+            break;
+        }
+        remaining = new_remaining;
+        batches.push(batch);
     }
 
     batches
+}
+
+/// Pack one batch from `entries`, building both formatted variants for the
+/// same selected files. Mirrors `generate_full_patch`'s soft/hard thresholds.
+fn pack_dual_batch(
+    entries: &[(String, DualFileEntry)],
+    max_tokens: u32,
+    remaining_prev: &[String],
+) -> (DualDiffBatch, Vec<String>) {
+    let remaining_set: std::collections::HashSet<&str> =
+        remaining_prev.iter().map(|s| s.as_str()).collect();
+
+    let mut patches = String::new();
+    let mut patches_with_lines = String::new();
+    let mut total_tokens: u32 = 0;
+    let mut remaining_files: Vec<String> = Vec::new();
+    let mut files_in_patch: Vec<String> = Vec::new();
+
+    for (filename, entry) in entries {
+        if !remaining_set.contains(filename.as_str()) {
+            continue;
+        }
+
+        // Hard stop: no more tokens available at all.
+        if total_tokens > max_tokens.saturating_sub(OUTPUT_BUFFER_TOKENS_HARD_THRESHOLD) {
+            tracing::warn!(file = %filename, "skipped: hard token limit reached");
+            continue;
+        }
+
+        // Soft threshold: defer to a later batch.
+        if total_tokens + entry.tokens
+            > max_tokens.saturating_sub(OUTPUT_BUFFER_TOKENS_SOFT_THRESHOLD)
+        {
+            remaining_files.push(filename.clone());
+            continue;
+        }
+
+        if !entry.with_lines.is_empty() {
+            patches.push_str(&entry.no_lines);
+            patches_with_lines.push_str(&entry.with_lines);
+            total_tokens += entry.tokens;
+            files_in_patch.push(filename.clone());
+        }
+    }
+
+    (
+        DualDiffBatch {
+            patches,
+            patches_with_lines,
+            files_in_patch,
+        },
+        remaining_files,
+    )
 }
 
 #[cfg(test)]
@@ -351,6 +454,36 @@ mod tests {
         let mut f = FilePatchInfo::new(String::new(), String::new(), patch.into(), filename.into());
         f.edit_type = edit_type;
         f
+    }
+
+    #[test]
+    fn test_dual_batches_have_consistent_files() {
+        // P4: both formatted variants of a batch must reference the same files,
+        // since they come from a single packing pass.
+        let mut files = vec![
+            make_file("a.rs", "@@ -1,1 +1,1 @@\n-a\n+b", EditType::Modified),
+            make_file("b.rs", "@@ -1,1 +1,1 @@\n-c\n+d", EditType::Modified),
+        ];
+        let batches = get_pr_diff_multiple_patches(&mut files, "gpt-4o", 5);
+        assert!(!batches.is_empty(), "should produce at least one batch");
+
+        for batch in &batches {
+            assert!(!batch.files_in_patch.is_empty());
+            for f in &batch.files_in_patch {
+                assert!(
+                    batch.patches.contains(f.as_str()),
+                    "no-lines variant must mention {f}"
+                );
+                assert!(
+                    batch.patches_with_lines.contains(f.as_str()),
+                    "with-lines variant must mention {f}"
+                );
+            }
+            // The with-lines variant carries numbered hunks (`__new hunk__`),
+            // the no-lines variant does not.
+            assert!(batch.patches_with_lines.contains("__new hunk__"));
+            assert!(!batch.patches.contains("__new hunk__"));
+        }
     }
 
     #[test]
