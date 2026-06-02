@@ -149,7 +149,13 @@ fn build_file_dict(
     let mut entries: Vec<(String, FileEntry)> = Vec::with_capacity(files.len());
 
     for file in files {
-        let extended = extend_patch(&file.base_file, &file.patch, extra_before, extra_after);
+        let extended = extend_patch(
+            &file.base_file,
+            &file.patch,
+            &file.head_file,
+            extra_before,
+            extra_after,
+        );
 
         // Pass raw parts directly — avoids constructing a temporary FilePatchInfo
         // and eliminates one filename clone per file.
@@ -361,7 +367,13 @@ pub fn get_pr_diff_multiple_patches(
     let mut entries: Vec<(String, DualFileEntry)> = files
         .iter()
         .map(|file| {
-            let extended = extend_patch(&file.base_file, &file.patch, extra_before, extra_after);
+            let extended = extend_patch(
+                &file.base_file,
+                &file.patch,
+                &file.head_file,
+                extra_before,
+                extra_after,
+            );
             let no_lines = format_patch_simple(&file.filename, &extended, file.edit_type);
             let with_lines =
                 convert_to_hunks_with_line_numbers(&file.filename, &extended, file.edit_type);

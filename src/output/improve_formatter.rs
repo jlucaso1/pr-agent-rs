@@ -191,7 +191,11 @@ pub fn format_suggestions_table(
                 } else {
                     format!("[{}-{}]", s.relevant_lines_start, s.relevant_lines_end)
                 };
-                let link = link_gen(&s.relevant_file, s.relevant_lines_start, s.relevant_lines_end);
+                let link = link_gen(
+                    &s.relevant_file,
+                    s.relevant_lines_start,
+                    s.relevant_lines_end,
+                );
                 let summary = if s.one_sentence_summary.is_empty() {
                     s.suggestion_content.trim()
                 } else {
@@ -358,7 +362,8 @@ code_suggestions:
             score_why: String::new(),
         }];
 
-        let result = format_suggestions_table(&suggestions, 9, 7, &|_: &str, _: i32, _: i32| String::new());
+        let result =
+            format_suggestions_table(&suggestions, 9, 7, &|_: &str, _: i32, _: i32| String::new());
         assert!(result.contains("PR Code Suggestions"));
         assert!(result.contains("<!-- pr-agent:improve -->"));
         assert!(result.contains("Improve performance"));
@@ -386,7 +391,8 @@ code_suggestions:
             score_why: String::new(),
         }];
 
-        let result = format_suggestions_table(&suggestions, 9, 7, &|_: &str, _: i32, _: i32| String::new());
+        let result =
+            format_suggestions_table(&suggestions, 9, 7, &|_: &str, _: i32, _: i32| String::new());
         // Should appear in high-level section, not in table
         assert!(result.contains("Architecture & Design"));
         assert!(result.contains("[Minor] Fix issue"));
@@ -424,7 +430,8 @@ code_suggestions:
             },
         ];
 
-        let result = format_suggestions_table(&suggestions, 9, 7, &|_: &str, _: i32, _: i32| String::new());
+        let result =
+            format_suggestions_table(&suggestions, 9, 7, &|_: &str, _: i32, _: i32| String::new());
         // Both sections present
         assert!(result.contains("Architecture & Design"));
         assert!(result.contains("Code Suggestions"));
@@ -457,9 +464,15 @@ code_suggestions:
         // Collapsible summary + before/after diff.
         assert!(result.contains("<details><summary>Fix the value</summary>"));
         assert!(result.contains("```diff"));
-        assert!(result.contains("-let y = 2;"), "diff shows the removed line: {result}");
+        assert!(
+            result.contains("-let y = 2;"),
+            "diff shows the removed line: {result}"
+        );
         assert!(result.contains("+let y = 3;"), "diff shows the added line");
-        assert!(result.contains(" let x = 1;"), "diff keeps the context line");
+        assert!(
+            result.contains(" let x = 1;"),
+            "diff keeps the context line"
+        );
         // Line link.
         assert!(result.contains("https://gh/src/main.rs#L10-L12"));
         // Reflect "Why".
@@ -481,7 +494,8 @@ code_suggestions:
             score_why: String::new(),
         }];
 
-        let result = format_suggestions_table(&suggestions, 9, 7, &|_: &str, _: i32, _: i32| String::new());
+        let result =
+            format_suggestions_table(&suggestions, 9, 7, &|_: &str, _: i32, _: i32| String::new());
         assert!(result.contains("[42]"));
         assert!(!result.contains("[42-42]"));
     }
@@ -501,7 +515,8 @@ code_suggestions:
             score_why: String::new(),
         }];
 
-        let result = format_suggestions_table(&suggestions, 9, 7, &|_: &str, _: i32, _: i32| String::new());
+        let result =
+            format_suggestions_table(&suggestions, 9, 7, &|_: &str, _: i32, _: i32| String::new());
         // Table rows should not have raw newlines within cells
         for line in result.lines() {
             if line.starts_with("| ") && line.contains("Summary") {
