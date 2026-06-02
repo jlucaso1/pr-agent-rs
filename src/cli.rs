@@ -24,7 +24,7 @@ pub struct Cli {
     pub command: Command,
 
     /// Extra arguments passed as config overrides (--section.key=value).
-    /// Place after `--` separator: `pr-agent review --pr_url=<url> -- --config.model=gpt-4`
+    /// Place after `--` separator: `pr-agent --pr-url=<url> review -- --config.model=gpt-4`
     #[arg(last = true, allow_hyphen_values = true, global = true)]
     pub rest: Vec<String>,
 }
