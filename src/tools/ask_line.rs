@@ -67,7 +67,10 @@ impl PRAskLine {
         let (full_hunk, selected_lines) = if !diff_hunk.is_empty() {
             extract_hunk_lines_from_patch(diff_hunk, file_name, line_start, line_end, side)
         } else {
-            // Fallback: fetch diff files and find the matching file
+            // Fallback: fetch diff files and find the matching file. This only
+            // runs when the webhook did NOT supply `_diff_hunk` (a rare path);
+            // get_diff_files is heavier than needed here (it also fetches file
+            // contents), but the trait exposes no single-file patch accessor.
             let files = self.provider.get_diff_files().await?;
             let mut result = (String::new(), String::new());
             for file in &files {
@@ -103,9 +106,13 @@ impl PRAskLine {
                 String::new()
             };
 
-        // 3. Build template variables
-        let title = self.provider.get_pr_description_full().await?.0;
-        let branch = self.provider.get_pr_branch().await?;
+        // 3. Build template variables. Title and branch come from the same
+        // `pulls/{n}` endpoint, so fetch them concurrently.
+        let (description, branch) = tokio::try_join!(
+            self.provider.get_pr_description_full(),
+            self.provider.get_pr_branch(),
+        )?;
+        let title = description.0;
 
         let mut vars: HashMap<String, Value> = HashMap::new();
         vars.insert("title".into(), Value::from(title));
