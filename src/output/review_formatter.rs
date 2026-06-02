@@ -89,7 +89,7 @@ fn format_review_gfm(
                 format_contribution_time_cost_row(value, out);
             }
             "ticket_compliance_check" => {
-                format_simple_row("🎫 Ticket compliance", value, out);
+                format_ticket_compliance_row(section_emoji("Ticket compliance check"), value, out);
             }
             "todo_sections" => {
                 format_todo_sections_row(value, out);
@@ -384,6 +384,113 @@ fn format_can_be_split_row(value: &serde_yaml_ng::Value, out: &mut String) {
         }
     }
     out.push_str("</td></tr>\n");
+}
+
+/// Format the `ticket_compliance_check` row — a `List[TicketCompliance]`, each
+/// item carrying `ticket_url` plus compliant / non-compliant / needs-human-
+/// verification requirement bullet lists. Mirrors Python `ticket_markdown_logic`:
+/// derive a per-ticket compliance level, an aggregate emoji, and render a
+/// readable block per ticket. Without this the nested list was flattened by
+/// `yaml_value_to_string` into one unreadable paragraph (raw YAML field names
+/// and `|` block-scalar markers included).
+fn format_ticket_compliance_row(emoji: &str, value: &serde_yaml_ng::Value, out: &mut String) {
+    let Some(tickets) = value.as_sequence() else {
+        return;
+    };
+
+    let mut compliance_str = String::new();
+    let mut levels: Vec<&str> = Vec::new();
+
+    for ticket in tickets {
+        let field = |k: &str| {
+            ticket
+                .get(k)
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string()
+        };
+        let ticket_url = field("ticket_url");
+        let fully = field("fully_compliant_requirements");
+        let not = field("not_compliant_requirements");
+        let needs = field("requires_further_human_verification");
+
+        // A ticket with no compliant/non-compliant items carries no signal.
+        if fully.is_empty() && not.is_empty() {
+            continue;
+        }
+
+        let level = if !fully.is_empty() {
+            if !not.is_empty() {
+                "Partially compliant"
+            } else if needs.is_empty() {
+                "Fully compliant"
+            } else {
+                "PR Code Verified"
+            }
+        } else {
+            "Not compliant"
+        };
+        levels.push(level);
+
+        let mut explanation = String::new();
+        if !fully.is_empty() {
+            let _ = write!(explanation, "Compliant requirements:\n\n{fully}\n\n");
+        }
+        if !not.is_empty() {
+            let _ = write!(explanation, "Non-compliant requirements:\n\n{not}\n\n");
+        }
+        if !needs.is_empty() {
+            let _ = write!(
+                explanation,
+                "Requires further human verification:\n\n{needs}\n\n"
+            );
+        }
+
+        // Link text is the trailing path segment (the ticket id), as in Python.
+        let ticket_id = ticket_url.rsplit('/').next().unwrap_or("");
+        let heading = if ticket_url.is_empty() {
+            level.to_string()
+        } else {
+            format!("[{ticket_id}]({ticket_url}) - {level}")
+        };
+        let _ = write!(compliance_str, "\n\n**{heading}**\n\n{explanation}\n\n");
+    }
+
+    // Nothing renderable → skip the whole row (don't emit an empty header).
+    if compliance_str.trim().is_empty() {
+        return;
+    }
+
+    let compliance_emoji = aggregate_compliance_emoji(&levels);
+    let _ = write!(
+        out,
+        "<tr><td>\n\n**{emoji} Ticket compliance analysis {compliance_emoji}**\n\n{compliance_str}</td></tr>\n"
+    );
+}
+
+/// Derive the overall compliance emoji from the per-ticket levels.
+/// Mirrors the aggregation in Python `ticket_markdown_logic`.
+fn aggregate_compliance_emoji(levels: &[&str]) -> &'static str {
+    if levels.is_empty() {
+        return "";
+    }
+    let all = |target: &str| levels.iter().all(|&l| l == target);
+    let any = |target: &str| levels.contains(&target);
+
+    if all("Fully compliant") || all("PR Code Verified") {
+        "✅"
+    } else if any("Not compliant") {
+        if any("Fully compliant") || any("PR Code Verified") {
+            "🔶" // mix of compliant and non-compliant
+        } else {
+            "❌"
+        }
+    } else if any("Partially compliant") {
+        "🔶"
+    } else {
+        "✅"
+    }
 }
 
 /// Format the `contribution_time_cost_estimate` row (best/average/worst case).
@@ -705,5 +812,98 @@ review:
         assert!(result.contains("30 minutes"));
         // Must NOT leak the raw YAML keys.
         assert!(!result.contains("best_case:"));
+    }
+
+    #[test]
+    fn test_ticket_compliance_renders_structured_block() {
+        // Reproduces the production scenario where the nested list was flattened
+        // into one paragraph (raw `ticket_url: |` keys and `|` markers leaked).
+        let yaml = "\
+review:
+  ticket_compliance_check:
+    - ticket_url: |
+        https://github.com/acme/repo/issues/2504
+      ticket_requirements: |
+        * Migrate db.transaction() calls
+      fully_compliant_requirements: |
+        * Migrated the travel-requests router
+        * Migrated fleet-requests REST routes
+      not_compliant_requirements: |
+        None.
+      requires_further_human_verification: |
+        * Test file updates are not included in this diff
+";
+        let data: serde_yaml_ng::Value = serde_yaml_ng::from_str(yaml).unwrap();
+        let result = format_review_markdown(&data, true, None);
+
+        // Renders the analysis header and a per-ticket linked heading.
+        assert!(
+            result.contains("Ticket compliance analysis"),
+            "has the analysis header: {result}"
+        );
+        assert!(
+            result.contains("[2504](https://github.com/acme/repo/issues/2504)"),
+            "links the ticket by id: {result}"
+        );
+        // Renders the readable requirement sub-sections.
+        assert!(result.contains("Compliant requirements:"));
+        assert!(result.contains("Migrated the travel-requests router"));
+        assert!(result.contains("Requires further human verification:"));
+
+        // CRITICAL regression guard: must NOT leak the raw YAML field names or
+        // block-scalar markers that the flattened rendering produced.
+        assert!(
+            !result.contains("ticket_url:"),
+            "raw ticket_url key leaked: {result}"
+        );
+        assert!(
+            !result.contains("fully_compliant_requirements:"),
+            "raw field key leaked: {result}"
+        );
+        assert!(
+            !result.contains("ticket_requirements:"),
+            "raw field key leaked: {result}"
+        );
+    }
+
+    #[test]
+    fn test_ticket_compliance_aggregate_emoji_levels() {
+        // Fully compliant (no non-compliant, no further verification) → ✅
+        assert_eq!(aggregate_compliance_emoji(&["Fully compliant"]), "✅");
+        // A non-compliant ticket alone → ❌
+        assert_eq!(aggregate_compliance_emoji(&["Not compliant"]), "❌");
+        // Mix of compliant + non-compliant → partial 🔶
+        assert_eq!(
+            aggregate_compliance_emoji(&["Fully compliant", "Not compliant"]),
+            "🔶"
+        );
+        // Partially compliant present → 🔶
+        assert_eq!(aggregate_compliance_emoji(&["Partially compliant"]), "🔶");
+        // PR Code Verified across the board → ✅
+        assert_eq!(aggregate_compliance_emoji(&["PR Code Verified"]), "✅");
+        // No levels → no emoji.
+        assert_eq!(aggregate_compliance_emoji(&[]), "");
+    }
+
+    #[test]
+    fn test_ticket_compliance_skips_empty_requirements() {
+        // A ticket with neither compliant nor non-compliant items carries no
+        // signal and must be dropped (no empty header row).
+        let yaml = "\
+review:
+  ticket_compliance_check:
+    - ticket_url: |
+        https://github.com/acme/repo/issues/9
+      ticket_requirements: |
+        * Something
+      fully_compliant_requirements: |
+      not_compliant_requirements: |
+";
+        let data: serde_yaml_ng::Value = serde_yaml_ng::from_str(yaml).unwrap();
+        let result = format_review_markdown(&data, true, None);
+        assert!(
+            !result.contains("Ticket compliance analysis"),
+            "empty ticket should not render a row: {result}"
+        );
     }
 }
