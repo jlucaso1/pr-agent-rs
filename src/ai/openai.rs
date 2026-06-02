@@ -157,9 +157,13 @@ impl OpenAiCompatibleHandler {
             }
 
             let body_text = resp.text().await.unwrap_or_default();
-            return Err(PrAgentError::AiHandler(format!(
-                "API returned {status}: {body_text}"
-            )));
+            let msg = format!("API returned {status}: {body_text}");
+            // 4xx (other than 429) is a client error — not worth retrying.
+            return Err(if status.is_client_error() {
+                PrAgentError::AiClientError(msg)
+            } else {
+                PrAgentError::AiHandler(msg)
+            });
         }
 
         let api_resp: ApiResponse = resp.json().await.map_err(PrAgentError::Http)?;
@@ -255,10 +259,10 @@ impl AiHandler for OpenAiCompatibleHandler {
         for attempt in 0..=MODEL_RETRIES {
             match self.send_completion(&body).await {
                 Ok(resp) => return Ok(resp),
-                Err(e @ PrAgentError::RateLimited { .. }) => {
-                    // Don't retry rate limits — propagate immediately
-                    return Err(e);
-                }
+                // Only retry transient errors (network/5xx). Rate limits and
+                // client (4xx) errors propagate immediately instead of burning
+                // attempts with backoff.
+                Err(e) if !e.is_retryable() => return Err(e),
                 Err(e) => {
                     tracing::warn!(
                         attempt = attempt + 1,
