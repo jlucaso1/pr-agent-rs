@@ -277,9 +277,13 @@ async fn health_check() -> Result<(), PrAgentError> {
         .unwrap_or(3000);
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
     let timeout = std::time::Duration::from_secs(5);
-    std::net::TcpStream::connect_timeout(&addr, timeout)
-        .map_err(|e| PrAgentError::Other(format!("health check failed: {e}")))?;
-    Ok(())
+    // Async connect — never block the runtime thread (the previous
+    // std::net::TcpStream::connect_timeout blocked for up to 5s).
+    match tokio::time::timeout(timeout, tokio::net::TcpStream::connect(addr)).await {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(e)) => Err(PrAgentError::Other(format!("health check failed: {e}"))),
+        Err(_) => Err(PrAgentError::Other("health check timed out".into())),
+    }
 }
 
 #[cfg(test)]
