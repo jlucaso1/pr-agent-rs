@@ -195,9 +195,8 @@ pub async fn run() -> Result<(), PrAgentError> {
                 )));
             }
 
-            let url = pr_url.ok_or_else(|| {
-                PrAgentError::Other(format!("--pr-url is required for {name}"))
-            })?;
+            let url = pr_url
+                .ok_or_else(|| PrAgentError::Other(format!("--pr-url is required for {name}")))?;
 
             let provider: Arc<dyn crate::git::GitProvider> =
                 Arc::new(GithubProvider::new(url).await?);

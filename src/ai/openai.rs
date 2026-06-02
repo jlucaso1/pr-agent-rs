@@ -70,8 +70,14 @@ impl OpenAiCompatibleHandler {
         // Build messages
         let mut messages = Vec::new();
 
-        let (sys_msg, usr_msg) = if !caps.supports_system_message {
-            // Combine system + user into a single user message
+        // Combine system + user into a single user message when the model can't
+        // take a separate system prompt OR the user marked it a custom reasoning
+        // model. Previously only the former was honored, so custom_reasoning_model
+        // still sent a separate system message (rejected by some reasoning models)
+        // even though its temperature suppression already applied.
+        let merge_system_into_user =
+            !caps.supports_system_message || settings.config.custom_reasoning_model;
+        let (sys_msg, usr_msg) = if merge_system_into_user {
             (String::new(), format!("{system}\n\n\n{user}"))
         } else {
             (system.to_string(), user.to_string())
@@ -368,6 +374,37 @@ mod tests {
             body["reasoning_effort"].is_string(),
             "gpt-5 models must send reasoning_effort, got: {:?}",
             body.get("reasoning_effort")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_build_request_body_custom_reasoning_model_merges_messages() {
+        // C5: custom_reasoning_model must merge system+user into a single user
+        // message (and suppress temperature), even for a model that otherwise
+        // supports a separate system prompt.
+        use crate::config::loader::with_settings;
+        let mut overrides = std::collections::HashMap::new();
+        overrides.insert("config.custom_reasoning_model".into(), "true".into());
+        let settings = std::sync::Arc::new(
+            crate::config::loader::load_settings(&overrides, None, None).unwrap(),
+        );
+
+        let handler = test_handler();
+        let body = with_settings(settings, async {
+            handler.build_request_body("gpt-4", "system", "user", Some(0.5), None)
+        })
+        .await;
+
+        let messages = body["messages"].as_array().unwrap();
+        assert_eq!(
+            messages.len(),
+            1,
+            "custom_reasoning_model should merge system+user into one message"
+        );
+        assert_eq!(messages[0]["role"], "user");
+        assert!(
+            body.get("temperature").is_none(),
+            "custom_reasoning_model should suppress temperature"
         );
     }
 
