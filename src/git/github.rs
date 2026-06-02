@@ -17,6 +17,21 @@ use crate::error::PrAgentError;
 /// Maximum characters in a single comment (GitHub limit ~65536).
 const MAX_COMMENT_CHARS: usize = 65000;
 
+/// Truncate a comment body to GitHub's character limit on a UTF-8 char
+/// boundary. Applied to every comment write (create AND edit) so large
+/// persistent comments don't get rejected with HTTP 422.
+fn truncate_comment(text: &str) -> &str {
+    if text.len() <= MAX_COMMENT_CHARS {
+        return text;
+    }
+    // Find the largest char boundary at or before MAX_COMMENT_CHARS.
+    let mut end = MAX_COMMENT_CHARS;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
+}
+
 /// JWT claims for GitHub App authentication.
 #[derive(Debug, Serialize)]
 struct GithubAppClaims {
@@ -522,16 +537,7 @@ impl GitProvider for GithubProvider {
         text: &str,
         _is_temporary: bool,
     ) -> Result<Option<CommentId>, PrAgentError> {
-        let truncated = if text.len() > MAX_COMMENT_CHARS {
-            // Find the largest char boundary at or before MAX_COMMENT_CHARS
-            let mut end = MAX_COMMENT_CHARS;
-            while end > 0 && !text.is_char_boundary(end) {
-                end -= 1;
-            }
-            &text[..end]
-        } else {
-            text
-        };
+        let truncated = truncate_comment(text);
         let path = format!(
             "repos/{}/issues/{}/comments",
             self.repo_full, self.parsed.pr_number
@@ -820,7 +826,8 @@ impl GitProvider for GithubProvider {
 
     async fn edit_comment(&self, comment_id: &CommentId, body: &str) -> Result<(), PrAgentError> {
         let path = format!("repos/{}/issues/comments/{}", self.repo_full, comment_id.0);
-        self.api_patch(&path, &json!({"body": body})).await?;
+        let truncated = truncate_comment(body);
+        self.api_patch(&path, &json!({"body": truncated})).await?;
         Ok(())
     }
 
@@ -1064,6 +1071,35 @@ mod tests {
         let (plus, minus) = count_patch_lines("");
         assert_eq!(plus, 0);
         assert_eq!(minus, 0);
+    }
+
+    #[test]
+    fn test_truncate_comment_under_limit() {
+        let text = "short comment";
+        assert_eq!(truncate_comment(text), text);
+    }
+
+    #[test]
+    fn test_truncate_comment_over_limit() {
+        let text = "a".repeat(MAX_COMMENT_CHARS + 500);
+        let truncated = truncate_comment(&text);
+        assert_eq!(truncated.len(), MAX_COMMENT_CHARS);
+    }
+
+    #[test]
+    fn test_truncate_comment_respects_char_boundary() {
+        // Build a string that, at exactly MAX_COMMENT_CHARS bytes, would split a
+        // multibyte char. Truncation must back off to a valid boundary.
+        let mut text = "a".repeat(MAX_COMMENT_CHARS - 1);
+        text.push('é'); // 2 bytes → straddles the byte limit
+        text.push_str(&"b".repeat(100));
+        let truncated = truncate_comment(&text);
+        assert!(truncated.len() <= MAX_COMMENT_CHARS);
+        // Must remain valid UTF-8 (no panic on slice / valid str returned).
+        assert!(truncated.is_char_boundary(truncated.len()));
+        // The 'é' would start at byte MAX_COMMENT_CHARS-1 and end at +1, so it is
+        // dropped entirely, leaving only the leading run of 'a'.
+        assert_eq!(truncated.len(), MAX_COMMENT_CHARS - 1);
     }
 
     #[test]
