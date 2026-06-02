@@ -280,10 +280,7 @@ impl PRReviewer {
                 let formatted = format_review_markdown(data, true, None);
                 println!("{formatted}");
             }
-            None => {
-                eprintln!("Warning: could not parse YAML from AI response, printing raw:");
-                println!("{raw_response}");
-            }
+            None => super::print_raw_fallback(raw_response),
         }
     }
 }

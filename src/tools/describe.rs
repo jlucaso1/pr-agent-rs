@@ -231,10 +231,7 @@ impl PRDescription {
                     serde_yaml_ng::to_string(data).unwrap_or_else(|_| raw_response.to_string())
                 );
             }
-            None => {
-                eprintln!("Warning: could not parse YAML from AI response, printing raw:");
-                println!("{raw_response}");
-            }
+            None => super::print_raw_fallback(raw_response),
         }
     }
 }

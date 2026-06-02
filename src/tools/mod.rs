@@ -87,6 +87,12 @@ impl PrMetadata {
     }
 }
 
+/// Print a raw AI response to stdout when its YAML couldn't be parsed (CLI mode).
+pub(crate) fn print_raw_fallback(raw_response: &str) {
+    eprintln!("Warning: could not parse YAML from AI response, printing raw:");
+    println!("{raw_response}");
+}
+
 /// Run a tool's inner logic wrapped with progress comment lifecycle.
 ///
 /// If `publish_output_progress` is enabled, creates a progress comment before
