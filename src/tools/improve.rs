@@ -369,13 +369,16 @@ impl PRCodeSuggestions {
 
     /// Publish suggestions to the PR.
     ///
-    /// Three modes:
-    /// 1. **Dual publishing** (`dual_publishing_score_threshold > -1`): publish
-    ///    high-scoring suggestions as inline committable comments AND all
-    ///    suggestions as a summary table.
-    /// 2. **Inline-only** (`commitable_code_suggestions = true`): publish as
-    ///    inline GitHub code suggestions; fall back to table on failure.
-    /// 3. **Table-only** (default): publish as persistent comment table.
+    /// The PRIMARY mode is chosen by `commitable_code_suggestions` (mirroring
+    /// the Python original):
+    /// - **Table mode** (default, `commitable_code_suggestions = false` and the
+    ///   provider supports GFM): publish all suggestions as a persistent-comment
+    ///   table. Then, ADDITIVELY, when `dual_publishing_score_threshold > 0`,
+    ///   also push suggestions scoring `>= threshold` as inline committable
+    ///   comments.
+    /// - **Inline-only mode** (`commitable_code_suggestions = true`, or GFM
+    ///   unsupported): publish as inline GitHub code suggestions; fall back to
+    ///   the table on failure or when none have valid line numbers.
     async fn publish_suggestions(
         &self,
         suggestions: &[ParsedSuggestion],
@@ -390,43 +393,47 @@ impl PRCodeSuggestions {
 
         tracing::info!(count = suggestions.len(), "publishing code suggestions");
 
-        let threshold = settings.pr_code_suggestions.dual_publishing_score_threshold;
+        let commitable = settings.pr_code_suggestions.commitable_code_suggestions;
+        let gfm_supported = self.provider.is_supported("gfm_markdown");
 
-        if threshold > -1 {
-            // Dual publishing mode: inline high-scoring + table for all
-            let threshold_u32 = threshold.max(0) as u32;
-            let high_scoring: Vec<ParsedSuggestion> = suggestions
-                .iter()
-                .filter(|s| s.score >= threshold_u32)
-                .cloned()
-                .collect();
+        if !commitable && gfm_supported {
+            // Table mode (primary): publish the full summary table.
+            self.publish_table(suggestions, reflect_failed).await?;
 
-            if !high_scoring.is_empty() {
-                let code_suggestions = suggestions_to_code_suggestions(&high_scoring);
-                if !code_suggestions.is_empty() {
-                    match self
-                        .provider
-                        .publish_code_suggestions(&code_suggestions)
-                        .await
-                    {
-                        Ok(_) => {
-                            tracing::info!(
+            // Dual publishing is ADDITIVE on top of the table, and only when the
+            // threshold is strictly positive (a threshold of 0 means "off",
+            // matching Python's `> 0` gate). It never disables the table.
+            let threshold = settings.pr_code_suggestions.dual_publishing_score_threshold;
+            if threshold > 0 {
+                let threshold_u32 = threshold as u32;
+                // parse_suggestions already guarantees non-empty improved_code.
+                let above_threshold: Vec<ParsedSuggestion> = suggestions
+                    .iter()
+                    .filter(|s| s.score >= threshold_u32)
+                    .cloned()
+                    .collect();
+                if !above_threshold.is_empty() {
+                    let code_suggestions = suggestions_to_code_suggestions(&above_threshold);
+                    if !code_suggestions.is_empty() {
+                        match self
+                            .provider
+                            .publish_code_suggestions(&code_suggestions)
+                            .await
+                        {
+                            Ok(_) => tracing::info!(
                                 count = code_suggestions.len(),
                                 threshold = threshold_u32,
                                 "published inline suggestions (dual mode)"
-                            );
-                        }
-                        Err(e) => {
-                            tracing::warn!(error = %e, "failed to publish inline suggestions in dual mode");
+                            ),
+                            Err(e) => {
+                                tracing::warn!(error = %e, "failed to publish inline suggestions in dual mode")
+                            }
                         }
                     }
                 }
             }
-
-            // Always publish the full table as well
-            self.publish_table(suggestions, reflect_failed).await?;
-        } else if settings.pr_code_suggestions.commitable_code_suggestions {
-            // Inline-only mode
+        } else {
+            // Inline-only mode (committable, or GFM unsupported).
             let code_suggestions = suggestions_to_code_suggestions(suggestions);
             if code_suggestions.is_empty() {
                 tracing::warn!(
@@ -447,9 +454,6 @@ impl PRCodeSuggestions {
                     }
                 }
             }
-        } else {
-            // Table-only mode
-            self.publish_table(suggestions, reflect_failed).await?;
         }
 
         Ok(())
@@ -936,6 +940,107 @@ code_suggestions:
         assert!(
             reflect_call.image_urls.is_none(),
             "reflect pass should NOT include images"
+        );
+    }
+
+    // ── Publishing-mode tests (C7) ──────────────────────────────────
+
+    fn sample_suggestion(score: u32) -> ParsedSuggestion {
+        ParsedSuggestion {
+            label: "bug".into(),
+            relevant_file: "src/main.rs".into(),
+            relevant_lines_start: 10,
+            relevant_lines_end: 12,
+            existing_code: "old".into(),
+            improved_code: "new".into(),
+            one_sentence_summary: "Fix".into(),
+            suggestion_content: "Fix it".into(),
+            score,
+        }
+    }
+
+    fn publish_settings(extra: &[(&str, &str)]) -> Arc<Settings> {
+        let mut overrides = std::collections::HashMap::new();
+        overrides.insert("config.publish_output".into(), "true".into());
+        overrides.insert("config.publish_output_progress".into(), "false".into());
+        for (k, v) in extra {
+            overrides.insert((*k).into(), (*v).into());
+        }
+        Arc::new(crate::config::loader::load_settings(&overrides, None, None).unwrap())
+    }
+
+    #[tokio::test]
+    async fn test_publish_dual_mode_adds_inline_on_top_of_table() {
+        // C7: dual publishing is ADDITIVE — table AND inline (only high-scoring).
+        let provider = Arc::new(MockGitProvider::new());
+        let improver = PRCodeSuggestions::new(provider.clone());
+        let settings =
+            publish_settings(&[("pr_code_suggestions.dual_publishing_score_threshold", "50")]);
+
+        let suggestions = vec![sample_suggestion(80), sample_suggestion(20)];
+        with_settings(settings, improver.publish_suggestions(&suggestions, false))
+            .await
+            .unwrap();
+
+        let calls = provider.get_calls();
+        assert!(!calls.comments.is_empty(), "table must still be published");
+        assert_eq!(
+            calls.code_suggestions.len(),
+            1,
+            "inline suggestions must be published in dual mode"
+        );
+        assert_eq!(
+            calls.code_suggestions[0].len(),
+            1,
+            "only the suggestion scoring >= threshold goes inline"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_publish_threshold_zero_publishes_no_inline() {
+        // C7 (divergence #1): threshold 0 means OFF — table only, no inline.
+        let provider = Arc::new(MockGitProvider::new());
+        let improver = PRCodeSuggestions::new(provider.clone());
+        let settings =
+            publish_settings(&[("pr_code_suggestions.dual_publishing_score_threshold", "0")]);
+
+        let suggestions = vec![sample_suggestion(80)];
+        with_settings(settings, improver.publish_suggestions(&suggestions, false))
+            .await
+            .unwrap();
+
+        let calls = provider.get_calls();
+        assert!(!calls.comments.is_empty(), "table must be published");
+        assert!(
+            calls.code_suggestions.is_empty(),
+            "threshold 0 must NOT publish inline suggestions"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_publish_commitable_is_inline_only() {
+        // C7 (divergence #2): commitable mode is inline-only even with a dual
+        // threshold set — it must NOT publish a table.
+        let provider = Arc::new(MockGitProvider::new());
+        let improver = PRCodeSuggestions::new(provider.clone());
+        let settings = publish_settings(&[
+            ("pr_code_suggestions.commitable_code_suggestions", "true"),
+            ("pr_code_suggestions.dual_publishing_score_threshold", "50"),
+        ]);
+
+        let suggestions = vec![sample_suggestion(80)];
+        with_settings(settings, improver.publish_suggestions(&suggestions, false))
+            .await
+            .unwrap();
+
+        let calls = provider.get_calls();
+        assert!(
+            !calls.code_suggestions.is_empty(),
+            "commitable mode publishes inline"
+        );
+        assert!(
+            calls.comments.is_empty(),
+            "commitable mode must NOT publish a table"
         );
     }
 }
