@@ -191,47 +191,67 @@ pub fn extract_hunk_lines_from_patch(
 
     let mut full_hunk = format!("## File: '{}'\n\n", filename.trim());
     let mut selected = String::new();
-    let mut new_line: usize = 0;
-    let mut old_line: usize = 0;
+    let mut start1: usize = 0;
+    let mut size1: usize = 0;
+    let mut start2: usize = 0;
+    let mut size2: usize = 0;
+    let mut skip_hunk = false;
+    // Counter relative to the hunk start, incremented for every non-deleted
+    // line (matching Python's selected_lines_num).
+    let mut selected_lines_num: usize = 0;
 
     for line in patch.lines() {
-        if let Some(header) = HunkHeader::parse(line) {
-            full_hunk.push_str(&format!("{line}\n"));
-            new_line = header.start2;
-            old_line = header.start1;
+        if line.to_lowercase().contains("no newline at end of file") {
             continue;
         }
 
-        if line.starts_with('+') {
-            let formatted = format!("{new_line} {line}\n");
-            full_hunk.push_str(&formatted);
-            if !use_left && new_line >= line_start && new_line <= line_end {
-                selected.push_str(&formatted);
+        if let Some(header) = HunkHeader::parse(line) {
+            skip_hunk = false;
+            selected_lines_num = 0;
+            start1 = header.start1;
+            size1 = header.size1;
+            start2 = header.start2;
+            size2 = header.size2;
+
+            // Only include the hunk that contains the requested start line.
+            let in_range = if use_left {
+                start1 <= line_start && line_start <= start1 + size1
+            } else {
+                start2 <= line_start && line_start <= start2 + size2
+            };
+            if !in_range {
+                skip_hunk = true;
+                continue;
             }
-            new_line += 1;
-        } else if line.starts_with('-') {
-            let formatted = format!("{old_line} {line}\n");
-            full_hunk.push_str(&formatted);
-            if use_left && old_line >= line_start && old_line <= line_end {
-                selected.push_str(&formatted);
+
+            full_hunk.push_str(line);
+            full_hunk.push('\n');
+        } else if !skip_hunk {
+            // Lines are emitted RAW (with their -/+/space prefix), NOT prefixed
+            // with line numbers — the pr_line_questions template tells the model
+            // to read those change markers.
+            let in_selection = if use_left {
+                start1 <= selected_lines_num + start1 && selected_lines_num + start1 <= line_end
+            } else {
+                line_start <= start2 + selected_lines_num && start2 + selected_lines_num <= line_end
+            };
+            if in_selection {
+                selected.push_str(line);
+                selected.push('\n');
             }
-            old_line += 1;
-        } else {
-            // Context line
-            let formatted = format!("{new_line} {line}\n");
-            full_hunk.push_str(&formatted);
-            if !use_left && new_line >= line_start && new_line <= line_end {
-                selected.push_str(&formatted);
+            full_hunk.push_str(line);
+            full_hunk.push('\n');
+            if !line.starts_with('-') {
+                selected_lines_num += 1;
             }
-            if use_left && old_line >= line_start && old_line <= line_end {
-                selected.push_str(&format!("{old_line} {line}\n"));
-            }
-            new_line += 1;
-            old_line += 1;
         }
     }
 
-    (full_hunk, selected)
+    // rstrip (mirrors Python remove_trailing_chars).
+    (
+        full_hunk.trim_end().to_string(),
+        selected.trim_end().to_string(),
+    )
 }
 
 #[cfg(test)]
@@ -335,9 +355,44 @@ mod tests {
         let patch = "@@ -1,2 +1,2 @@\n context\n-old\n+new";
         let (full, selected) = extract_hunk_lines_from_patch(patch, "f.rs", 100, 200, "RIGHT");
 
-        // Full hunk should still be populated
+        // Full hunk still has the file header (the out-of-range hunk is skipped).
         assert!(!full.is_empty());
         // But selected lines should be empty (out of range)
         assert!(selected.is_empty());
+    }
+
+    #[test]
+    fn test_extract_hunk_lines_no_number_prefix() {
+        // C9: lines are emitted raw (with -/+/space), NOT prefixed with line
+        // numbers — matching what the pr_line_questions template expects.
+        let patch = "@@ -10,2 +10,2 @@\n context\n-old\n+new";
+        let (full, _selected) = extract_hunk_lines_from_patch(patch, "f.rs", 10, 11, "RIGHT");
+        assert!(
+            full.contains("\n+new"),
+            "added line should be raw: {full:?}"
+        );
+        assert!(
+            full.contains("\n context"),
+            "context should be raw: {full:?}"
+        );
+        assert!(
+            !full.contains("11 +new"),
+            "must not prefix line numbers: {full:?}"
+        );
+    }
+
+    #[test]
+    fn test_extract_hunk_lines_skips_out_of_range_hunk() {
+        // C9: only the hunk containing the requested line is included.
+        let patch = "@@ -1,1 +1,1 @@\n a\n@@ -50,1 +50,2 @@\n b\n+c";
+        let (full, _) = extract_hunk_lines_from_patch(patch, "f.rs", 50, 51, "RIGHT");
+        assert!(
+            full.contains("@@ -50,1 +50,2 @@"),
+            "in-range hunk included: {full:?}"
+        );
+        assert!(
+            !full.contains("@@ -1,1 +1,1 @@"),
+            "out-of-range hunk skipped: {full:?}"
+        );
     }
 }
