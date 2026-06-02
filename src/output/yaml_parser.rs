@@ -186,7 +186,15 @@ fn try_fix_yaml(
         return Some(data);
     }
 
-    // ── Fallback 11: Composite — fix indentation + quote bracket keys ──
+    // ── Fallback 11: Fix nested/indented list items ──
+    // When the AI returns a list of objects but indents subsequent items
+    // deeper than the first one (making them nested), unindent them.
+    if let Some(data) = fallback_fix_nested_list_items(text) {
+        tracing::info!("YAML parsed after fixing nested list items");
+        return Some(data);
+    }
+
+    // ── Fallback 12: Composite — fix indentation + quote bracket keys ──
     // When a response needs BOTH indent fixing AND bracket-key quoting,
     // neither individual fallback succeeds. Chain them together.
     if text.contains('[') {
@@ -197,7 +205,7 @@ fn try_fix_yaml(
         }
     }
 
-    // ── Fallback 12: Composite — fix orphan lines + quote bracket keys ──
+    // ── Fallback 13: Composite — fix orphan lines + quote bracket keys ──
     if text.contains('[') {
         let orphan_fixed = apply_fix_orphan_continuation_lines(text);
         if let Some(data) = fallback_quote_bracket_keys(&orphan_fixed) {
@@ -363,6 +371,11 @@ fn fallback_replace_tabs(text: &str) -> Option<serde_yaml_ng::Value> {
 static YAML_KEY_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^[a-zA-Z_][a-zA-Z0-9_]*\s*:").unwrap());
 
+/// Regex to detect a list item key (dash, spaces, word chars, colon).
+/// Captures: 1=indent before dash, 2=key name
+static LIST_ITEM_KEY_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^(\s*)-\s+([a-zA-Z0-9_]+):").unwrap());
+
 /// Fallback 7: Fix unindented block scalar content.
 ///
 /// When the AI returns `key: |\ncontent` without indenting the content,
@@ -527,6 +540,53 @@ fn fallback_quote_bracket_keys(text: &str) -> Option<serde_yaml_ng::Value> {
         }
     }
     if changed { try_parse(&result) } else { None }
+}
+
+/// Fallback 11: Fix nested/indented list items.
+///
+/// Detects when a list item `- key:` is indented deeper than a previous
+/// instance of `- key:`, suggesting the AI incorrectly indented a sibling item.
+fn fallback_fix_nested_list_items(text: &str) -> Option<serde_yaml_ng::Value> {
+    use std::collections::HashMap;
+    // Map key -> first seen indent
+    let mut key_indents: HashMap<String, usize> = HashMap::new();
+    let mut fixed = String::with_capacity(text.len());
+    let mut changed = false;
+
+    for (i, line) in text.lines().enumerate() {
+        if i > 0 {
+            fixed.push('\n');
+        }
+
+        if let Some(caps) = LIST_ITEM_KEY_RE.captures(line) {
+            let indent_str = caps.get(1).unwrap().as_str(); // spaces before -
+            let key = caps.get(2).unwrap().as_str();
+            let current_indent = indent_str.len();
+
+            // Check if we've seen this list item key before
+            if let Some(&first_indent) = key_indents.get(key) {
+                // Deeper than the first sibling → re-indent it back to match.
+                if current_indent > first_indent {
+                    // Leading spaces are ASCII, so current_indent is the byte
+                    // index where the `-` starts.
+                    let rest_of_line = &line[current_indent..];
+                    for _ in 0..first_indent {
+                        fixed.push(' ');
+                    }
+                    fixed.push_str(rest_of_line);
+                    changed = true;
+                    continue;
+                }
+            } else {
+                // First time seeing this list item key, record its indent
+                key_indents.insert(key.to_string(), current_indent);
+            }
+        }
+
+        fixed.push_str(line);
+    }
+
+    if changed { try_parse(&fixed) } else { None }
 }
 
 #[cfg(test)]
@@ -817,5 +877,85 @@ This will cause E2E tests to fail due to missing database migrations for the E2E
             content.contains("E2E tests"),
             "issue_content should contain the full text"
         );
+    }
+
+    #[test]
+    fn test_load_yaml_nested_list_indentation() {
+        // Real AI failure: a List[object] field (`can_be_split`) where the AI
+        // over-indents a *sibling* item's `- key:` deeper than the first one,
+        // making it look nested. No other fallback recovers this (verified by
+        // disabling Fallback 11), so it must round-trip to the CORRECT structure.
+        let yaml = r#"
+can_be_split:
+  - relevant_files:
+    - apps/web/src/app/(admin)/admin/clans/[id]/view/page.tsx
+    - apps/web/src/app/(admin)/admin/clans/page.tsx
+    title: |
+      Admin clans: separate view and edit actions
+    - relevant_files:
+      - apps/api/database/migrations/2026_02_10_232849_add_ai_model_to_ai_generation_runs_table.php
+"#;
+
+        // Direct parse must fail (otherwise the fallback isn't exercised).
+        assert!(
+            serde_yaml_ng::from_str::<serde_yaml_ng::Value>(yaml).is_err(),
+            "the malformed YAML should fail a direct parse"
+        );
+
+        let data = load_yaml(yaml, &[], "can_be_split", "can_be_split")
+            .expect("load_yaml should recover via the nested-list-items fallback");
+
+        let split = data["can_be_split"]
+            .as_sequence()
+            .expect("can_be_split should be a sequence");
+        assert_eq!(split.len(), 2, "the two siblings must be separate items");
+
+        // Item 0: two relevant_files + a title — proves the data is correct,
+        // not merely valid-but-mangled.
+        let files0: Vec<&str> = split[0]["relevant_files"]
+            .as_sequence()
+            .expect("item 0 relevant_files")
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert_eq!(
+            files0,
+            vec![
+                "apps/web/src/app/(admin)/admin/clans/[id]/view/page.tsx",
+                "apps/web/src/app/(admin)/admin/clans/page.tsx",
+            ]
+        );
+        assert!(
+            split[0]["title"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("Admin clans"),
+            "item 0 should keep its title"
+        );
+
+        // Item 1: a single relevant_file, no title.
+        let files1: Vec<&str> = split[1]["relevant_files"]
+            .as_sequence()
+            .expect("item 1 relevant_files")
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert_eq!(
+            files1,
+            vec![
+                "apps/api/database/migrations/2026_02_10_232849_add_ai_model_to_ai_generation_runs_table.php",
+            ]
+        );
+        assert!(split[1].get("title").is_none(), "item 1 has no title");
+    }
+
+    #[test]
+    fn test_nested_list_fix_is_noop_on_valid_yaml() {
+        // The fallback must not disturb already-valid YAML (it only fires when
+        // a sibling key is over-indented, returning None otherwise).
+        let valid = "can_be_split:\n  - relevant_files:\n      - a.rs\n    title: T1\n  - relevant_files:\n      - b.rs\n    title: T2\n";
+        // Valid YAML parses directly, so the fallback is never consulted; but
+        // the fallback itself must also report "no change" for it.
+        assert!(fallback_fix_nested_list_items(valid).is_none());
     }
 }
