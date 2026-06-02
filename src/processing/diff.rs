@@ -192,9 +192,7 @@ pub fn extract_hunk_lines_from_patch(
     let mut full_hunk = format!("## File: '{}'\n\n", filename.trim());
     let mut selected = String::new();
     let mut start1: usize = 0;
-    let mut size1: usize = 0;
     let mut start2: usize = 0;
-    let mut size2: usize = 0;
     let mut skip_hunk = false;
     // Counter relative to the hunk start, incremented for every non-deleted
     // line (matching Python's selected_lines_num).
@@ -209,15 +207,13 @@ pub fn extract_hunk_lines_from_patch(
             skip_hunk = false;
             selected_lines_num = 0;
             start1 = header.start1;
-            size1 = header.size1;
             start2 = header.start2;
-            size2 = header.size2;
 
             // Only include the hunk that contains the requested start line.
             let in_range = if use_left {
-                start1 <= line_start && line_start <= start1 + size1
+                start1 <= line_start && line_start <= start1 + header.size1
             } else {
-                start2 <= line_start && line_start <= start2 + size2
+                start2 <= line_start && line_start <= start2 + header.size2
             };
             if !in_range {
                 skip_hunk = true;
