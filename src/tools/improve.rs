@@ -94,7 +94,9 @@ impl PRCodeSuggestions {
         .await;
         let image_ref = image_urls.as_deref();
 
-        // 3. Process batches (parallel or sequential)
+        // 3. Process batches (parallel or sequential). Track whether any batch's
+        // self-review (reflect) pass failed, so the output can flag degraded scores.
+        let mut reflect_failed = false;
         let all_suggestions = if settings.pr_code_suggestions.parallel_calls && num_batches > 1 {
             let futures: Vec<_> = batches
                 .iter()
@@ -112,17 +114,17 @@ impl PRCodeSuggestions {
                 })
                 .collect();
             let results = join_all(futures).await;
-            results
-                .into_iter()
-                .enumerate()
-                .flat_map(|(i, r)| match r {
-                    Ok(s) => s,
-                    Err(e) => {
-                        tracing::error!(batch = i, error = %e, "batch failed");
-                        Vec::new()
+            let mut all = Vec::new();
+            for (i, r) in results.into_iter().enumerate() {
+                match r {
+                    Ok((suggestions, failed)) => {
+                        reflect_failed |= failed;
+                        all.extend(suggestions);
                     }
-                })
-                .collect::<Vec<_>>()
+                    Err(e) => tracing::error!(batch = i, error = %e, "batch failed"),
+                }
+            }
+            all
         } else {
             let mut all = Vec::new();
             for (i, batch) in batches.iter().enumerate() {
@@ -138,27 +140,33 @@ impl PRCodeSuggestions {
                     )
                     .await
                 {
-                    Ok(suggestions) => all.extend(suggestions),
+                    Ok((suggestions, failed)) => {
+                        reflect_failed |= failed;
+                        all.extend(suggestions);
+                    }
                     Err(e) => tracing::error!(batch = i, error = %e, "batch failed"),
                 }
             }
             all
         };
 
-        // 4. Filter by score threshold, sort, deduplicate
+        // 4. Filter by score threshold and sort (highest score first).
+        // score_threshold is at least 1, so `score >= score_threshold` already
+        // excludes zero-scored suggestions — no extra `> 0` check needed.
         let score_threshold = settings
             .pr_code_suggestions
             .suggestions_score_threshold
             .max(1);
         let mut suggestions: Vec<ParsedSuggestion> = all_suggestions
             .into_iter()
-            .filter(|s| s.score >= score_threshold && s.score > 0)
+            .filter(|s| s.score >= score_threshold)
             .collect();
         suggestions.sort_by(|a, b| b.score.cmp(&a.score));
 
         // 5. Format and publish
         if settings.config.publish_output {
-            self.publish_suggestions(&suggestions, false).await?;
+            self.publish_suggestions(&suggestions, reflect_failed)
+                .await?;
         } else {
             self.print_suggestions(&suggestions);
         }
@@ -179,7 +187,7 @@ impl PRCodeSuggestions {
         diff_with_lines: &str,
         batch_index: usize,
         image_urls: Option<&[String]>,
-    ) -> Result<Vec<ParsedSuggestion>, PrAgentError> {
+    ) -> Result<(Vec<ParsedSuggestion>, bool), PrAgentError> {
         let settings = get_settings();
 
         // 1. Build template variables
@@ -215,10 +223,12 @@ impl PRCodeSuggestions {
             .unwrap_or_default();
 
         if suggestions.is_empty() {
-            return Ok(suggestions);
+            return Ok((suggestions, false));
         }
 
-        // 5. Self-reflect pass (per-batch)
+        // 5. Self-reflect pass (per-batch). Report whether it failed so the
+        // caller can warn the user that scores are less reliable.
+        let mut reflect_failed = false;
         match self
             .self_reflect_on_suggestions(ai, model, &suggestions, diff_with_lines, &settings)
             .await
@@ -233,6 +243,7 @@ impl PRCodeSuggestions {
             }
             Err(e) => {
                 tracing::warn!(batch = batch_index, error = %e, "reflect pass failed, using default scores");
+                reflect_failed = true;
                 for s in &mut suggestions {
                     if s.score == 0 {
                         s.score = 7;
@@ -241,7 +252,7 @@ impl PRCodeSuggestions {
             }
         }
 
-        Ok(suggestions)
+        Ok((suggestions, reflect_failed))
     }
 
     /// Self-reflect on suggestions: second AI call to score and locate them.
@@ -987,6 +998,26 @@ code_suggestions:
             calls.code_suggestions[0].len(),
             1,
             "only the suggestion scoring >= threshold goes inline"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_publish_table_warns_on_reflect_failure() {
+        // C18: reflect_failed=true must surface the degraded-scoring note.
+        let provider = Arc::new(MockGitProvider::new());
+        let improver = PRCodeSuggestions::new(provider.clone());
+        let settings = publish_settings(&[]);
+
+        let suggestions = vec![sample_suggestion(80)];
+        with_settings(settings, improver.publish_suggestions(&suggestions, true))
+            .await
+            .unwrap();
+
+        let calls = provider.get_calls();
+        assert!(!calls.comments.is_empty());
+        assert!(
+            calls.comments[0].0.contains("less accurate"),
+            "table should warn that scoring is degraded when reflect failed"
         );
     }
 
