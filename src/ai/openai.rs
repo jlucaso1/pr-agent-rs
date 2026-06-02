@@ -8,7 +8,7 @@ use serde_json::json;
 use super::AiHandler;
 use super::token::{
     get_max_tokens_with_fallback, is_no_temperature_model, is_user_message_only_model,
-    uses_reasoning_effort,
+    normalize_reasoning_effort, uses_reasoning_effort,
 };
 use super::types::{ChatResponse, FinishReason, ModelCapabilities, Usage};
 use crate::config::loader::get_settings;
@@ -212,9 +212,7 @@ impl AiHandler for OpenAiCompatibleHandler {
         );
 
         let reasoning_effort = uses_reasoning_effort(model)
-            .then(|| &settings.config.reasoning_effort)
-            .filter(|e| !e.is_empty())
-            .cloned();
+            .then(|| normalize_reasoning_effort(&settings.config.reasoning_effort));
 
         ModelCapabilities {
             supports_system_message: !is_user_message_only_model(model),

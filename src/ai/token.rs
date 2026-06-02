@@ -273,6 +273,26 @@ pub fn uses_reasoning_effort(model: &str) -> bool {
     is_gpt5_reasoning_model(model) || supports_reasoning_effort(model)
 }
 
+/// Normalize a configured `reasoning_effort` to a valid value, falling back to
+/// `"medium"` (with a warning) for anything outside the accepted set. Mirrors
+/// the Python `ReasoningEffort` validation so an invalid config value is never
+/// sent to the API raw.
+pub fn normalize_reasoning_effort(value: &str) -> String {
+    const VALID: &[&str] = &["xhigh", "high", "medium", "low", "minimal"];
+    let v = value.trim().to_lowercase();
+    if VALID.contains(&v.as_str()) {
+        v
+    } else {
+        if !value.trim().is_empty() {
+            tracing::warn!(
+                value,
+                "invalid reasoning_effort in config, falling back to 'medium'"
+            );
+        }
+        "medium".to_string()
+    }
+}
+
 /// Check if a model requires streaming (e.g. some API providers require it).
 #[allow(dead_code)]
 pub fn requires_streaming(model: &str) -> bool {
@@ -389,5 +409,16 @@ mod tests {
         assert!(uses_reasoning_effort("gpt-5.2-2025-12-11"));
         assert!(uses_reasoning_effort("o3-mini"));
         assert!(!uses_reasoning_effort("gpt-4o"));
+    }
+
+    #[test]
+    fn test_normalize_reasoning_effort() {
+        // Valid values pass through (case/space-normalized).
+        assert_eq!(normalize_reasoning_effort("high"), "high");
+        assert_eq!(normalize_reasoning_effort(" Medium "), "medium");
+        assert_eq!(normalize_reasoning_effort("xhigh"), "xhigh");
+        // Invalid / empty fall back to medium.
+        assert_eq!(normalize_reasoning_effort("ultra"), "medium");
+        assert_eq!(normalize_reasoning_effort(""), "medium");
     }
 }
