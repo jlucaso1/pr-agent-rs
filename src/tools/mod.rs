@@ -50,19 +50,31 @@ impl PrMetadata {
         provider: &dyn GitProvider,
         settings: &Settings,
     ) -> Result<Self, PrAgentError> {
-        let (title, description) = provider.get_pr_description_full().await?;
-        let branch = provider.get_pr_branch().await?;
-        let commit_messages = provider.get_commit_messages().await?;
+        // These fetches are independent, so run them concurrently. Error
+        // handling is preserved per field: the first three propagate (`?`),
+        // the last two degrade to a default. best_practices still prefers the
+        // configured content and only fetches when it is empty.
+        let bp_from_config = !settings.best_practices.content.is_empty();
 
-        let best_practices = {
-            let bp = &settings.best_practices.content;
-            if !bp.is_empty() {
-                bp.clone()
-            } else {
-                provider.get_best_practices().await.unwrap_or_default()
-            }
-        };
-        let repo_metadata = provider.get_repo_metadata().await.unwrap_or_default();
+        let (desc_res, branch_res, commits_res, bp_res, repo_res) = tokio::join!(
+            provider.get_pr_description_full(),
+            provider.get_pr_branch(),
+            provider.get_commit_messages(),
+            async {
+                if bp_from_config {
+                    Ok(settings.best_practices.content.clone())
+                } else {
+                    provider.get_best_practices().await
+                }
+            },
+            provider.get_repo_metadata(),
+        );
+
+        let (title, description) = desc_res?;
+        let branch = branch_res?;
+        let commit_messages = commits_res?;
+        let best_practices = bp_res.unwrap_or_default();
+        let repo_metadata = repo_res.unwrap_or_default();
 
         Ok(Self {
             title,
@@ -463,6 +475,33 @@ mod tests {
     fn test_scoped_settings_none_when_nothing_to_scope() {
         // No overrides and no repo/global TOML → dispatch against ambient settings.
         assert!(build_scoped_settings(&HashMap::new(), None, None).is_none());
+    }
+
+    #[tokio::test]
+    async fn test_pr_metadata_fetch_populates_fields() {
+        // P2: the concurrent fetch still returns the correct fields.
+        use crate::testing::mock_git::MockGitProvider;
+        let provider = MockGitProvider::new().with_pr_description("My Title", "My Desc");
+        let settings = crate::config::loader::load_settings(&HashMap::new(), None, None).unwrap();
+
+        let meta = PrMetadata::fetch(&provider, &settings).await.unwrap();
+        assert_eq!(meta.title, "My Title");
+        assert_eq!(meta.description, "My Desc");
+        assert_eq!(meta.branch, "feature/test");
+    }
+
+    #[tokio::test]
+    async fn test_pr_metadata_prefers_configured_best_practices() {
+        // P2: the best_practices gate is preserved — configured content wins and
+        // the provider is not consulted for it.
+        use crate::testing::mock_git::MockGitProvider;
+        let provider = MockGitProvider::new();
+        let mut overrides = HashMap::new();
+        overrides.insert("best_practices.content".to_string(), "MY BP".to_string());
+        let settings = crate::config::loader::load_settings(&overrides, None, None).unwrap();
+
+        let meta = PrMetadata::fetch(&provider, &settings).await.unwrap();
+        assert_eq!(meta.best_practices, "MY BP");
     }
 
     #[test]
