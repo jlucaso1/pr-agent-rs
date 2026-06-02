@@ -47,21 +47,39 @@ pub fn convert_to_hunks_with_line_numbers(
     }
 
     let mut output = format!("## File: '{}'\n", filename.trim());
+    let lines: Vec<&str> = patch.lines().collect();
     let mut new_content = Vec::new();
     let mut old_content = Vec::new();
     let mut has_plus = false;
     let mut has_minus = false;
     let mut line_number: usize = 0;
+    // Raw `@@ ... @@` header of the hunk currently being accumulated. Emitted
+    // before the hunk's markers so the LLM keeps the section/function context.
+    let mut current_header: Option<String> = None;
 
-    for line in patch.lines() {
+    for (i, &line) in lines.iter().enumerate() {
+        // Skip "\ No newline at end of file" markers — they are not real
+        // content and would inflate line numbers.
+        if line.to_lowercase().contains("no newline at end of file") {
+            continue;
+        }
+
         if let Some(header) = HunkHeader::parse(line) {
-            // Flush previous hunk
-            flush_hunk(&mut output, &new_content, &old_content, has_plus, has_minus);
+            // Flush previous hunk (with its own header)
+            flush_hunk(
+                &mut output,
+                current_header.as_deref(),
+                &new_content,
+                &old_content,
+                has_plus,
+                has_minus,
+            );
             new_content.clear();
             old_content.clear();
             has_plus = false;
             has_minus = false;
             line_number = header.start2;
+            current_header = Some(line.to_string());
             continue;
         }
 
@@ -73,6 +91,15 @@ pub fn convert_to_hunks_with_line_numbers(
             has_minus = true;
             old_content.push(format!("{line}\n"));
         } else {
+            // Context line. Skip a blank line that directly precedes a hunk
+            // header or ends the patch — otherwise it inflates line numbers.
+            if line.is_empty() && i > 0 {
+                let next_is_header = lines.get(i + 1).is_some_and(|n| n.starts_with("@@"));
+                let is_last = i + 1 == lines.len();
+                if next_is_header || is_last {
+                    continue;
+                }
+            }
             // Context line — goes to both
             new_content.push(format!("{line_number} {line}\n"));
             old_content.push(format!("{line}\n"));
@@ -81,14 +108,23 @@ pub fn convert_to_hunks_with_line_numbers(
     }
 
     // Flush final hunk
-    flush_hunk(&mut output, &new_content, &old_content, has_plus, has_minus);
+    flush_hunk(
+        &mut output,
+        current_header.as_deref(),
+        &new_content,
+        &old_content,
+        has_plus,
+        has_minus,
+    );
 
     output
 }
 
-/// Write the hunk content to output with `__new hunk__` / `__old hunk__` markers.
+/// Write the hunk content to output: the raw `@@` header (when present),
+/// then `__new hunk__` / `__old hunk__` markers with their lines.
 fn flush_hunk(
     output: &mut String,
+    header: Option<&str>,
     new_content: &[String],
     old_content: &[String],
     has_plus: bool,
@@ -96,6 +132,11 @@ fn flush_hunk(
 ) {
     if new_content.is_empty() && old_content.is_empty() {
         return;
+    }
+
+    if let Some(h) = header {
+        output.push('\n');
+        output.push_str(h);
     }
 
     if has_plus || !has_minus {
@@ -223,6 +264,40 @@ mod tests {
     fn test_deleted_file() {
         let result = convert_to_hunks_with_line_numbers("src/main.rs", "", EditType::Deleted);
         assert!(result.contains("was deleted"));
+    }
+
+    #[test]
+    fn test_convert_emits_hunk_header() {
+        // C8: the @@ header (with section context) must be emitted before the hunk.
+        let patch = "@@ -10,3 +10,4 @@ fn main()\n context\n-removed\n+added\n+new line";
+        let result = convert_to_hunks_with_line_numbers("src/main.rs", patch, EditType::Modified);
+        assert!(
+            result.contains("@@ -10,3 +10,4 @@ fn main()"),
+            "should emit the hunk header with section context: {result}"
+        );
+    }
+
+    #[test]
+    fn test_convert_skips_no_newline_marker() {
+        // C10: the "\ No newline at end of file" marker is not content.
+        let patch = "@@ -1,2 +1,2 @@\n context\n-old\n+new\n\\ No newline at end of file";
+        let result = convert_to_hunks_with_line_numbers("f.rs", patch, EditType::Modified);
+        assert!(
+            !result.to_lowercase().contains("no newline"),
+            "no-newline marker should be skipped: {result}"
+        );
+    }
+
+    #[test]
+    fn test_convert_skips_trailing_blank_context_line() {
+        // C10: a blank context line ending the patch must not add a numbered
+        // empty line (which would misalign the line numbers the LLM references).
+        let patch = "@@ -1,1 +1,2 @@\n a\n+b\n\n";
+        let result = convert_to_hunks_with_line_numbers("f.rs", patch, EditType::Modified);
+        assert!(
+            !result.contains("3 \n"),
+            "trailing blank line should be skipped: {result:?}"
+        );
     }
 
     #[test]
