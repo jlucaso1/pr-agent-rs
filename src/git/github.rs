@@ -3,6 +3,7 @@ use std::fmt::Write;
 
 use async_trait::async_trait;
 use base64::Engine;
+use futures_util::stream::{self, StreamExt};
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use reqwest::Client;
 use serde::Serialize;
@@ -30,6 +31,17 @@ fn truncate_comment(text: &str) -> &str {
         end -= 1;
     }
     &text[..end]
+}
+
+/// Owned per-file metadata extracted from the compare API, used to fetch base
+/// and head blobs concurrently in `get_diff_files`.
+struct DiffFileMeta {
+    filename: String,
+    patch: String,
+    previous_filename: Option<String>,
+    edit_type: EditType,
+    plus_lines: i32,
+    minus_lines: i32,
 }
 
 /// JWT claims for GitHub App authentication.
@@ -418,58 +430,86 @@ impl GitProvider for GithubProvider {
         );
         let compare_data = self.api_get(&compare_path).await?;
 
-        let files = compare_data["files"]
+        // Extract owned metadata first, borrowing the files array directly (no
+        // deep clone of the JSON — addresses the previous `.cloned()`).
+        let empty = Vec::new();
+        let metas: Vec<DiffFileMeta> = compare_data["files"]
             .as_array()
-            .cloned()
-            .unwrap_or_default();
+            .unwrap_or(&empty)
+            .iter()
+            .map(|file| {
+                let filename = file["filename"].as_str().unwrap_or_default().to_string();
+                let status = file["status"].as_str().unwrap_or("modified");
+                let patch = file["patch"].as_str().unwrap_or_default().to_string();
+                let previous_filename = file["previous_filename"].as_str().map(String::from);
 
-        let mut diff_files = Vec::with_capacity(files.len());
-
-        for file in &files {
-            let filename = file["filename"].as_str().unwrap_or_default().to_string();
-            let status = file["status"].as_str().unwrap_or("modified");
-            let patch = file["patch"].as_str().unwrap_or_default().to_string();
-            let previous_filename = file["previous_filename"].as_str().map(String::from);
-
-            let edit_type = match status {
-                "added" => EditType::Added,
-                "removed" => EditType::Deleted,
-                "renamed" => EditType::Renamed,
-                "modified" | "changed" => EditType::Modified,
-                _ => EditType::Unknown,
-            };
-
-            let (plus_lines, minus_lines) = count_patch_lines(&patch);
-
-            let base_file = if edit_type != EditType::Added {
-                let ref_name = if edit_type == EditType::Renamed {
-                    previous_filename.as_deref().unwrap_or(&filename)
-                } else {
-                    &filename
+                let edit_type = match status {
+                    "added" => EditType::Added,
+                    "removed" => EditType::Deleted,
+                    "renamed" => EditType::Renamed,
+                    "modified" | "changed" => EditType::Modified,
+                    _ => EditType::Unknown,
                 };
-                self.get_file_content(ref_name, &base_sha)
-                    .await
-                    .unwrap_or_default()
-            } else {
-                String::new()
-            };
+                let (plus_lines, minus_lines) = count_patch_lines(&patch);
+                DiffFileMeta {
+                    filename,
+                    patch,
+                    previous_filename,
+                    edit_type,
+                    plus_lines,
+                    minus_lines,
+                }
+            })
+            .collect();
 
-            let head_file = if edit_type != EditType::Deleted {
-                self.get_file_content(&filename, &head_sha)
-                    .await
-                    .unwrap_or_default()
-            } else {
-                String::new()
-            };
+        // Fetch base + head content for each file concurrently. Each file's two
+        // blobs run in parallel via `tokio::join!`, and files are processed with
+        // bounded concurrency via `buffered` (which preserves input order, so the
+        // resulting diff order is stable) to avoid hammering GitHub's rate limits.
+        const CONTENT_FETCH_CONCURRENCY: usize = 8;
+        let base_sha = base_sha.as_str();
+        let head_sha = head_sha.as_str();
 
-            let mut info = FilePatchInfo::new(base_file, head_file, patch, filename);
-            info.edit_type = edit_type;
-            info.old_filename = previous_filename;
-            info.num_plus_lines = plus_lines;
-            info.num_minus_lines = minus_lines;
+        let diff_files: Vec<FilePatchInfo> = stream::iter(metas)
+            .map(|meta| async move {
+                // Ref to fetch for the base blob (None for an added file).
+                let base_ref = match meta.edit_type {
+                    EditType::Added => None,
+                    EditType::Renamed => Some(
+                        meta.previous_filename
+                            .clone()
+                            .unwrap_or_else(|| meta.filename.clone()),
+                    ),
+                    _ => Some(meta.filename.clone()),
+                };
 
-            diff_files.push(info);
-        }
+                let base_fut = async {
+                    match &base_ref {
+                        Some(r) => self.get_file_content(r, base_sha).await.unwrap_or_default(),
+                        None => String::new(),
+                    }
+                };
+                let head_fut = async {
+                    if meta.edit_type != EditType::Deleted {
+                        self.get_file_content(&meta.filename, head_sha)
+                            .await
+                            .unwrap_or_default()
+                    } else {
+                        String::new()
+                    }
+                };
+                let (base_file, head_file) = tokio::join!(base_fut, head_fut);
+
+                let mut info = FilePatchInfo::new(base_file, head_file, meta.patch, meta.filename);
+                info.edit_type = meta.edit_type;
+                info.old_filename = meta.previous_filename;
+                info.num_plus_lines = meta.plus_lines;
+                info.num_minus_lines = meta.minus_lines;
+                info
+            })
+            .buffered(CONTENT_FETCH_CONCURRENCY)
+            .collect()
+            .await;
 
         Ok(diff_files)
     }
