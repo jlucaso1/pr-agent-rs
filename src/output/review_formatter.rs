@@ -92,7 +92,7 @@ fn format_review_gfm(
                 format_ticket_compliance_row(section_emoji("Ticket compliance check"), value, out);
             }
             "todo_sections" => {
-                format_todo_sections_row(value, out);
+                format_todo_sections_row(value, out, link_gen);
             }
             // Skip internal fields that shouldn't be rendered
             "todo_summary" => {}
@@ -153,21 +153,89 @@ fn format_relevant_tests_row(value: &serde_yaml_ng::Value, out: &mut String) {
     }
 }
 
-/// Format todo sections as HTML table rows.
-fn format_todo_sections_row(value: &serde_yaml_ng::Value, out: &mut String) {
-    let text = yaml_value_to_string(value);
-
-    if is_value_no(&text) {
+/// Format the `todo_sections` row — `Union[List[TodoSection], str]`. When the
+/// PR has TODO comments the AI returns a list (each item: relevant_file,
+/// line_number, content); otherwise the string "No". Mirrors Python
+/// `format_todo_items`: render a capped `<ul>` of linked file refs. Without the
+/// list branch, `yaml_value_to_string` flattened the items into raw YAML.
+fn format_todo_sections_row(
+    value: &serde_yaml_ng::Value,
+    out: &mut String,
+    link_gen: Option<&LinkGenerator>,
+) {
+    // The "no todos" sentinel is the string "No" (or empty/null).
+    if value.as_sequence().is_none() && is_value_no(&yaml_value_to_string(value)) {
         let _ = writeln!(
             out,
             "<tr><td>✅&nbsp;<strong>No TODO sections</strong></td></tr>"
         );
+        return;
+    }
+
+    let emoji = section_emoji("Todo sections");
+    let _ = write!(
+        out,
+        "<tr><td>{emoji}&nbsp;<strong>TODO sections</strong>\n<br><br>\n"
+    );
+    out.push_str(&format_todo_items(value, link_gen));
+    out.push_str("</td></tr>\n");
+}
+
+/// Maximum TODO items to display (mirrors Python `MAX_ITEMS`).
+const MAX_TODO_ITEMS: usize = 5;
+
+/// Render the TODO items as a capped `<ul>` list (or a single `<p>` when the
+/// value is one item rather than a list). Mirrors Python `format_todo_items`.
+fn format_todo_items(value: &serde_yaml_ng::Value, link_gen: Option<&LinkGenerator>) -> String {
+    let mut out = String::new();
+    match value.as_sequence() {
+        Some(items) => {
+            out.push_str("<ul>\n");
+            for item in items.iter().take(MAX_TODO_ITEMS) {
+                let _ = writeln!(out, "<li>{}</li>", format_todo_item(item, link_gen));
+            }
+            out.push_str("</ul>\n");
+        }
+        None => {
+            let _ = writeln!(out, "<p>{}</p>", format_todo_item(value, link_gen));
+        }
+    }
+    out
+}
+
+/// Render one TODO item as `<a href=link>file [line]</a>: content`.
+/// Mirrors Python `format_todo_item`.
+fn format_todo_item(item: &serde_yaml_ng::Value, link_gen: Option<&LinkGenerator>) -> String {
+    let relevant_file = item
+        .get("relevant_file")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
+    let line_str = item
+        .get("line_number")
+        .map(yaml_value_to_string)
+        .unwrap_or_default();
+    let content = item
+        .get("content")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
+
+    let mut file_ref = format!("{relevant_file} [{line_str}]");
+    let line_num: i32 = line_str.parse().unwrap_or(0);
+    if !relevant_file.is_empty()
+        && let Some(link_fn) = link_gen
+    {
+        let link = link_fn(relevant_file, line_num, None);
+        if !link.is_empty() {
+            file_ref = format!("<a href='{link}'>{file_ref}</a>");
+        }
+    }
+
+    if content.is_empty() {
+        file_ref
     } else {
-        let emoji = section_emoji("Todo sections");
-        let _ = writeln!(
-            out,
-            "<tr><td>{emoji}&nbsp;<strong>TODO sections</strong><br><br>{text}</td></tr>"
-        );
+        format!("{file_ref}: {content}")
     }
 }
 
@@ -700,6 +768,52 @@ review:
         let result = format_review_markdown(&data, true, None);
         assert!(result.contains("No TODO sections"));
         assert!(!result.contains("todo_sections"));
+    }
+
+    #[test]
+    fn test_todo_sections_list_renders_items() {
+        // When require_todo_scan is on, the AI returns a List[TodoSection].
+        // It must render as a readable <ul>, not a flattened YAML blob.
+        let yaml_str = r#"
+review:
+  todo_sections:
+    - relevant_file: "src/auth.rs"
+      line_number: 42
+      content: "handle token refresh"
+    - relevant_file: "src/db.rs"
+      line_number: 7
+      content: "add migration"
+"#;
+        let data: serde_yaml_ng::Value = serde_yaml_ng::from_str(yaml_str).unwrap();
+        let result = format_review_markdown(&data, true, None);
+
+        assert!(result.contains("<strong>TODO sections</strong>"));
+        assert!(result.contains("<ul>"));
+        assert!(result.contains("src/auth.rs [42]: handle token refresh"));
+        assert!(result.contains("src/db.rs [7]: add migration"));
+        // Regression guard: no leaked raw YAML field names.
+        assert!(!result.contains("relevant_file:"), "leaked field: {result}");
+        assert!(!result.contains("line_number:"), "leaked field: {result}");
+    }
+
+    #[test]
+    fn test_todo_sections_list_caps_at_five() {
+        // More than MAX_TODO_ITEMS (5) items are truncated.
+        let mut yaml_str = String::from("review:\n  todo_sections:\n");
+        for i in 0..8 {
+            yaml_str.push_str(&format!(
+                "    - relevant_file: \"f{i}.rs\"\n      line_number: {i}\n      content: \"todo {i}\"\n"
+            ));
+        }
+        let data: serde_yaml_ng::Value = serde_yaml_ng::from_str(&yaml_str).unwrap();
+        let result = format_review_markdown(&data, true, None);
+        assert!(result.contains("todo 4"), "keeps first 5: {result}");
+        assert!(!result.contains("todo 5"), "drops the 6th item: {result}");
+        assert_eq!(
+            result.matches("<li>").count(),
+            5,
+            "exactly 5 items rendered"
+        );
     }
 
     #[test]
