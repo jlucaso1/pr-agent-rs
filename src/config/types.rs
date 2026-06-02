@@ -947,11 +947,23 @@ impl Default for PrFindSimilarComponentConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+#[derive(Clone, Deserialize, Serialize, Default)]
 #[serde(default)]
 pub struct PineconeConfig {
     pub api_key: String,
     pub environment: String,
+}
+
+// Manual Debug that redacts the api_key, so it can't leak if a parent struct
+// (Settings derives Debug) is ever debug-printed (C25). Uses the same redact()
+// helper as the openai/anthropic secrets.
+impl fmt::Debug for PineconeConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PineconeConfig")
+            .field("api_key", &redact(&self.api_key))
+            .field("environment", &self.environment)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -968,11 +980,21 @@ impl Default for LancedbConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+#[derive(Clone, Deserialize, Serialize, Default)]
 #[serde(default)]
 pub struct QdrantConfig {
     pub url: String,
     pub api_key: String,
+}
+
+// Manual Debug that redacts the api_key (C25).
+impl fmt::Debug for QdrantConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("QdrantConfig")
+            .field("url", &self.url)
+            .field("api_key", &redact(&self.api_key))
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -1115,5 +1137,34 @@ impl std::fmt::Debug for AnthropicSecrets {
         f.debug_struct("AnthropicSecrets")
             .field("key", &redact(&self.key))
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_secret_configs_redact_api_key_in_debug() {
+        // C25: api_key must not appear in Debug output.
+        let p = PineconeConfig {
+            api_key: "SECRET_PINECONE".into(),
+            environment: "prod".into(),
+        };
+        let dbg = format!("{p:?}");
+        assert!(
+            !dbg.contains("SECRET_PINECONE"),
+            "pinecone key leaked: {dbg}"
+        );
+        assert!(dbg.contains("REDACTED"));
+        assert!(dbg.contains("prod"), "non-secret field should remain");
+
+        let q = QdrantConfig {
+            url: "http://q".into(),
+            api_key: "SECRET_QDRANT".into(),
+        };
+        let dbg = format!("{q:?}");
+        assert!(!dbg.contains("SECRET_QDRANT"), "qdrant key leaked: {dbg}");
+        assert!(dbg.contains("http://q"));
     }
 }
