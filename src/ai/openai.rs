@@ -8,7 +8,7 @@ use serde_json::json;
 use super::AiHandler;
 use super::token::{
     get_max_tokens_with_fallback, is_no_temperature_model, is_user_message_only_model,
-    supports_reasoning_effort,
+    uses_reasoning_effort,
 };
 use super::types::{ChatResponse, FinishReason, ModelCapabilities, Usage};
 use crate::config::loader::get_settings;
@@ -106,7 +106,7 @@ impl OpenAiCompatibleHandler {
             body["temperature"] = json!(temp);
         }
 
-        // Reasoning effort (for o3/o4-mini models)
+        // Reasoning effort (GPT-5 family + o3/o4-mini models)
         if caps.reasoning_effort.is_some() {
             // When reasoning effort is set, remove temperature
             if let Some(obj) = body.as_object_mut() {
@@ -201,7 +201,7 @@ impl AiHandler for OpenAiCompatibleHandler {
         let settings = get_settings();
         let max_tokens = get_max_tokens_with_fallback(model, settings.config.max_model_tokens);
 
-        let reasoning_effort = supports_reasoning_effort(model)
+        let reasoning_effort = uses_reasoning_effort(model)
             .then(|| &settings.config.reasoning_effort)
             .filter(|e| !e.is_empty())
             .cloned();
@@ -345,6 +345,26 @@ mod tests {
         assert!(
             content.contains("user"),
             "combined message should include user text"
+        );
+    }
+
+    #[test]
+    fn test_build_request_body_gpt5_reasoning_effort() {
+        let handler = test_handler();
+        // The default config model is a GPT-5 model: it must receive
+        // `reasoning_effort` and must NOT receive `temperature`, mirroring the
+        // Python `thinking_kwargs_gpt5` branch (model.startswith('gpt-5')).
+        let body =
+            handler.build_request_body("gpt-5.2-2025-12-11", "sys", "user", Some(0.2), None);
+
+        assert!(
+            body.get("temperature").is_none(),
+            "gpt-5 models must not send temperature"
+        );
+        assert!(
+            body["reasoning_effort"].is_string(),
+            "gpt-5 models must send reasoning_effort, got: {:?}",
+            body.get("reasoning_effort")
         );
     }
 

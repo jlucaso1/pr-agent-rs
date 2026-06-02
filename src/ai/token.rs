@@ -206,6 +206,8 @@ pub fn is_user_message_only_model(model: &str) -> bool {
 }
 
 /// Check if a model supports the `reasoning_effort` parameter.
+///
+/// Mirrors the Python `SUPPORT_REASONING_EFFORT_MODELS` list (o3/o4 family).
 pub fn supports_reasoning_effort(model: &str) -> bool {
     let normalized = normalize_model_name(model);
 
@@ -218,6 +220,25 @@ pub fn supports_reasoning_effort(model: &str) -> bool {
             | "o4-mini"
             | "o4-mini-2025-04-16"
     )
+}
+
+/// Check if a model belongs to the GPT-5 family.
+///
+/// Mirrors the Python `if model.startswith('gpt-5')` branch
+/// (`thinking_kwargs_gpt5`): every GPT-5 model receives `reasoning_effort`
+/// and has `temperature` removed. This is a separate mechanism from the
+/// o3/o4 `SUPPORT_REASONING_EFFORT_MODELS` list — the default config model
+/// (`gpt-5.2-2025-12-11`) is in this family.
+pub fn is_gpt5_reasoning_model(model: &str) -> bool {
+    let normalized = normalize_model_name(model);
+    normalized.starts_with("gpt-5")
+}
+
+/// Check if a model uses the `reasoning_effort` parameter through any path
+/// (GPT-5 family or the o3/o4 list). When true, the request must include
+/// `reasoning_effort` and omit `temperature`.
+pub fn uses_reasoning_effort(model: &str) -> bool {
+    is_gpt5_reasoning_model(model) || supports_reasoning_effort(model)
 }
 
 /// Check if a model requires streaming (e.g. some API providers require it).
@@ -289,5 +310,22 @@ mod tests {
         assert!(!is_user_message_only_model("gpt-4o"));
         assert!(supports_reasoning_effort("o3-mini"));
         assert!(!supports_reasoning_effort("gpt-4o"));
+    }
+
+    #[test]
+    fn test_gpt5_family_uses_reasoning_effort() {
+        // GPT-5 family is detected regardless of provider prefix / suffix.
+        assert!(is_gpt5_reasoning_model("gpt-5.2-2025-12-11")); // default config model
+        assert!(is_gpt5_reasoning_model("openai/gpt-5.2-2025-12-11"));
+        assert!(is_gpt5_reasoning_model("gpt-5"));
+        assert!(is_gpt5_reasoning_model("gpt-5-mini"));
+        assert!(is_gpt5_reasoning_model("gpt-5.1-codex"));
+        assert!(!is_gpt5_reasoning_model("gpt-4o"));
+        assert!(!is_gpt5_reasoning_model("o3-mini"));
+
+        // `uses_reasoning_effort` unifies both paths (GPT-5 family + o3/o4 list).
+        assert!(uses_reasoning_effort("gpt-5.2-2025-12-11"));
+        assert!(uses_reasoning_effort("o3-mini"));
+        assert!(!uses_reasoning_effort("gpt-4o"));
     }
 }
