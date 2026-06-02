@@ -1,8 +1,15 @@
 use std::fmt::Write;
 
+use indexmap::IndexMap;
+
+use crate::git::capitalize_first;
 use crate::git::types::CodeSuggestion;
 use crate::output::markdown::persistent_comment_marker;
 use crate::output::yaml_parser::{yaml_str_field, yaml_value_as_i64, yaml_value_as_u64};
+
+/// A function that generates a link to a file range in the PR diff view.
+/// Parameters: (file, start_line, end_line) → URL string (possibly empty).
+pub type SuggestionLinkGen<'a> = dyn Fn(&str, i32, i32) -> String + 'a;
 
 /// A parsed code suggestion from the AI response.
 #[derive(Debug, Clone)]
@@ -16,6 +23,8 @@ pub struct ParsedSuggestion {
     pub one_sentence_summary: String,
     pub suggestion_content: String,
     pub score: u32,
+    /// Why the score was given (populated by the self-reflect pass).
+    pub score_why: String,
 }
 
 /// Parse code suggestions from the AI YAML response.
@@ -64,6 +73,7 @@ pub fn parse_suggestions(data: &serde_yaml_ng::Value) -> Vec<ParsedSuggestion> {
             one_sentence_summary,
             suggestion_content,
             score,
+            score_why: String::new(),
         });
     }
 
@@ -105,6 +115,7 @@ pub fn format_suggestions_table(
     suggestions: &[ParsedSuggestion],
     th_high: u32,
     th_medium: u32,
+    link_gen: &SuggestionLinkGen,
 ) -> String {
     let marker = persistent_comment_marker("improve");
     let mut out = String::with_capacity(4_000);
@@ -139,56 +150,112 @@ pub fn format_suggestions_table(
         let _ = writeln!(out);
     }
 
-    // Render code-level suggestions table
+    // Render code-level suggestions as a rich grouped HTML table: each row is a
+    // label group; each suggestion is a <details> with its diff (before/after),
+    // a link to the lines, and the reflect "Why". Mirrors the Python original.
     if !code_level.is_empty() {
         if !high_level.is_empty() {
             let _ = writeln!(out, "### Code Suggestions\n");
         }
 
-        let _ = writeln!(out, "| Category | Suggestion | Score |");
-        let _ = writeln!(out, "| --- | --- | --- |");
-
+        // Group by label; sort groups by their highest score, items within by score.
+        let mut groups: IndexMap<String, Vec<&ParsedSuggestion>> = IndexMap::new();
         for s in &code_level {
-            let importance = importance_label(s.score, th_high, th_medium);
-
-            let raw_summary = if s.one_sentence_summary.is_empty() {
-                &s.suggestion_content
-            } else {
-                &s.one_sentence_summary
-            };
-
-            // Truncate long summaries for table (char-safe)
-            let summary = if raw_summary.len() > 200 {
-                let end = raw_summary
-                    .char_indices()
-                    .take_while(|(i, _)| *i < 200)
-                    .last()
-                    .map(|(i, c)| i + c.len_utf8())
-                    .unwrap_or(200.min(raw_summary.len()));
-                format!("{}...", &raw_summary[..end])
-            } else {
-                raw_summary.to_string()
-            };
-
-            // Sanitize for markdown table: replace newlines and pipes
-            let summary = sanitize_table_cell(&summary);
-            let label = sanitize_table_cell(&s.label);
-            let file = sanitize_table_cell(&s.relevant_file);
-
-            // Format line range
-            let lines_str = if s.relevant_lines_start == s.relevant_lines_end {
-                format!(" [{}]", s.relevant_lines_start)
-            } else {
-                format!(" [{}-{}]", s.relevant_lines_start, s.relevant_lines_end)
-            };
-
-            let _ = writeln!(
-                out,
-                "| {label} | **{summary}**<br>`{file}`{lines_str} | {importance} |",
-            );
+            let label = s.label.trim().trim_matches(['\'', '"']).to_string();
+            groups.entry(label).or_default().push(s);
         }
+        let mut group_vec: Vec<(String, Vec<&ParsedSuggestion>)> = groups.into_iter().collect();
+        for (_, items) in group_vec.iter_mut() {
+            items.sort_by_key(|s| std::cmp::Reverse(s.score));
+        }
+        group_vec.sort_by_key(|(_, items)| {
+            std::cmp::Reverse(items.iter().map(|s| s.score).max().unwrap_or(0))
+        });
+
+        out.push_str("<table>");
+        let header = format!("Suggestion{}", "&nbsp; ".repeat(66));
+        let _ = write!(
+            out,
+            "<thead><tr><td><strong>Category</strong></td><td align=left><strong>{header}</strong></td><td align=center><strong>Impact</strong></td></tr>"
+        );
+        out.push_str("<tbody>");
+
+        for (label, items) in &group_vec {
+            let cap_label = capitalize_first(label);
+            let n = items.len();
+            let _ = writeln!(out, "<tr><td rowspan={n}>{cap_label}</td>");
+
+            for (i, s) in items.iter().enumerate() {
+                let range_str = if s.relevant_lines_start == s.relevant_lines_end {
+                    format!("[{}]", s.relevant_lines_start)
+                } else {
+                    format!("[{}-{}]", s.relevant_lines_start, s.relevant_lines_end)
+                };
+                let link = link_gen(
+                    &s.relevant_file,
+                    s.relevant_lines_start,
+                    s.relevant_lines_end,
+                );
+                let summary = if s.one_sentence_summary.is_empty() {
+                    s.suggestion_content.trim()
+                } else {
+                    s.one_sentence_summary.trim()
+                };
+                let file = s.relevant_file.trim();
+                let diff_block = code_diff_block(&s.existing_code, &s.improved_code);
+                let importance = importance_label(s.score, th_high, th_medium);
+
+                if i == 0 {
+                    out.push_str("<td>\n\n");
+                } else {
+                    out.push_str("<tr><td>\n\n");
+                }
+                // Only wrap the file reference in a link when the generator
+                // produced a URL; otherwise emit it as plain text (an empty
+                // `(...)` renders as a broken link).
+                let file_ref = if link.is_empty() {
+                    format!("{file} {range_str}")
+                } else {
+                    format!("[{file} {range_str}]({link})")
+                };
+                let _ = write!(out, "<details><summary>{summary}</summary>\n\n___\n\n");
+                let _ = write!(
+                    out,
+                    "**{}**\n\n{file_ref}\n\n{diff_block}\n",
+                    s.suggestion_content.trim()
+                );
+                if !s.score_why.is_empty() {
+                    let _ = write!(
+                        out,
+                        "<details><summary>Suggestion importance[1-10]: {}</summary>\n\n__\n\nWhy: {}\n\n</details>",
+                        s.score, s.score_why
+                    );
+                }
+                out.push_str("</details>");
+                let _ = write!(out, "</td><td align=center>{importance}\n\n</td></tr>");
+            }
+        }
+        out.push_str("</tbody></table>");
     }
 
+    out
+}
+
+/// Render a ```diff block showing the change from `existing` to `improved`.
+fn code_diff_block(existing: &str, improved: &str) -> String {
+    let diff = similar::TextDiff::from_lines(existing.trim_end(), improved.trim_end());
+    let mut out = String::from("```diff\n");
+    for change in diff.iter_all_changes() {
+        let sign = match change.tag() {
+            similar::ChangeTag::Delete => '-',
+            similar::ChangeTag::Insert => '+',
+            similar::ChangeTag::Equal => ' ',
+        };
+        out.push(sign);
+        out.push_str(change.value().trim_end_matches('\n'));
+        out.push('\n');
+    }
+    out.push_str("```");
     out
 }
 
@@ -279,6 +346,7 @@ code_suggestions:
             one_sentence_summary: "Fix bug".into(),
             suggestion_content: "Fix the bug".into(),
             score: 8,
+            score_why: String::new(),
         }];
 
         let code_suggestions = suggestions_to_code_suggestions(&suggestions);
@@ -299,9 +367,11 @@ code_suggestions:
             one_sentence_summary: "Improve performance".into(),
             suggestion_content: "Use a better algorithm".into(),
             score: 7,
+            score_why: String::new(),
         }];
 
-        let result = format_suggestions_table(&suggestions, 9, 7);
+        let result =
+            format_suggestions_table(&suggestions, 9, 7, &|_: &str, _: i32, _: i32| String::new());
         assert!(result.contains("PR Code Suggestions"));
         assert!(result.contains("<!-- pr-agent:improve -->"));
         assert!(result.contains("Improve performance"));
@@ -310,7 +380,7 @@ code_suggestions:
 
     #[test]
     fn test_format_suggestions_table_empty() {
-        let result = format_suggestions_table(&[], 9, 7);
+        let result = format_suggestions_table(&[], 9, 7, &|_: &str, _: i32, _: i32| String::new());
         assert!(result.contains("No code suggestions found"));
     }
 
@@ -326,9 +396,11 @@ code_suggestions:
             one_sentence_summary: "Fix issue".into(),
             suggestion_content: "Fix".into(),
             score: 5,
+            score_why: String::new(),
         }];
 
-        let result = format_suggestions_table(&suggestions, 9, 7);
+        let result =
+            format_suggestions_table(&suggestions, 9, 7, &|_: &str, _: i32, _: i32| String::new());
         // Should appear in high-level section, not in table
         assert!(result.contains("Architecture & Design"));
         assert!(result.contains("[Minor] Fix issue"));
@@ -350,6 +422,7 @@ code_suggestions:
                 one_sentence_summary: "Consider splitting module".into(),
                 suggestion_content: "Split".into(),
                 score: 8,
+                score_why: String::new(),
             },
             ParsedSuggestion {
                 label: "bug".into(),
@@ -361,18 +434,57 @@ code_suggestions:
                 one_sentence_summary: "Fix null check".into(),
                 suggestion_content: "Add null check".into(),
                 score: 9,
+                score_why: String::new(),
             },
         ];
 
-        let result = format_suggestions_table(&suggestions, 9, 7);
+        let result =
+            format_suggestions_table(&suggestions, 9, 7, &|_: &str, _: i32, _: i32| String::new());
         // Both sections present
         assert!(result.contains("Architecture & Design"));
         assert!(result.contains("Code Suggestions"));
         // High-level in bullet list
         assert!(result.contains("[Important] Consider splitting module"));
-        // Code-level in table
-        assert!(result.contains("| bug |"));
+        // Code-level in the rich HTML table: capitalized label, range, diff block.
+        assert!(result.contains("<table>"));
+        assert!(result.contains(">Bug</td>"));
         assert!(result.contains("[10-15]"));
+        assert!(result.contains("```diff"));
+    }
+
+    #[test]
+    fn test_format_suggestions_table_rich_features() {
+        let suggestions = vec![ParsedSuggestion {
+            label: "bug".into(),
+            relevant_file: "src/main.rs".into(),
+            relevant_lines_start: 10,
+            relevant_lines_end: 12,
+            existing_code: "let x = 1;\nlet y = 2;".into(),
+            improved_code: "let x = 1;\nlet y = 3;".into(),
+            one_sentence_summary: "Fix the value".into(),
+            suggestion_content: "Change y to 3".into(),
+            score: 8,
+            score_why: "Avoids a subtle bug".into(),
+        }];
+        let link_gen = |file: &str, s: i32, e: i32| format!("https://gh/{file}#L{s}-L{e}");
+        let result = format_suggestions_table(&suggestions, 9, 7, &link_gen);
+
+        // Collapsible summary + before/after diff.
+        assert!(result.contains("<details><summary>Fix the value</summary>"));
+        assert!(result.contains("```diff"));
+        assert!(
+            result.contains("-let y = 2;"),
+            "diff shows the removed line: {result}"
+        );
+        assert!(result.contains("+let y = 3;"), "diff shows the added line");
+        assert!(
+            result.contains(" let x = 1;"),
+            "diff keeps the context line"
+        );
+        // Line link.
+        assert!(result.contains("https://gh/src/main.rs#L10-L12"));
+        // Reflect "Why".
+        assert!(result.contains("Why: Avoids a subtle bug"));
     }
 
     #[test]
@@ -387,9 +499,11 @@ code_suggestions:
             one_sentence_summary: "Fix".into(),
             suggestion_content: "Fix".into(),
             score: 8,
+            score_why: String::new(),
         }];
 
-        let result = format_suggestions_table(&suggestions, 9, 7);
+        let result =
+            format_suggestions_table(&suggestions, 9, 7, &|_: &str, _: i32, _: i32| String::new());
         assert!(result.contains("[42]"));
         assert!(!result.contains("[42-42]"));
     }
@@ -406,16 +520,26 @@ code_suggestions:
             one_sentence_summary: "Summary with\nnewline".into(),
             suggestion_content: "Content".into(),
             score: 6,
+            score_why: String::new(),
         }];
 
-        let result = format_suggestions_table(&suggestions, 9, 7);
-        // Table rows should not have raw newlines within cells
-        for line in result.lines() {
-            if line.starts_with("| ") && line.contains("Summary") {
-                // This line is a table row — must not split across lines
-                assert!(line.ends_with(" |") || line.ends_with(" |"));
-            }
-        }
+        let result =
+            format_suggestions_table(&suggestions, 9, 7, &|_: &str, _: i32, _: i32| String::new());
+        // Code-level suggestions now render as an HTML <table>, not markdown rows.
+        assert!(
+            result.contains("<table>"),
+            "renders an HTML table: {result}"
+        );
+        assert!(result.contains("<td"), "has table cells: {result}");
+        assert!(
+            result.contains("<details><summary>"),
+            "suggestion is a collapsible details block: {result}"
+        );
+        // The empty link generator must not leave a broken markdown link.
+        assert!(
+            !result.contains("]()"),
+            "no empty link emitted when link_gen returns empty: {result}"
+        );
     }
 
     #[test]

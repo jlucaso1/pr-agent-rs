@@ -71,6 +71,44 @@ enable_pr_diagram = true
 num_code_suggestions = 4
 ```
 
+## GitHub Action
+
+Run pr-agent-rs directly from a workflow — no server, webhook, or GitHub App
+required. On every opened/reopened PR it runs describe, review, and improve;
+`/`-commands in PR comments (e.g. `/ask`, `/improve`) are also handled.
+
+Add `.github/workflows/pr-agent.yml` to your repo:
+
+```yaml
+name: pr-agent
+on:
+  pull_request:
+    types: [opened, reopened, ready_for_review]
+  issue_comment:
+    types: [created]
+  pull_request_review_comment:
+    types: [created]
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+jobs:
+  pr-agent:
+    runs-on: ubuntu-latest
+    steps:
+      # Pin to a released tag or commit SHA in production instead of @main.
+      - uses: jlucaso1/pr-agent-rs@main
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          # Any setting can be overridden via SECTION.KEY env vars, e.g.:
+          # CONFIG.MODEL: "openai/gpt-4o"
+```
+
+The Action reads the triggering event from `GITHUB_EVENT_PATH` and uses
+`GITHUB_TOKEN` for API calls (user-token auth, no App needed). Locally the same
+path runs via `pr-agent-rs github-action`.
+
 ## GitHub App Setup
 
 1. Create a GitHub App with the following permissions:

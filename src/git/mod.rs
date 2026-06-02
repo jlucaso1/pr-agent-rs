@@ -224,4 +224,13 @@ pub trait GitProvider: Send + Sync {
     async fn get_issue_body(&self, _issue_number: u64) -> Result<(String, String), PrAgentError> {
         Err(PrAgentError::Unsupported("get_issue_body".into()))
     }
+
+    /// Fetch an issue's `(title, body, labels)` by issue number (for ticket
+    /// compliance). Labels are the label names.
+    async fn get_issue(
+        &self,
+        _issue_number: u64,
+    ) -> Result<(String, String, Vec<String>), PrAgentError> {
+        Err(PrAgentError::Unsupported("get_issue".into()))
+    }
 }

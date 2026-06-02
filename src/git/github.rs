@@ -302,6 +302,19 @@ impl GithubProvider {
         resp.json().await.map_err(PrAgentError::Http)
     }
 
+    /// Make an authenticated PUT request.
+    async fn api_put(
+        &self,
+        path: &str,
+        body: &serde_json::Value,
+    ) -> Result<serde_json::Value, PrAgentError> {
+        let resp = self
+            .api_request_with_retry(reqwest::Method::PUT, path, Some(body))
+            .await?;
+        let resp = Self::check_response(resp, "PUT").await?;
+        resp.json().await.map_err(PrAgentError::Http)
+    }
+
     /// Make an authenticated DELETE request.
     async fn api_delete(&self, path: &str) -> Result<(), PrAgentError> {
         let resp = self
@@ -802,7 +815,10 @@ impl GitProvider for GithubProvider {
             "repos/{}/issues/{}/labels",
             self.repo_full, self.parsed.pr_number
         );
-        self.api_post(&path, &json!({"labels": labels})).await?;
+        // PUT replaces the full label set (vs POST which only adds). Callers
+        // are expected to have merged in any user labels to preserve, so stale
+        // AI-generated labels get cleared instead of accumulating.
+        self.api_put(&path, &json!({"labels": labels})).await?;
         Ok(())
     }
 
@@ -1047,6 +1063,33 @@ impl GitProvider for GithubProvider {
         let title = data["title"].as_str().unwrap_or_default().to_string();
         let body = data["body"].as_str().unwrap_or_default().to_string();
         Ok((title, body))
+    }
+
+    async fn get_issue(
+        &self,
+        issue_number: u64,
+    ) -> Result<(String, String, Vec<String>), PrAgentError> {
+        let path = format!("repos/{}/issues/{}", self.repo_full, issue_number);
+        let data = self.api_get(&path).await?;
+        // The /issues endpoint also returns pull requests (GitHub models PRs as
+        // issues). A linked PR is not a ticket, so reject it — callers treat the
+        // error as "skip this reference".
+        if data.get("pull_request").is_some() {
+            return Err(PrAgentError::Other(format!(
+                "#{issue_number} is a pull request, not an issue"
+            )));
+        }
+        let title = data["title"].as_str().unwrap_or_default().to_string();
+        let body = data["body"].as_str().unwrap_or_default().to_string();
+        let labels = data["labels"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|l| l["name"].as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok((title, body, labels))
     }
 
     async fn auto_approve(&self) -> Result<bool, PrAgentError> {

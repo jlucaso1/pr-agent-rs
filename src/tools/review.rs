@@ -74,7 +74,21 @@ impl PRReviewer {
         );
 
         // 3. Build template variables
-        let vars = self.build_vars(&meta, &diff_result.diff, num_files);
+        let mut vars = self.build_vars(&meta, &diff_result.diff, num_files);
+
+        // Ticket compliance: populate related_tickets from linked GitHub issues
+        // so the (already-ported) ticket-analysis prompt blocks light up.
+        if settings.pr_reviewer.require_ticket_analysis_review {
+            let tickets = super::fetch_related_tickets(
+                self.provider.as_ref(),
+                &meta.description,
+                self.provider.get_pr_number(),
+            )
+            .await;
+            if !tickets.is_empty() {
+                vars.insert("related_tickets".into(), Value::from(tickets));
+            }
+        }
 
         // 4. Render prompt
         let rendered = render_prompt(&settings.pr_review_prompt, vars)?;
@@ -183,7 +197,9 @@ impl PRReviewer {
         vars.insert("answer_str".into(), Value::from(""));
         vars.insert(
             "extra_instructions".into(),
-            Value::from(settings.pr_reviewer.extra_instructions.as_str()),
+            Value::from(super::with_response_language(
+                &settings.pr_reviewer.extra_instructions,
+            )),
         );
         insert_custom_labels_vars(&mut vars, &settings);
         vars.insert("is_ai_metadata".into(), Value::from(false));
@@ -219,6 +235,18 @@ impl PRReviewer {
                 format!("## PR Reviewer Guide 🔍\n\n{}\n", raw_response)
             }
         };
+
+        // Suppress the comment on a clean PR when configured: skip only when
+        // publish_output_no_suggestions is false AND the review found no major
+        // issues (mirrors the Python original).
+        if !settings.pr_reviewer.publish_output_no_suggestions
+            && markdown.contains("No major issues detected")
+        {
+            tracing::info!(
+                "review found no major issues; not publishing (publish_output_no_suggestions=false)"
+            );
+            return Ok(());
+        }
 
         publish_as_comment(
             self.provider.as_ref(),
@@ -264,9 +292,38 @@ impl PRReviewer {
             }
         }
 
-        if !labels.is_empty() {
-            tracing::info!(?labels, "publishing review labels");
-            self.provider.publish_labels(&labels).await?;
+        // publish_labels replaces the entire label set, so merge in the labels
+        // already on the PR — minus any previously-generated review labels
+        // (effort / security), which we re-derive each run. A failed read must
+        // NOT be treated as "no labels": that would wipe the user's labels, so
+        // skip publishing on error instead.
+        let current = match self.provider.get_pr_labels().await {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to read current labels; skipping review label publish");
+                return Ok(());
+            }
+        };
+        // Match only the exact labels this tool emits, so a user label that
+        // merely mentions "security concern" isn't dropped.
+        let current_filtered: Vec<String> = current
+            .iter()
+            .filter(|l| {
+                let lower = l.to_lowercase();
+                !lower.starts_with("review effort") && lower != "security concern"
+            })
+            .cloned()
+            .collect();
+
+        let mut new_labels = labels.clone();
+        new_labels.extend(current_filtered);
+
+        let cur_set: std::collections::BTreeSet<&String> = current.iter().collect();
+        let new_set: std::collections::BTreeSet<&String> = new_labels.iter().collect();
+
+        if (!current.is_empty() || !labels.is_empty()) && new_set != cur_set {
+            tracing::info!(?new_labels, "publishing review labels");
+            self.provider.publish_labels(&new_labels).await?;
         }
 
         Ok(())
@@ -300,6 +357,65 @@ mod tests {
             crate::config::loader::load_settings(&overrides, None, None)
                 .expect("should load test settings"),
         )
+    }
+
+    #[tokio::test]
+    async fn test_review_includes_related_tickets() {
+        // A linked issue (#42) must be fetched and fed to the model (ticket
+        // compliance), lighting up the previously-dead related_tickets blocks.
+        let provider = Arc::new(
+            MockGitProvider::new()
+                .with_diff_files(vec![sample_diff_file("src/main.rs", SAMPLE_PATCH)])
+                .with_pr_description("Title", "Implements the feature. Closes #42")
+                .with_issue_body(42, "Add dark mode", "Users want a dark theme toggle"),
+        );
+        let ai = Arc::new(MockAiHandler::new(REVIEW_YAML));
+        let reviewer = PRReviewer::new_with_ai(provider.clone(), ai.clone());
+
+        with_settings(test_settings(), reviewer.run())
+            .await
+            .unwrap();
+
+        let calls = ai.get_recorded_calls();
+        assert_eq!(calls.len(), 1);
+        let user = &calls[0].user;
+        assert!(
+            user.contains("Add dark mode"),
+            "the linked ticket title must reach the prompt"
+        );
+        assert!(
+            user.contains("issues/42"),
+            "the ticket URL must reach the prompt"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_review_skips_publish_on_clean_pr() {
+        // publish_output_no_suggestions=false + a review with no issues → no comment.
+        let provider = Arc::new(
+            MockGitProvider::new()
+                .with_diff_files(vec![sample_diff_file("src/main.rs", SAMPLE_PATCH)]),
+        );
+        let ai = Arc::new(MockAiHandler::new(
+            "```yaml\nreview:\n  key_issues_to_review: []\n```",
+        ));
+        let reviewer = PRReviewer::new_with_ai(provider.clone(), ai);
+
+        let mut overrides = std::collections::HashMap::new();
+        overrides.insert("config.publish_output".into(), "true".into());
+        overrides.insert("config.publish_output_progress".into(), "false".into());
+        overrides.insert(
+            "pr_reviewer.publish_output_no_suggestions".into(),
+            "false".into(),
+        );
+        let settings =
+            Arc::new(crate::config::loader::load_settings(&overrides, None, None).unwrap());
+        with_settings(settings, reviewer.run()).await.unwrap();
+
+        assert!(
+            provider.get_calls().comments.is_empty(),
+            "a clean PR with the flag off must not publish a review comment"
+        );
     }
 
     #[tokio::test]
@@ -383,6 +499,52 @@ mod tests {
         assert!(
             labels.iter().any(|l| l.contains("Review effort")),
             "should include effort score label"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_review_preserves_user_labels_and_replaces_stale_review_labels() {
+        let provider = Arc::new(
+            MockGitProvider::new()
+                .with_diff_files(vec![sample_diff_file("src/main.rs", SAMPLE_PATCH)])
+                // A user label to preserve + a stale review label to drop.
+                .with_existing_labels(vec![
+                    "needs-review".to_string(),
+                    "Review effort [1-5]: 1".to_string(),
+                ]),
+        );
+        let ai = Arc::new(MockAiHandler::new(REVIEW_YAML));
+        let reviewer = PRReviewer::new_with_ai(provider.clone(), ai);
+
+        let mut overrides = std::collections::HashMap::new();
+        overrides.insert("config.publish_output".into(), "true".into());
+        overrides.insert("config.publish_output_progress".into(), "false".into());
+        overrides.insert(
+            "pr_reviewer.enable_review_labels_effort".into(),
+            "true".into(),
+        );
+        let settings =
+            Arc::new(crate::config::loader::load_settings(&overrides, None, None).unwrap());
+
+        with_settings(settings, reviewer.run()).await.unwrap();
+
+        let calls = provider.get_calls();
+        assert!(!calls.labels.is_empty(), "should publish merged labels");
+        let labels = &calls.labels[0];
+        // User label preserved.
+        assert!(
+            labels.contains(&"needs-review".to_string()),
+            "user label must be preserved: {labels:?}"
+        );
+        // The freshly-computed review effort label is present...
+        assert!(
+            labels.iter().any(|l| l.contains("Review effort")),
+            "fresh effort label present: {labels:?}"
+        );
+        // ...but the stale one (effort 1) is not duplicated/kept.
+        assert!(
+            !labels.contains(&"Review effort [1-5]: 1".to_string()),
+            "stale review label must be replaced: {labels:?}"
         );
     }
 

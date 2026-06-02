@@ -44,6 +44,9 @@ regex = "1"
 # HTTP
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
 
+# Text diffing (for the rich code-suggestion table)
+similar = "2"
+
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

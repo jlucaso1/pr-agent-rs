@@ -48,7 +48,8 @@ impl PRDescription {
 
     async fn run_inner(&self) -> Result<(), PrAgentError> {
         let settings = get_settings();
-        let model = &settings.config.model;
+        let model = super::select_model(super::ModelKind::Weak);
+        let model = model.as_str();
 
         // 1. Fetch PR metadata
         let meta = PrMetadata::fetch(self.provider.as_ref(), &settings).await?;
@@ -110,7 +111,16 @@ impl PRDescription {
         );
 
         // 6. Parse YAML from response
-        let yaml_data = load_yaml(&response.content, &[], "type", "pr_files");
+        let mut yaml_data = load_yaml(&response.content, &[], "type", "pr_files");
+
+        // 6b. Extend the file walkthrough with diff files the model didn't list
+        // (large PRs otherwise truncate the table silently).
+        if settings.pr_description.enable_semantic_files_types
+            && let Some(data) = yaml_data.as_mut()
+        {
+            let diff_filenames: Vec<&str> = files.iter().map(|f| f.filename.as_str()).collect();
+            extend_uncovered_files(data, &diff_filenames);
+        }
 
         // 7. Format and publish
         // Strip any previous pr-agent:describe content from original body
@@ -144,7 +154,9 @@ impl PRDescription {
         // Describe-specific variables
         vars.insert(
             "extra_instructions".into(),
-            Value::from(settings.pr_description.extra_instructions.as_str()),
+            Value::from(super::with_response_language(
+                &settings.pr_description.extra_instructions,
+            )),
         );
         insert_custom_labels_vars(&mut vars, &settings);
         vars.insert(
@@ -212,9 +224,29 @@ impl PRDescription {
                 .await?;
         }
 
-        // Publish labels if enabled
+        // Publish labels if enabled. publish_labels replaces the entire label
+        // set, so preserve user-applied labels (those not in the standard or
+        // custom set) and only write when the merged set actually differs.
         if settings.pr_description.publish_labels && !output.labels.is_empty() {
-            self.provider.publish_labels(&output.labels).await?;
+            // publish_labels replaces the full set, so a failed read of the
+            // current labels must NOT be treated as "no labels" — that would
+            // wipe the user's labels. Skip publishing on a read error instead.
+            match self.provider.get_pr_labels().await {
+                Ok(current) => {
+                    let user_labels = super::get_user_labels(&current, &settings);
+                    let mut new_labels = output.labels.clone();
+                    new_labels.extend(user_labels);
+
+                    let cur_set: std::collections::BTreeSet<&String> = current.iter().collect();
+                    let new_set: std::collections::BTreeSet<&String> = new_labels.iter().collect();
+                    if new_set != cur_set {
+                        self.provider.publish_labels(&new_labels).await?;
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "failed to read current labels; skipping label publish");
+                }
+            }
         }
 
         Ok(())
@@ -308,6 +340,63 @@ fn strip_pr_agent_content(body: &str) -> String {
         // Body is generated but has no user description section → return empty
         String::new()
     }
+}
+
+/// Append diff files the model didn't include in `pr_files` so the File
+/// Walkthrough lists every changed file (capped). Mirrors the Python
+/// `extend_uncovered_files`.
+fn extend_uncovered_files(data: &mut serde_yaml_ng::Value, diff_filenames: &[&str]) {
+    use serde_yaml_ng::Value;
+    const MAX_EXTRA_FILES: usize = 100;
+
+    let predicted: std::collections::HashSet<String> = data
+        .get("pr_files")
+        .and_then(|v| v.as_sequence())
+        .map(|seq| {
+            seq.iter()
+                .filter_map(|f| f.get("filename").and_then(|n| n.as_str()))
+                .map(|s| s.trim().to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let mut extra: Vec<Value> = Vec::new();
+    let mut count = 0usize;
+    for &filename in diff_filenames {
+        if predicted.contains(filename) {
+            continue;
+        }
+        count += 1;
+        if count > MAX_EXTRA_FILES {
+            extra.push(extra_file_entry("Additional files not shown"));
+            break;
+        }
+        extra.push(extra_file_entry(filename));
+    }
+
+    if extra.is_empty() {
+        return;
+    }
+
+    if let Some(map) = data.as_mapping_mut() {
+        let key = Value::from("pr_files");
+        match map.get_mut(&key).and_then(|v| v.as_sequence_mut()) {
+            Some(seq) => seq.extend(extra),
+            None => {
+                map.insert(key, Value::Sequence(extra));
+            }
+        }
+    }
+}
+
+/// Build a placeholder `pr_files` entry for a file the model didn't summarize.
+fn extra_file_entry(filename: &str) -> serde_yaml_ng::Value {
+    use serde_yaml_ng::{Mapping, Value};
+    let mut m = Mapping::new();
+    m.insert(Value::from("filename"), Value::from(filename));
+    m.insert(Value::from("changes_title"), Value::from("..."));
+    m.insert(Value::from("label"), Value::from("additional files"));
+    Value::Mapping(m)
 }
 
 #[cfg(test)]
@@ -703,5 +792,38 @@ description: "Changes"
         );
         let urls = call.image_urls.as_ref().unwrap();
         assert_eq!(urls, &[img_url]);
+    }
+
+    #[test]
+    fn test_extend_uncovered_files() {
+        let yaml = "type: Bug fix\npr_files:\n  - filename: src/a.rs\n    changes_title: did a\n    label: bug fix\n";
+        let mut data: serde_yaml_ng::Value = serde_yaml_ng::from_str(yaml).unwrap();
+        extend_uncovered_files(&mut data, &["src/a.rs", "src/b.rs", "src/c.rs"]);
+
+        let files = data["pr_files"].as_sequence().unwrap();
+        assert_eq!(
+            files.len(),
+            3,
+            "b.rs and c.rs appended to the existing a.rs"
+        );
+        let names: Vec<&str> = files
+            .iter()
+            .filter_map(|f| f["filename"].as_str())
+            .collect();
+        assert!(names.contains(&"src/b.rs"));
+        assert!(names.contains(&"src/c.rs"));
+        let b = files
+            .iter()
+            .find(|f| f["filename"].as_str() == Some("src/b.rs"))
+            .unwrap();
+        assert_eq!(b["label"].as_str(), Some("additional files"));
+    }
+
+    #[test]
+    fn test_extend_uncovered_files_noop_when_all_covered() {
+        let yaml = "pr_files:\n  - filename: src/a.rs\n    label: x\n";
+        let mut data: serde_yaml_ng::Value = serde_yaml_ng::from_str(yaml).unwrap();
+        extend_uncovered_files(&mut data, &["src/a.rs"]);
+        assert_eq!(data["pr_files"].as_sequence().unwrap().len(), 1);
     }
 }

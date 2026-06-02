@@ -52,6 +52,8 @@ pub enum Command {
     Config,
     /// Start the webhook server.
     Serve,
+    /// Run as a GitHub Action (reads the event from GITHUB_EVENT_PATH).
+    GithubAction,
     /// Check if the server is healthy (for Docker HEALTHCHECK).
     Health,
 }
@@ -68,6 +70,7 @@ impl Command {
             Command::AskLine => "ask_line",
             Command::Config => "config",
             Command::Serve => "serve",
+            Command::GithubAction => "github_action",
             Command::Health => "health",
         }
     }
@@ -98,6 +101,7 @@ pub const FORBIDDEN_OVERRIDE_KEYS: &[&str] = &[
     "webhook_secret",
     "bearer_token",
     "personal_access_token",
+    "user_token",
     "override_deployment_type",
     "private_key",
     "local_cache_path",
@@ -185,6 +189,9 @@ pub async fn run() -> Result<(), PrAgentError> {
         Command::Serve => {
             crate::server::start_server().await?;
         }
+        Command::GithubAction => {
+            crate::server::github_action::run_action(&config_overrides).await?;
+        }
         _ => {
             // Defense-in-depth: reject any command without a dispatch path before
             // doing network/auth work, mirroring the webhook's is_known_command
@@ -242,6 +249,10 @@ pub async fn run() -> Result<(), PrAgentError> {
             } else {
                 None
             };
+
+            // Validate the repo TOML; on a parse error this reports it to the PR
+            // and drops the file so the run proceeds with default config.
+            let repo_toml = tools::validate_repo_settings_toml(provider.as_ref(), repo_toml).await;
 
             // Re-initialize global settings with global + repo overrides if either
             // was found, so any non-scoped reads also see the merged config.
@@ -342,7 +353,7 @@ mod tests {
         // Every exposed CLI subcommand must either be handled directly in run()
         // (config/serve/health) or be a dispatchable tool command. This guards
         // against re-introducing "announced but always-failing" commands (A1/F1).
-        let directly_handled = ["config", "serve", "health"];
+        let directly_handled = ["config", "serve", "github_action", "health"];
         let all = [
             Command::Review,
             Command::AutoReview,
@@ -352,6 +363,7 @@ mod tests {
             Command::AskLine,
             Command::Config,
             Command::Serve,
+            Command::GithubAction,
             Command::Health,
         ];
         for cmd in all {

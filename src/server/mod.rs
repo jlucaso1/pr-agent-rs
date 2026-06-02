@@ -1,3 +1,4 @@
+pub mod github_action;
 pub mod push_dedup;
 pub mod webhook;
 

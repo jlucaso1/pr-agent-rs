@@ -147,6 +147,105 @@ where
     result
 }
 
+/// Which configured model a tool should use.
+#[derive(Clone, Copy)]
+pub(crate) enum ModelKind {
+    /// A cheaper/faster model for lighter tasks (describe, ask, ask_line).
+    Weak,
+    /// A reasoning model (e.g. improve's self-reflect pass).
+    Reasoning,
+}
+
+/// Resolve the model for a task: the kind-specific model (`model_weak` /
+/// `model_reasoning`) when configured, otherwise the default `config.model`.
+/// Mirrors the Python `get_model`.
+pub(crate) fn select_model(kind: ModelKind) -> String {
+    let cfg = &get_settings().config;
+    match kind {
+        ModelKind::Weak if !cfg.model_weak.is_empty() => cfg.model_weak.clone(),
+        ModelKind::Reasoning if !cfg.model_reasoning.is_empty() => cfg.model_reasoning.clone(),
+        _ => cfg.model.clone(),
+    }
+}
+
+/// Append the response-language instruction to a tool's `extra_instructions`
+/// when a non-default `response_language` is configured, mirroring the Python
+/// original (which injects it into every section's extra_instructions). The
+/// instruction is deduplicated so repeated runs don't stack it.
+pub(crate) fn with_response_language(extra_instructions: &str) -> String {
+    let lang = &get_settings().config.response_language;
+    if lang.is_empty() || lang.eq_ignore_ascii_case("en-us") {
+        return extra_instructions.to_string();
+    }
+    let lang_instruction = format!(
+        "Your response MUST be written in the language corresponding to locale code: '{lang}'. This is crucial."
+    );
+    if extra_instructions.contains(&lang_instruction) {
+        return extra_instructions.to_string();
+    }
+    if extra_instructions.is_empty() {
+        lang_instruction
+    } else {
+        format!("{extra_instructions}\n======\n\nIn addition, {lang_instruction}")
+    }
+}
+
+/// Fetch GitHub issues linked in the PR description and build the
+/// `related_tickets` template list for review ticket-compliance analysis.
+///
+/// GitHub-only (no Jira/Azure work-items), capped at [`image::MAX_LINKED_ISSUES`],
+/// and the PR's own number is skipped. Returns an empty list when nothing is
+/// linked, so the `{% if related_tickets %}` prompt blocks stay off.
+pub(crate) async fn fetch_related_tickets(
+    provider: &dyn GitProvider,
+    description: &str,
+    pr_number: Option<u64>,
+) -> Vec<Value> {
+    let (owner, repo) = provider.repo_owner_and_name();
+    if owner.is_empty() || repo.is_empty() {
+        return Vec::new();
+    }
+    let issue_numbers: Vec<u64> = image::extract_linked_issue_numbers(description, &owner, &repo)
+        .into_iter()
+        .filter(|&n| pr_number != Some(n))
+        .take(image::MAX_LINKED_ISSUES)
+        .collect();
+    if issue_numbers.is_empty() {
+        return Vec::new();
+    }
+
+    #[derive(serde::Serialize)]
+    struct RelatedTicket {
+        ticket_url: String,
+        title: String,
+        body: String,
+        labels: String,
+    }
+
+    let futures: Vec<_> = issue_numbers
+        .iter()
+        .map(|&n| provider.get_issue(n))
+        .collect();
+    let results = futures_util::future::join_all(futures).await;
+
+    let mut tickets = Vec::new();
+    for (i, result) in results.into_iter().enumerate() {
+        let n = issue_numbers[i];
+        match result {
+            Ok((title, body, labels)) => tickets.push(Value::from_serialize(&RelatedTicket {
+                ticket_url: format!("https://github.com/{owner}/{repo}/issues/{n}"),
+                title,
+                body,
+                labels: labels.join(", "),
+            })),
+            Err(e) => {
+                tracing::warn!(issue = n, error = %e, "failed to fetch linked ticket, skipping")
+            }
+        }
+    }
+    tickets
+}
+
 /// Build the custom labels class string for prompt templates.
 ///
 /// Produces the prompt-friendly label class format:
@@ -272,6 +371,39 @@ pub async fn get_pr_images(
     }
 }
 
+/// Keep only labels that were added by the user.
+///
+/// Filters out the standard PR-type set (bug fix / tests / enhancement /
+/// documentation / other) and, when custom labels are configured, any label
+/// whose name matches a configured custom label. Mirrors the Python
+/// `get_user_labels`. Used before a `publish_labels` PUT (which replaces *all*
+/// labels) so user-applied labels are preserved instead of clobbered.
+pub fn get_user_labels(current_labels: &[String], settings: &Settings) -> Vec<String> {
+    const STANDARD: [&str; 5] = ["bug fix", "tests", "enhancement", "documentation", "other"];
+    let has_custom = !settings.custom_labels.is_empty();
+    current_labels
+        .iter()
+        .filter(|label| {
+            let lower = label.to_lowercase();
+            if STANDARD.contains(&lower.as_str()) {
+                return false;
+            }
+            // Custom-label match is case-insensitive too, to stay consistent
+            // with the standard-set check above.
+            if has_custom
+                && settings
+                    .custom_labels
+                    .keys()
+                    .any(|k| k.eq_ignore_ascii_case(label))
+            {
+                return false;
+            }
+            true
+        })
+        .cloned()
+        .collect()
+}
+
 /// Insert custom-labels template variables into the vars map.
 ///
 /// Shared by review and describe, which both need `enable_custom_labels`,
@@ -371,6 +503,51 @@ pub async fn publish_persistent_comment(
     tracing::info!("creating new persistent comment");
     provider.publish_comment(text, false).await?;
     Ok(())
+}
+
+/// Marker header for the "invalid repo configuration" persistent comment.
+const CONFIG_ERROR_HEADER: &str = "❌ **PR-Agent failed to apply repo settings**";
+
+/// Validate a repo-level `.pr_agent.toml` before it is merged into the config.
+///
+/// If the file fails to parse as TOML, publish a persistent comment to the PR
+/// describing the error (so the author can fix it) and return `None` so the
+/// caller proceeds with the remaining config layers instead of crashing.
+/// A `None`/empty input passes through unchanged. Mirrors the Python
+/// `handle_configurations_errors`.
+pub async fn validate_repo_settings_toml(
+    provider: &dyn GitProvider,
+    repo_toml: Option<String>,
+) -> Option<String> {
+    let toml_str = repo_toml?;
+    if toml_str.trim().is_empty() {
+        return Some(toml_str);
+    }
+    match toml::from_str::<toml::Value>(&toml_str) {
+        Ok(_) => Some(toml_str),
+        Err(e) => {
+            let body = format!(
+                "{CONFIG_ERROR_HEADER}\n\nThe configuration file needs to be a valid \
+                 [TOML](https://qodo-merge-docs.qodo.ai/usage-guide/configuration_options/), \
+                 please fix it.\n\n___\n\n**Error message:**\n`{e}`\n\n\
+                 <details><summary>Configuration content:</summary>\n\n\
+                 ```toml\n{toml_str}\n```\n\n</details>"
+            );
+            tracing::warn!(error = %e, "repo .pr_agent.toml is invalid; reporting to PR");
+            if let Err(pub_err) = publish_persistent_comment(
+                provider,
+                &body,
+                CONFIG_ERROR_HEADER,
+                "configuration error",
+                false,
+            )
+            .await
+            {
+                tracing::warn!(error = %pub_err, "failed to publish config-error comment");
+            }
+            None
+        }
+    }
 }
 
 /// Parse a "/command --arg=value text" string into (command_name, args_overrides).
@@ -619,6 +796,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_select_model() {
+        use crate::config::loader::with_settings;
+
+        // Defaults: weak/reasoning empty → fall back to config.model.
+        let settings =
+            Arc::new(crate::config::loader::load_settings(&HashMap::new(), None, None).unwrap());
+        let default_model = settings.config.model.clone();
+        let (weak, reasoning) = with_settings(settings, async {
+            (
+                select_model(ModelKind::Weak),
+                select_model(ModelKind::Reasoning),
+            )
+        })
+        .await;
+        assert_eq!(weak, default_model);
+        assert_eq!(reasoning, default_model);
+
+        // Configured → the specific model is used.
+        let mut overrides = HashMap::new();
+        overrides.insert("config.model_weak".to_string(), "gpt-4o-mini".to_string());
+        overrides.insert("config.model_reasoning".to_string(), "o3-mini".to_string());
+        let settings =
+            Arc::new(crate::config::loader::load_settings(&overrides, None, None).unwrap());
+        let (weak, reasoning) = with_settings(settings, async {
+            (
+                select_model(ModelKind::Weak),
+                select_model(ModelKind::Reasoning),
+            )
+        })
+        .await;
+        assert_eq!(weak, "gpt-4o-mini");
+        assert_eq!(reasoning, "o3-mini");
+    }
+
+    #[tokio::test]
+    async fn test_with_response_language() {
+        use crate::config::loader::with_settings;
+
+        // Default en-US → unchanged.
+        let settings =
+            Arc::new(crate::config::loader::load_settings(&HashMap::new(), None, None).unwrap());
+        let unchanged = with_settings(settings, async { with_response_language("base") }).await;
+        assert_eq!(unchanged, "base");
+
+        // Non-default language → appended, with dedup on re-application.
+        let mut overrides = HashMap::new();
+        overrides.insert("config.response_language".to_string(), "pt-BR".to_string());
+        let settings =
+            Arc::new(crate::config::loader::load_settings(&overrides, None, None).unwrap());
+        let (from_empty, with_base, reapplied) = with_settings(settings, async {
+            let from_empty = with_response_language("");
+            let with_base = with_response_language("Focus on X");
+            let reapplied = with_response_language(&with_base);
+            (from_empty, with_base, reapplied)
+        })
+        .await;
+
+        assert!(
+            from_empty.contains("pt-BR"),
+            "empty base gets the instruction"
+        );
+        assert!(
+            with_base.starts_with("Focus on X"),
+            "existing instructions preserved"
+        );
+        assert!(with_base.contains("pt-BR"), "language instruction appended");
+        assert_eq!(reapplied, with_base, "re-applying must not duplicate");
+    }
+
+    #[tokio::test]
     async fn test_pr_metadata_fetch_populates_fields() {
         // P2: the concurrent fetch still returns the correct fields.
         use crate::testing::mock_git::MockGitProvider;
@@ -776,6 +1023,92 @@ mod tests {
 
         assert_eq!(vars["enable_custom_labels"].to_string(), "false");
         assert_eq!(vars["custom_labels_class"].to_string(), "");
+    }
+
+    #[test]
+    fn test_get_user_labels_filters_standard_set() {
+        let settings = Settings::default();
+        let current = vec![
+            "Bug fix".to_string(),
+            "Enhancement".to_string(),
+            "needs-review".to_string(),
+            "priority/high".to_string(),
+        ];
+        let user = get_user_labels(&current, &settings);
+        // Standard PR-type labels dropped (case-insensitive); user labels kept.
+        assert_eq!(user, vec!["needs-review", "priority/high"]);
+    }
+
+    #[test]
+    fn test_get_user_labels_filters_custom_labels() {
+        let mut settings = Settings::default();
+        settings.custom_labels.insert(
+            "Performance".into(),
+            CustomLabelEntry {
+                description: "Perf".into(),
+            },
+        );
+        let current = vec![
+            "Performance".to_string(),
+            // Differs only by case from the configured custom label — must
+            // still be filtered out.
+            "performance".to_string(),
+            "tests".to_string(),
+            "keep-me".to_string(),
+        ];
+        let user = get_user_labels(&current, &settings);
+        assert_eq!(user, vec!["keep-me"]);
+    }
+
+    #[tokio::test]
+    async fn test_validate_repo_settings_toml_valid_passes_through() {
+        use crate::testing::mock_git::MockGitProvider;
+
+        let provider = MockGitProvider::new();
+        let toml = "[pr_reviewer]\nnum_max_findings = 5\n".to_string();
+        let result = validate_repo_settings_toml(&provider, Some(toml.clone())).await;
+        assert_eq!(result, Some(toml));
+        // No error comment published for valid TOML.
+        assert!(provider.get_calls().comments.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_validate_repo_settings_toml_invalid_reports_and_drops() {
+        use crate::testing::mock_git::MockGitProvider;
+
+        let provider = MockGitProvider::new();
+        // Missing closing bracket / dangling key — invalid TOML.
+        let bad = "[pr_reviewer\nnum_max_findings = ".to_string();
+        let result = validate_repo_settings_toml(&provider, Some(bad)).await;
+        // Invalid TOML is dropped so the run continues with defaults.
+        assert_eq!(result, None);
+        // An error comment was published to the PR.
+        let calls = provider.get_calls();
+        assert_eq!(calls.comments.len(), 1);
+        assert!(
+            calls.comments[0]
+                .0
+                .contains("failed to apply repo settings"),
+            "comment should explain the config error: {}",
+            calls.comments[0].0
+        );
+        assert!(
+            calls.comments[0].0.contains("```toml"),
+            "comment should include the offending config content"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_validate_repo_settings_toml_none_and_empty() {
+        use crate::testing::mock_git::MockGitProvider;
+
+        let provider = MockGitProvider::new();
+        assert_eq!(validate_repo_settings_toml(&provider, None).await, None);
+        assert_eq!(
+            validate_repo_settings_toml(&provider, Some(String::new())).await,
+            Some(String::new())
+        );
+        assert!(provider.get_calls().comments.is_empty());
     }
 
     #[tokio::test]

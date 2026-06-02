@@ -1,0 +1,35 @@
+# Image for running pr-agent-rs as a GitHub Action.
+#
+# Identical build to the main Dockerfile, but the entrypoint runs the
+# `github-action` subcommand: it reads the triggering event from
+# GITHUB_EVENT_PATH and fans out describe/review/improve (or a slash command).
+FROM rust:1-slim-bookworm AS builder
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    pkg-config cmake perl gcc g++ && \
+    rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Cache dependencies: build a dummy project first so this layer is only
+# invalidated when Cargo.toml/Cargo.lock change.
+COPY Cargo.toml Cargo.lock ./
+RUN mkdir src && echo "fn main() {}" > src/main.rs && \
+    cargo build --release && \
+    rm -rf src
+
+COPY src/ src/
+COPY settings/ settings/
+RUN cargo build --release
+
+FROM gcr.io/distroless/cc-debian12
+
+COPY --from=builder /app/target/release/pr-agent-rs /usr/local/bin/pr-agent-rs
+
+# Run as the distroless non-root user. The binary only reads env vars + the
+# event JSON and makes network calls, so it needs no write access.
+USER nonroot
+
+# Distroless has no shell, so invoke the binary directly. The Action runtime
+# supplies GITHUB_EVENT_NAME / GITHUB_EVENT_PATH / GITHUB_TOKEN as env vars.
+ENTRYPOINT ["/usr/local/bin/pr-agent-rs", "github-action"]

@@ -24,6 +24,57 @@ pub fn is_binary(filename: &str) -> bool {
     }
 }
 
+/// Exact filenames that are auto-generated (lockfiles) and add no review value.
+const AUTO_GENERATED_FILES: &[&str] = &[
+    "package-lock.json",
+    "yarn.lock",
+    "pnpm-lock.yaml",
+    "composer.lock",
+    "Gemfile.lock",
+    "poetry.lock",
+    "go.sum",
+    ".terraform.lock.hcl",
+    "uv.lock",
+    "Cargo.lock",
+    "Pipfile.lock",
+    "mix.lock",
+    "pubspec.lock",
+    "bun.lockb",
+];
+
+/// Filename suffixes that mark minified / source-map generated output.
+const AUTO_GENERATED_SUFFIXES: &[&str] = &[".min.js", ".min.css", ".js.map", ".ts.map", ".css.map"];
+
+/// Whether a file is auto-generated (a known lockfile or a minified/map file),
+/// mirroring the upstream `is_valid_file` exact-name and suffix checks.
+pub fn is_auto_generated(filename: &str) -> bool {
+    let base = filename.replace('\\', "/");
+    let base = base.rsplit('/').next().unwrap_or(&base);
+    AUTO_GENERATED_FILES.contains(&base)
+        || AUTO_GENERATED_SUFFIXES
+            .iter()
+            .any(|suffix| filename.ends_with(suffix))
+}
+
+/// Whether the file's extension is in the configured `bad_extensions` list
+/// (noise: archives, generated data, lockfiles by extension). Mirrors the
+/// upstream extension check, honoring `use_extra_bad_extensions`.
+pub fn is_bad_extension(filename: &str) -> bool {
+    let Some(ext) = filename.rsplit('.').next() else {
+        return false;
+    };
+    if ext == filename {
+        // No extension at all (rsplit returned the whole name).
+        return false;
+    }
+    // The configured lists are lowercase; normalize so `REPORT.CSV` matches `csv`.
+    let ext = ext.to_ascii_lowercase();
+    let settings = get_settings();
+    let bad = &settings.bad_extensions;
+    bad.default.iter().any(|e| e == &ext)
+        || (settings.config.use_extra_bad_extensions && bad.extra.iter().any(|e| e == &ext))
+}
+
 /// Build the list of compiled ignore patterns from settings.
 /// Combines regex patterns and glob patterns (converted to regex).
 ///
@@ -111,6 +162,16 @@ pub fn filter_files(files: &mut Vec<FilePatchInfo>) {
             return false;
         }
 
+        if is_auto_generated(&file.filename) {
+            tracing::debug!(file = file.filename, "filtered: auto-generated/lockfile");
+            return false;
+        }
+
+        if is_bad_extension(&file.filename) {
+            tracing::debug!(file = file.filename, "filtered: bad extension");
+            return false;
+        }
+
         if let Some(pattern) = patterns.iter().find(|p| p.is_match(&file.filename)) {
             tracing::debug!(file = file.filename, pattern = %pattern, "filtered: ignore pattern");
             return false;
@@ -123,6 +184,44 @@ pub fn filter_files(files: &mut Vec<FilePatchInfo>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_is_auto_generated() {
+        assert!(is_auto_generated("Cargo.lock"));
+        assert!(is_auto_generated("path/to/package-lock.json"));
+        assert!(is_auto_generated("app.min.js"));
+        assert!(is_auto_generated("dist/bundle.css.map"));
+        assert!(!is_auto_generated("src/main.rs"));
+        assert!(!is_auto_generated("locked.rs"));
+    }
+
+    #[tokio::test]
+    async fn test_is_bad_extension() {
+        use crate::config::loader::with_settings;
+        let settings = Arc::new(
+            crate::config::loader::load_settings(&std::collections::HashMap::new(), None, None)
+                .unwrap(),
+        );
+        let (csv, log, rs, md, csv_upper) = with_settings(settings, async {
+            (
+                is_bad_extension("data.csv"),
+                is_bad_extension("build.log"),
+                is_bad_extension("src/main.rs"),
+                is_bad_extension("README.md"),
+                // Mixed/upper-case extensions must match the lowercase config.
+                is_bad_extension("REPORT.CSV"),
+            )
+        })
+        .await;
+        assert!(csv, "csv is a bad (noisy) extension");
+        assert!(log, "log is a bad extension");
+        assert!(!rs, "rs is valid code");
+        assert!(
+            !md,
+            "md is in 'extra' (off unless use_extra_bad_extensions)"
+        );
+        assert!(csv_upper, "uppercase .CSV is still a bad extension");
+    }
 
     #[test]
     fn test_is_binary() {
