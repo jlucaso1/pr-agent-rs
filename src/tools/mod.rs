@@ -354,12 +354,18 @@ pub fn is_known_command(name: &str) -> bool {
 
 /// Dispatch a command to the appropriate tool.
 ///
-/// If `args` contains per-command overrides (from `/command --key=value` parsing),
-/// creates a scoped settings override for this command execution.
+/// `global_toml` / `repo_toml` are the org-level and repo-level `.pr_agent.toml`
+/// contents already fetched by the caller. They are threaded all the way down so
+/// that, when `args` also carries per-command overrides (`/command --key=value`),
+/// the scoped re-load merges ALL layers (defaults → secrets → global → repo →
+/// overrides → env). Previously the override re-load passed `None, None`, which
+/// silently discarded the repo/global config whenever any override was present.
 pub async fn handle_command(
     command: &str,
     provider: Arc<dyn GitProvider>,
     args: &HashMap<String, String>,
+    global_toml: Option<&str>,
+    repo_toml: Option<&str>,
 ) -> Result<(), PrAgentError> {
     // Separate config overrides (key=value flags) from tool data (_text, _diff_hunk, etc.)
     let config_overrides: HashMap<String, String> = args
@@ -368,24 +374,41 @@ pub async fn handle_command(
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
 
-    // If there are per-command config overrides, scope them as settings overrides
-    if !config_overrides.is_empty() {
-        let current = get_settings();
-        let scoped = Arc::new(match load_settings(&config_overrides, None, None) {
+    match build_scoped_settings(&config_overrides, global_toml, repo_toml) {
+        Some(scoped) => with_settings(scoped, dispatch(command, provider, args)).await,
+        None => dispatch(command, provider, args).await,
+    }
+}
+
+/// Build the scoped settings for a command execution, merging per-command
+/// overrides on TOP of the global + repo `.pr_agent.toml` layers.
+///
+/// Returns `None` when there is nothing to scope (no overrides and no
+/// repo/global TOML), in which case the caller dispatches against the ambient
+/// settings. Including `global_toml`/`repo_toml` here is the fix for the bug
+/// where any per-command override silently discarded the repo/global config.
+fn build_scoped_settings(
+    config_overrides: &HashMap<String, String>,
+    global_toml: Option<&str>,
+    repo_toml: Option<&str>,
+) -> Option<Arc<Settings>> {
+    if config_overrides.is_empty() && global_toml.is_none() && repo_toml.is_none() {
+        return None;
+    }
+
+    Some(Arc::new(
+        match load_settings(config_overrides, global_toml, repo_toml) {
             Ok(s) => s,
             Err(e) => {
                 tracing::warn!(
                     error = %e,
                     ?config_overrides,
-                    "failed to apply command config overrides, using current settings"
+                    "failed to apply scoped settings, using current settings"
                 );
-                (*current).clone()
+                (*get_settings()).clone()
             }
-        });
-        return with_settings(scoped, dispatch(command, provider, args)).await;
-    }
-
-    dispatch(command, provider, args).await
+        },
+    ))
 }
 
 async fn dispatch(
@@ -417,6 +440,38 @@ mod tests {
         let (cmd, args) = parse_command("/review");
         assert_eq!(cmd, "review");
         assert!(args.is_empty());
+    }
+
+    #[test]
+    fn test_scoped_settings_overrides_preserve_repo_toml() {
+        // Regression for C3: a per-command override must NOT discard the
+        // repo-level `.pr_agent.toml`. Both layers have to survive.
+        let mut overrides = HashMap::new();
+        overrides.insert("config.temperature".to_string(), "0.9".to_string());
+        let repo_toml = "[pr_reviewer]\nnum_max_findings = 7\n";
+
+        let scoped = build_scoped_settings(&overrides, None, Some(repo_toml))
+            .expect("overrides present → must produce scoped settings");
+
+        // The CLI/comment override is applied...
+        assert!((scoped.config.temperature - 0.9).abs() < 1e-6);
+        // ...AND the repo toml is preserved (previously dropped to its default of 3).
+        assert_eq!(scoped.pr_reviewer.num_max_findings, 7);
+    }
+
+    #[test]
+    fn test_scoped_settings_none_when_nothing_to_scope() {
+        // No overrides and no repo/global TOML → dispatch against ambient settings.
+        assert!(build_scoped_settings(&HashMap::new(), None, None).is_none());
+    }
+
+    #[test]
+    fn test_scoped_settings_repo_toml_only() {
+        // Repo TOML with no overrides must still scope (so the layer applies).
+        let repo_toml = "[pr_reviewer]\nnum_max_findings = 5\n";
+        let scoped = build_scoped_settings(&HashMap::new(), None, Some(repo_toml))
+            .expect("repo toml present → must produce scoped settings");
+        assert_eq!(scoped.pr_reviewer.num_max_findings, 5);
     }
 
     #[test]

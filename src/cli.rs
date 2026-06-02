@@ -250,7 +250,8 @@ pub async fn run() -> Result<(), PrAgentError> {
                 None
             };
 
-            // Re-initialize settings with global + repo overrides if either was found
+            // Re-initialize global settings with global + repo overrides if either
+            // was found, so any non-scoped reads also see the merged config.
             if global_toml.is_some() || repo_toml.is_some() {
                 init_settings(
                     &config_overrides,
@@ -259,8 +260,16 @@ pub async fn run() -> Result<(), PrAgentError> {
                 )?;
             }
 
-            tools::handle_command(cli.command.canonical_name(), provider, &config_overrides)
-                .await?;
+            // Thread the global/repo TOML into handle_command so its scoped
+            // re-load (when overrides are present) keeps all config layers.
+            tools::handle_command(
+                cli.command.canonical_name(),
+                provider,
+                &config_overrides,
+                global_toml.as_deref(),
+                repo_toml.as_deref(),
+            )
+            .await?;
         }
     }
 

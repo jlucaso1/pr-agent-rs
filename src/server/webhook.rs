@@ -6,7 +6,7 @@ use axum::response::IntoResponse;
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 
-use crate::config::loader::{get_settings, load_settings, with_settings};
+use crate::config::loader::{get_settings, load_settings};
 use crate::config::types::Settings;
 use crate::error::PrAgentError;
 use crate::git::GitProvider;
@@ -253,8 +253,9 @@ async fn dispatch_event(
             let provider: Arc<dyn GitProvider> = Arc::new(GithubProvider::new(&pr_url).await?);
             let _ = provider.add_eyes_reaction(comment_id, disable_eyes).await;
 
-            // Fetch global + repo settings and scope them for this command
-            let scoped_settings = fetch_scoped_settings(provider.as_ref(), &settings).await;
+            // Fetch global + repo `.pr_agent.toml` once; threaded into the
+            // command so per-command overrides re-merge on top of these layers.
+            let (global_toml, repo_toml) = fetch_scoped_toml(provider.as_ref(), &settings).await;
 
             // Inject diff_hunk for ask_line when available
             if command == "ask_line"
@@ -263,11 +264,14 @@ async fn dispatch_event(
                 args.insert("_diff_hunk".to_string(), diff_hunk.to_string());
             }
 
-            if let Some(s) = scoped_settings {
-                with_settings(s, tools::handle_command(&command, provider, &args)).await?;
-            } else {
-                tools::handle_command(&command, provider, &args).await?;
-            }
+            tools::handle_command(
+                &command,
+                provider,
+                &args,
+                global_toml.as_deref(),
+                repo_toml.as_deref(),
+            )
+            .await?;
         }
         "pull_request_review_comment" => {
             if action != "created" {
@@ -309,7 +313,7 @@ async fn dispatch_event(
             let provider: Arc<dyn GitProvider> = Arc::new(GithubProvider::new(&pr_url).await?);
             let _ = provider.add_eyes_reaction(comment_id, true).await;
 
-            let scoped_settings = fetch_scoped_settings(provider.as_ref(), &settings).await;
+            let (global_toml, repo_toml) = fetch_scoped_toml(provider.as_ref(), &settings).await;
             let (command, args) = tools::parse_command(&transformed);
 
             // Inject the diff_hunk from the webhook payload for ask_line
@@ -318,11 +322,14 @@ async fn dispatch_event(
                 args.insert("_diff_hunk".to_string(), diff_hunk.to_string());
             }
 
-            if let Some(s) = scoped_settings {
-                with_settings(s, tools::handle_command(&command, provider, &args)).await?;
-            } else {
-                tools::handle_command(&command, provider, &args).await?;
-            }
+            tools::handle_command(
+                &command,
+                provider,
+                &args,
+                global_toml.as_deref(),
+                repo_toml.as_deref(),
+            )
+            .await?;
         }
         _ => {
             tracing::debug!(event, "ignoring unsupported event type");
@@ -624,13 +631,13 @@ async fn fetch_optional_toml(
     }
 }
 
-/// Fetch global org-level and repo-level settings, then build a scoped `Arc<Settings>`.
-///
-/// Returns `Some(settings)` if any overrides were loaded, `None` if neither exists.
-async fn fetch_scoped_settings(
+/// Fetch the raw global org-level and repo-level `.pr_agent.toml` strings for
+/// this PR. Threaded into `handle_command` so per-command overrides re-merge on
+/// top of these layers instead of discarding them.
+async fn fetch_scoped_toml(
     provider: &dyn GitProvider,
     settings: &Settings,
-) -> Option<Arc<Settings>> {
+) -> (Option<String>, Option<String>) {
     let global_toml = fetch_optional_toml(
         settings.config.use_global_settings_file,
         provider.get_global_settings(),
@@ -644,6 +651,20 @@ async fn fetch_scoped_settings(
         "repo-level",
     )
     .await;
+
+    (global_toml, repo_toml)
+}
+
+/// Fetch global org-level and repo-level settings, then build a scoped `Arc<Settings>`.
+///
+/// Returns `Some(settings)` if any overrides were loaded, `None` if neither exists.
+/// Used where the merged `Settings` object is needed directly (e.g. self-review
+/// flag checks); command dispatch uses [`fetch_scoped_toml`] instead.
+async fn fetch_scoped_settings(
+    provider: &dyn GitProvider,
+    settings: &Settings,
+) -> Option<Arc<Settings>> {
+    let (global_toml, repo_toml) = fetch_scoped_toml(provider, settings).await;
 
     if global_toml.is_some() || repo_toml.is_some() {
         match load_settings(
@@ -670,23 +691,22 @@ async fn run_commands(pr_url: &str, commands: &[String]) -> Result<(), crate::er
     let provider: Arc<dyn GitProvider> = Arc::new(GithubProvider::new(pr_url).await?);
     let settings = get_settings();
 
-    // Fetch global + repo settings once for all commands in this PR
-    let scoped_settings = fetch_scoped_settings(provider.as_ref(), &settings).await;
+    // Fetch global + repo `.pr_agent.toml` once for all commands in this PR.
+    let (global_toml, repo_toml) = fetch_scoped_toml(provider.as_ref(), &settings).await;
 
     for cmd_str in commands {
         let (command, args) = tools::parse_command(cmd_str);
         let cmd_provider: Arc<dyn GitProvider> = Arc::new(GithubProvider::new(pr_url).await?);
 
         tracing::info!(command = %command, "running auto-command");
-        let result = if let Some(ref s) = scoped_settings {
-            with_settings(
-                s.clone(),
-                tools::handle_command(&command, cmd_provider, &args),
-            )
-            .await
-        } else {
-            tools::handle_command(&command, cmd_provider, &args).await
-        };
+        let result = tools::handle_command(
+            &command,
+            cmd_provider,
+            &args,
+            global_toml.as_deref(),
+            repo_toml.as_deref(),
+        )
+        .await;
         if let Err(e) = result {
             tracing::error!(command = %command, error = %e, "auto-command failed");
             // Continue with other commands even if one fails
