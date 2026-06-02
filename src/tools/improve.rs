@@ -472,10 +472,14 @@ impl PRCodeSuggestions {
         reflect_failed: bool,
     ) -> Result<(), PrAgentError> {
         let settings = get_settings();
+        let provider = self.provider.clone();
+        let link_gen =
+            move |file: &str, start: i32, end: i32| provider.get_line_link(file, start, Some(end));
         let mut table = format_suggestions_table(
             suggestions,
             settings.pr_code_suggestions.new_score_mechanism_th_high,
             settings.pr_code_suggestions.new_score_mechanism_th_medium,
+            &link_gen,
         );
 
         if reflect_failed {
@@ -512,10 +516,15 @@ impl PRCodeSuggestions {
             println!("No code suggestions found.");
         } else {
             let settings = get_settings();
+            let provider = self.provider.clone();
+            let link_gen = move |file: &str, start: i32, end: i32| {
+                provider.get_line_link(file, start, Some(end))
+            };
             let table = format_suggestions_table(
                 suggestions,
                 settings.pr_code_suggestions.new_score_mechanism_th_high,
                 settings.pr_code_suggestions.new_score_mechanism_th_medium,
+                &link_gen,
             );
             println!("{table}");
         }
@@ -528,6 +537,7 @@ struct ReflectFeedback {
     relevant_lines_start: i32,
     relevant_lines_end: i32,
     suggestion_score: u32,
+    why: String,
 }
 
 /// Parse the reflect response YAML into feedback items.
@@ -554,10 +564,18 @@ fn parse_reflect_response(data: &serde_yaml_ng::Value) -> Vec<ReflectFeedback> {
                 .and_then(yaml_value_as_u64)
                 .unwrap_or(7) as u32;
 
+            let why = item
+                .get("why")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+
             ReflectFeedback {
                 relevant_lines_start: lines_start,
                 relevant_lines_end: lines_end,
                 suggestion_score: score,
+                why,
             }
         })
         .collect()
@@ -578,6 +596,7 @@ fn apply_reflect_feedback(suggestions: &mut [ParsedSuggestion], feedback: &[Refl
     for (i, suggestion) in suggestions.iter_mut().enumerate() {
         if let Some(fb) = feedback.get(i) {
             suggestion.score = fb.suggestion_score;
+            suggestion.score_why = fb.why.clone();
 
             // Only update line numbers if the suggestion doesn't already have valid ones
             if suggestion.relevant_lines_start <= 0 || suggestion.relevant_lines_end <= 0 {
@@ -638,6 +657,7 @@ code_suggestions:
                 one_sentence_summary: "Fix bug".into(),
                 suggestion_content: "Fix the bug".into(),
                 score: 5,
+                score_why: String::new(),
             },
             ParsedSuggestion {
                 label: "enhancement".into(),
@@ -649,6 +669,7 @@ code_suggestions:
                 one_sentence_summary: "Improve".into(),
                 suggestion_content: "Improve this".into(),
                 score: 5,
+                score_why: String::new(),
             },
         ];
 
@@ -657,11 +678,13 @@ code_suggestions:
                 relevant_lines_start: 10,
                 relevant_lines_end: 12,
                 suggestion_score: 9,
+                why: String::new(),
             },
             ReflectFeedback {
                 relevant_lines_start: 5,
                 relevant_lines_end: 5,
                 suggestion_score: 3,
+                why: String::new(),
             },
         ];
 
@@ -686,12 +709,14 @@ code_suggestions:
             one_sentence_summary: "Fix".into(),
             suggestion_content: "Fix".into(),
             score: 5,
+            score_why: String::new(),
         }];
 
         let feedback = vec![ReflectFeedback {
             relevant_lines_start: -1,
             relevant_lines_end: -1,
             suggestion_score: 8,
+            why: String::new(),
         }];
 
         apply_reflect_feedback(&mut suggestions, &feedback);
@@ -713,6 +738,7 @@ code_suggestions:
                 one_sentence_summary: "Fix".into(),
                 suggestion_content: "Fix".into(),
                 score: 5,
+                score_why: String::new(),
             },
             ParsedSuggestion {
                 label: "enhancement".into(),
@@ -724,6 +750,7 @@ code_suggestions:
                 one_sentence_summary: "Improve".into(),
                 suggestion_content: "Improve".into(),
                 score: 7,
+                score_why: String::new(),
             },
         ];
 
@@ -732,6 +759,7 @@ code_suggestions:
             relevant_lines_start: 10,
             relevant_lines_end: 12,
             suggestion_score: 9,
+            why: String::new(),
         }];
 
         apply_reflect_feedback(&mut suggestions, &feedback);
@@ -962,6 +990,7 @@ code_suggestions:
             one_sentence_summary: "Fix".into(),
             suggestion_content: "Fix it".into(),
             score,
+            score_why: String::new(),
         }
     }
 
