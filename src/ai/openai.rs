@@ -234,6 +234,19 @@ impl AiHandler for OpenAiCompatibleHandler {
         temperature: Option<f32>,
         image_urls: Option<&[String]>,
     ) -> Result<ChatResponse, PrAgentError> {
+        // A fixed seed is incompatible with a non-zero temperature (the result
+        // would not be reproducible). Mirror Python: reject the combination
+        // instead of silently sending both. Default seed is -1 (opt-in), so the
+        // default config is unaffected.
+        let settings = get_settings();
+        let effective_temp = temperature.unwrap_or(settings.config.temperature);
+        if effective_temp > 0.0 && settings.config.seed >= 0 {
+            return Err(PrAgentError::AiHandler(format!(
+                "seed ({}) is not supported with temperature ({effective_temp}) > 0",
+                settings.config.seed
+            )));
+        }
+
         let body = self.build_request_body(model, system, user, temperature, image_urls);
 
         // Retry logic: retry on transient errors with exponential backoff
@@ -455,6 +468,35 @@ mod tests {
         // Empty system message should be omitted
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0]["role"], "user");
+    }
+
+    #[tokio::test]
+    async fn test_chat_completion_rejects_seed_with_temperature() {
+        // C12: a fixed seed with temperature > 0 must be rejected before any
+        // network call (mirrors Python's ValueError).
+        use crate::config::loader::with_settings;
+        let mut overrides = std::collections::HashMap::new();
+        overrides.insert("config.seed".into(), "5".into()); // default temperature 0.2 > 0
+        let settings = std::sync::Arc::new(
+            crate::config::loader::load_settings(&overrides, None, None).unwrap(),
+        );
+
+        let handler = test_handler();
+        let result = with_settings(
+            settings,
+            handler.chat_completion("gpt-4", "sys", "user", None, None),
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .to_lowercase()
+                .contains("seed"),
+            "error should mention seed"
+        );
     }
 
     #[tokio::test]
