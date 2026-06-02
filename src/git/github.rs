@@ -1049,6 +1049,25 @@ impl GitProvider for GithubProvider {
         Ok((title, body))
     }
 
+    async fn get_issue(
+        &self,
+        issue_number: u64,
+    ) -> Result<(String, String, Vec<String>), PrAgentError> {
+        let path = format!("repos/{}/issues/{}", self.repo_full, issue_number);
+        let data = self.api_get(&path).await?;
+        let title = data["title"].as_str().unwrap_or_default().to_string();
+        let body = data["body"].as_str().unwrap_or_default().to_string();
+        let labels = data["labels"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|l| l["name"].as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok((title, body, labels))
+    }
+
     async fn auto_approve(&self) -> Result<bool, PrAgentError> {
         let path = format!(
             "repos/{}/pulls/{}/reviews",

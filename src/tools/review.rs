@@ -74,7 +74,21 @@ impl PRReviewer {
         );
 
         // 3. Build template variables
-        let vars = self.build_vars(&meta, &diff_result.diff, num_files);
+        let mut vars = self.build_vars(&meta, &diff_result.diff, num_files);
+
+        // Ticket compliance: populate related_tickets from linked GitHub issues
+        // so the (already-ported) ticket-analysis prompt blocks light up.
+        if settings.pr_reviewer.require_ticket_analysis_review {
+            let tickets = super::fetch_related_tickets(
+                self.provider.as_ref(),
+                &meta.description,
+                self.provider.get_pr_number(),
+            )
+            .await;
+            if !tickets.is_empty() {
+                vars.insert("related_tickets".into(), Value::from(tickets));
+            }
+        }
 
         // 4. Render prompt
         let rendered = render_prompt(&settings.pr_review_prompt, vars)?;
@@ -314,6 +328,36 @@ mod tests {
             crate::config::loader::load_settings(&overrides, None, None)
                 .expect("should load test settings"),
         )
+    }
+
+    #[tokio::test]
+    async fn test_review_includes_related_tickets() {
+        // A linked issue (#42) must be fetched and fed to the model (ticket
+        // compliance), lighting up the previously-dead related_tickets blocks.
+        let provider = Arc::new(
+            MockGitProvider::new()
+                .with_diff_files(vec![sample_diff_file("src/main.rs", SAMPLE_PATCH)])
+                .with_pr_description("Title", "Implements the feature. Closes #42")
+                .with_issue_body(42, "Add dark mode", "Users want a dark theme toggle"),
+        );
+        let ai = Arc::new(MockAiHandler::new(REVIEW_YAML));
+        let reviewer = PRReviewer::new_with_ai(provider.clone(), ai.clone());
+
+        with_settings(test_settings(), reviewer.run())
+            .await
+            .unwrap();
+
+        let calls = ai.get_recorded_calls();
+        assert_eq!(calls.len(), 1);
+        let user = &calls[0].user;
+        assert!(
+            user.contains("Add dark mode"),
+            "the linked ticket title must reach the prompt"
+        );
+        assert!(
+            user.contains("issues/42"),
+            "the ticket URL must reach the prompt"
+        );
     }
 
     #[tokio::test]

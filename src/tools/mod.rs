@@ -169,6 +169,62 @@ pub(crate) fn with_response_language(extra_instructions: &str) -> String {
     }
 }
 
+/// Fetch GitHub issues linked in the PR description and build the
+/// `related_tickets` template list for review ticket-compliance analysis.
+///
+/// GitHub-only (no Jira/Azure work-items), capped at [`image::MAX_LINKED_ISSUES`],
+/// and the PR's own number is skipped. Returns an empty list when nothing is
+/// linked, so the `{% if related_tickets %}` prompt blocks stay off.
+pub(crate) async fn fetch_related_tickets(
+    provider: &dyn GitProvider,
+    description: &str,
+    pr_number: Option<u64>,
+) -> Vec<Value> {
+    let (owner, repo) = provider.repo_owner_and_name();
+    if owner.is_empty() || repo.is_empty() {
+        return Vec::new();
+    }
+    let issue_numbers: Vec<u64> = image::extract_linked_issue_numbers(description, &owner, &repo)
+        .into_iter()
+        .filter(|&n| pr_number != Some(n))
+        .take(image::MAX_LINKED_ISSUES)
+        .collect();
+    if issue_numbers.is_empty() {
+        return Vec::new();
+    }
+
+    #[derive(serde::Serialize)]
+    struct RelatedTicket {
+        ticket_url: String,
+        title: String,
+        body: String,
+        labels: String,
+    }
+
+    let futures: Vec<_> = issue_numbers
+        .iter()
+        .map(|&n| provider.get_issue(n))
+        .collect();
+    let results = futures_util::future::join_all(futures).await;
+
+    let mut tickets = Vec::new();
+    for (i, result) in results.into_iter().enumerate() {
+        let n = issue_numbers[i];
+        match result {
+            Ok((title, body, labels)) => tickets.push(Value::from_serialize(&RelatedTicket {
+                ticket_url: format!("https://github.com/{owner}/{repo}/issues/{n}"),
+                title,
+                body,
+                labels: labels.join(", "),
+            })),
+            Err(e) => {
+                tracing::warn!(issue = n, error = %e, "failed to fetch linked ticket, skipping")
+            }
+        }
+    }
+    tickets
+}
+
 /// Build the custom labels class string for prompt templates.
 ///
 /// Produces the prompt-friendly label class format:

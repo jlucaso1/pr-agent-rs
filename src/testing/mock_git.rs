@@ -254,4 +254,14 @@ impl GitProvider for MockGitProvider {
             .cloned()
             .ok_or_else(|| PrAgentError::GitProvider(format!("issue #{issue_number} not found")))
     }
+
+    async fn get_issue(
+        &self,
+        issue_number: u64,
+    ) -> Result<(String, String, Vec<String>), PrAgentError> {
+        self.issue_bodies
+            .get(&issue_number)
+            .map(|(t, b)| (t.clone(), b.clone(), Vec::new()))
+            .ok_or_else(|| PrAgentError::GitProvider(format!("issue #{issue_number} not found")))
+    }
 }
