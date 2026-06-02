@@ -1071,6 +1071,14 @@ impl GitProvider for GithubProvider {
     ) -> Result<(String, String, Vec<String>), PrAgentError> {
         let path = format!("repos/{}/issues/{}", self.repo_full, issue_number);
         let data = self.api_get(&path).await?;
+        // The /issues endpoint also returns pull requests (GitHub models PRs as
+        // issues). A linked PR is not a ticket, so reject it — callers treat the
+        // error as "skip this reference".
+        if data.get("pull_request").is_some() {
+            return Err(PrAgentError::Other(format!(
+                "#{issue_number} is a pull request, not an issue"
+            )));
+        }
         let title = data["title"].as_str().unwrap_or_default().to_string();
         let body = data["body"].as_str().unwrap_or_default().to_string();
         let labels = data["labels"]

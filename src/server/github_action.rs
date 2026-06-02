@@ -36,12 +36,11 @@ pub async fn run_action(cli_overrides: &HashMap<String, String>) -> Result<(), P
     }
 
     // The Action provides a plain user/installation token, so force the
-    // user-token auth path regardless of any ambient deployment_type. The token
-    // itself is picked up from GITHUB_TOKEN by the env config layer.
+    // user-token auth path — unconditionally, so a stray CLI override can't flip
+    // us onto the App-auth path that has no credentials here. The token itself is
+    // picked up from GITHUB_TOKEN by the env config layer.
     let mut overrides = cli_overrides.clone();
-    overrides
-        .entry("github.deployment_type".to_string())
-        .or_insert_with(|| "user".to_string());
+    overrides.insert("github.deployment_type".to_string(), "user".to_string());
     init_settings(&overrides, None, None)?;
 
     // Load and parse the event payload the Action runtime wrote to disk.

@@ -67,10 +67,12 @@ pub fn is_bad_extension(filename: &str) -> bool {
         // No extension at all (rsplit returned the whole name).
         return false;
     }
+    // The configured lists are lowercase; normalize so `REPORT.CSV` matches `csv`.
+    let ext = ext.to_ascii_lowercase();
     let settings = get_settings();
     let bad = &settings.bad_extensions;
-    bad.default.iter().any(|e| e == ext)
-        || (settings.config.use_extra_bad_extensions && bad.extra.iter().any(|e| e == ext))
+    bad.default.iter().any(|e| e == &ext)
+        || (settings.config.use_extra_bad_extensions && bad.extra.iter().any(|e| e == &ext))
 }
 
 /// Build the list of compiled ignore patterns from settings.
@@ -200,12 +202,14 @@ mod tests {
             crate::config::loader::load_settings(&std::collections::HashMap::new(), None, None)
                 .unwrap(),
         );
-        let (csv, log, rs, md) = with_settings(settings, async {
+        let (csv, log, rs, md, csv_upper) = with_settings(settings, async {
             (
                 is_bad_extension("data.csv"),
                 is_bad_extension("build.log"),
                 is_bad_extension("src/main.rs"),
                 is_bad_extension("README.md"),
+                // Mixed/upper-case extensions must match the lowercase config.
+                is_bad_extension("REPORT.CSV"),
             )
         })
         .await;
@@ -216,6 +220,7 @@ mod tests {
             !md,
             "md is in 'extra' (off unless use_extra_bad_extensions)"
         );
+        assert!(csv_upper, "uppercase .CSV is still a bad extension");
     }
 
     #[test]

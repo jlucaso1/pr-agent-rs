@@ -26,6 +26,10 @@ FROM gcr.io/distroless/cc-debian12
 
 COPY --from=builder /app/target/release/pr-agent-rs /usr/local/bin/pr-agent-rs
 
+# Run as the distroless non-root user. The binary only reads env vars + the
+# event JSON and makes network calls, so it needs no write access.
+USER nonroot
+
 # Distroless has no shell, so invoke the binary directly. The Action runtime
 # supplies GITHUB_EVENT_NAME / GITHUB_EVENT_PATH / GITHUB_TOKEN as env vars.
 ENTRYPOINT ["/usr/local/bin/pr-agent-rs", "github-action"]

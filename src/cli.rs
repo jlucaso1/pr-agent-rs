@@ -101,6 +101,7 @@ pub const FORBIDDEN_OVERRIDE_KEYS: &[&str] = &[
     "webhook_secret",
     "bearer_token",
     "personal_access_token",
+    "user_token",
     "override_deployment_type",
     "private_key",
     "local_cache_path",

@@ -294,14 +294,23 @@ impl PRReviewer {
 
         // publish_labels replaces the entire label set, so merge in the labels
         // already on the PR — minus any previously-generated review labels
-        // (effort / security), which we re-derive each run. Only publish when
-        // the resulting set actually differs, to avoid a no-op API write.
-        let current = self.provider.get_pr_labels().await.unwrap_or_default();
+        // (effort / security), which we re-derive each run. A failed read must
+        // NOT be treated as "no labels": that would wipe the user's labels, so
+        // skip publishing on error instead.
+        let current = match self.provider.get_pr_labels().await {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to read current labels; skipping review label publish");
+                return Ok(());
+            }
+        };
+        // Match only the exact labels this tool emits, so a user label that
+        // merely mentions "security concern" isn't dropped.
         let current_filtered: Vec<String> = current
             .iter()
             .filter(|l| {
                 let lower = l.to_lowercase();
-                !lower.starts_with("review effort") && !lower.contains("security concern")
+                !lower.starts_with("review effort") && lower != "security concern"
             })
             .cloned()
             .collect();

@@ -228,15 +228,24 @@ impl PRDescription {
         // set, so preserve user-applied labels (those not in the standard or
         // custom set) and only write when the merged set actually differs.
         if settings.pr_description.publish_labels && !output.labels.is_empty() {
-            let current = self.provider.get_pr_labels().await.unwrap_or_default();
-            let user_labels = super::get_user_labels(&current, &settings);
-            let mut new_labels = output.labels.clone();
-            new_labels.extend(user_labels);
+            // publish_labels replaces the full set, so a failed read of the
+            // current labels must NOT be treated as "no labels" — that would
+            // wipe the user's labels. Skip publishing on a read error instead.
+            match self.provider.get_pr_labels().await {
+                Ok(current) => {
+                    let user_labels = super::get_user_labels(&current, &settings);
+                    let mut new_labels = output.labels.clone();
+                    new_labels.extend(user_labels);
 
-            let cur_set: std::collections::BTreeSet<&String> = current.iter().collect();
-            let new_set: std::collections::BTreeSet<&String> = new_labels.iter().collect();
-            if new_set != cur_set {
-                self.provider.publish_labels(&new_labels).await?;
+                    let cur_set: std::collections::BTreeSet<&String> = current.iter().collect();
+                    let new_set: std::collections::BTreeSet<&String> = new_labels.iter().collect();
+                    if new_set != cur_set {
+                        self.provider.publish_labels(&new_labels).await?;
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "failed to read current labels; skipping label publish");
+                }
             }
         }
 

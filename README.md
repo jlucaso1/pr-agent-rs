@@ -86,6 +86,8 @@ on:
     types: [opened, reopened, ready_for_review]
   issue_comment:
     types: [created]
+  pull_request_review_comment:
+    types: [created]
 permissions:
   contents: read
   pull-requests: write
@@ -94,6 +96,7 @@ jobs:
   pr-agent:
     runs-on: ubuntu-latest
     steps:
+      # Pin to a released tag or commit SHA in production instead of @main.
       - uses: jlucaso1/pr-agent-rs@main
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

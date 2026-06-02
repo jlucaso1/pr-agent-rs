@@ -388,7 +388,14 @@ pub fn get_user_labels(current_labels: &[String], settings: &Settings) -> Vec<St
             if STANDARD.contains(&lower.as_str()) {
                 return false;
             }
-            if has_custom && settings.custom_labels.contains_key(label.as_str()) {
+            // Custom-label match is case-insensitive too, to stay consistent
+            // with the standard-set check above.
+            if has_custom
+                && settings
+                    .custom_labels
+                    .keys()
+                    .any(|k| k.eq_ignore_ascii_case(label))
+            {
                 return false;
             }
             true
@@ -1043,6 +1050,9 @@ mod tests {
         );
         let current = vec![
             "Performance".to_string(),
+            // Differs only by case from the configured custom label — must
+            // still be filtered out.
+            "performance".to_string(),
             "tests".to_string(),
             "keep-me".to_string(),
         ];

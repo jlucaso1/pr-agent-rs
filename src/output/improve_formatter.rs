@@ -210,10 +210,18 @@ pub fn format_suggestions_table(
                 } else {
                     out.push_str("<tr><td>\n\n");
                 }
+                // Only wrap the file reference in a link when the generator
+                // produced a URL; otherwise emit it as plain text (an empty
+                // `(...)` renders as a broken link).
+                let file_ref = if link.is_empty() {
+                    format!("{file} {range_str}")
+                } else {
+                    format!("[{file} {range_str}]({link})")
+                };
                 let _ = write!(out, "<details><summary>{summary}</summary>\n\n___\n\n");
                 let _ = write!(
                     out,
-                    "**{}**\n\n[{file} {range_str}]({link})\n\n{diff_block}\n",
+                    "**{}**\n\n{file_ref}\n\n{diff_block}\n",
                     s.suggestion_content.trim()
                 );
                 if !s.score_why.is_empty() {
@@ -517,13 +525,21 @@ code_suggestions:
 
         let result =
             format_suggestions_table(&suggestions, 9, 7, &|_: &str, _: i32, _: i32| String::new());
-        // Table rows should not have raw newlines within cells
-        for line in result.lines() {
-            if line.starts_with("| ") && line.contains("Summary") {
-                // This line is a table row — must not split across lines
-                assert!(line.ends_with(" |") || line.ends_with(" |"));
-            }
-        }
+        // Code-level suggestions now render as an HTML <table>, not markdown rows.
+        assert!(
+            result.contains("<table>"),
+            "renders an HTML table: {result}"
+        );
+        assert!(result.contains("<td"), "has table cells: {result}");
+        assert!(
+            result.contains("<details><summary>"),
+            "suggestion is a collapsible details block: {result}"
+        );
+        // The empty link generator must not leave a broken markdown link.
+        assert!(
+            !result.contains("]()"),
+            "no empty link emitted when link_gen returns empty: {result}"
+        );
     }
 
     #[test]

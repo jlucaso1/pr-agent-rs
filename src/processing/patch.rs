@@ -156,8 +156,13 @@ fn process_patch_lines(
                             esz2 -= idx;
                             // Dynamic context only valid if the extra lines are
                             // identical on both sides from the section header down.
-                            if lines_before_original[idx as usize..]
-                                == lines_before_new[idx as usize..]
+                            // `lines_before_new` can be shorter than
+                            // `lines_before_original` (when start1 > start2), so
+                            // compare via `.get()` — a missing tail means "not
+                            // equal", never a panic (Python relies on forgiving
+                            // slicing here).
+                            let tail = idx as usize;
+                            if lines_before_new.get(tail..) == Some(&lines_before_original[tail..])
                             {
                                 found_header = true;
                                 section_header = String::new();
@@ -238,7 +243,14 @@ fn process_patch_lines(
                 delta_lines_original = Vec::new();
             }
 
-            out.push(String::new());
+            // Separate consecutive hunks with a blank line, but never emit one
+            // before the first hunk: a leading blank is consumed as line-0
+            // context by convert_to_hunks_with_line_numbers and surfaces as a
+            // bogus "line 0" hunk in the prompt. (Python emits it unconditionally
+            // but its converter drops the empty-content hunk; ours keeps it.)
+            if !out.is_empty() {
+                out.push(String::new());
+            }
             let sep = if section_header.is_empty() { "" } else { " " };
             out.push(format!(
                 "@@ -{ext_start1},{ext_size1} +{ext_start2},{ext_size2} @@{sep}{section_header}"
@@ -289,6 +301,36 @@ mod tests {
         assert!(result.contains("@@ -2,"), "header extended: {result}");
         assert!(result.contains(" line2"));
         assert!(result.contains(" line3"));
+        // The first hunk must not be preceded by a blank line, which would be
+        // read as bogus line-0 context downstream.
+        assert!(
+            !result.starts_with('\n'),
+            "no leading blank line before first hunk: {result:?}"
+        );
+        assert!(
+            result.starts_with("@@ -2,"),
+            "starts at the header: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_extend_patch_no_leading_blank_feeds_clean_hunks() {
+        // Regression: a leading blank line in the extended patch surfaces as a
+        // "line 0" hunk in convert_to_hunks_with_line_numbers.
+        use crate::git::types::EditType;
+        let original = "line1\nline2\nline3\ncontext\nremoved\nline6\nline7\nline8\nline9\nline10";
+        let patch = "@@ -4,3 +4,3 @@\n context\n-removed\n+added\n line6";
+        let extended = with_settings(settings_with(false), async {
+            extend_patch(original, patch, "", 2, 2)
+        })
+        .await;
+        let hunks = crate::processing::diff::convert_to_hunks_with_line_numbers(
+            "f.rs",
+            &extended,
+            EditType::Modified,
+        );
+        // No "0 " line-numbered content (the bogus line-0 hunk).
+        assert!(!hunks.contains("\n0 "), "no line-0 hunk content: {hunks}");
     }
 
     #[test]
@@ -340,5 +382,22 @@ mod tests {
         // Still produces a valid extended patch (no panic) containing the change.
         assert!(result.contains("@@ -"));
         assert!(result.contains("let c"));
+    }
+
+    #[tokio::test]
+    async fn test_dynamic_context_no_panic_when_old_side_longer() {
+        // Regression: the section header matches deep in the old-side "before"
+        // window (idx 4) while the new-side window has only one line (start2=2).
+        // The tail comparison must not index `lines_before_new[4..]` — Python
+        // slicing tolerates it, Rust slicing would panic.
+        let base = "a\nb\nc\nd\nMARKER\nf\ntarget\n}";
+        let new = "header\ntarget\n}";
+        let patch = "@@ -7,1 +2,1 @@ MARKER\n-target\n+changed";
+        let result = with_settings(settings_with(true), async {
+            extend_patch(base, patch, new, 2, 0)
+        })
+        .await;
+        // The point is simply that it didn't panic and produced a hunk.
+        assert!(result.contains("@@ -"), "produced a hunk: {result}");
     }
 }
