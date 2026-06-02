@@ -335,7 +335,10 @@ pub async fn publish_persistent_comment(
     let comments = provider.get_issue_comments().await?;
     for comment in &comments {
         if comment.body.starts_with(initial_header) {
-            tracing::info!(comment_id = comment.id, "updating existing persistent comment");
+            tracing::info!(
+                comment_id = comment.id,
+                "updating existing persistent comment"
+            );
             let comment_url = comment.url.as_deref().unwrap_or("");
 
             // Add "updated until commit" header
@@ -424,6 +427,7 @@ enum Command {
     Improve,
     Ask,
     AskLine,
+    Help,
 }
 
 /// Map a command name string to its `Command` variant, if recognized.
@@ -434,8 +438,26 @@ fn resolve_command(name: &str) -> Option<Command> {
         "improve" | "improve_code" => Some(Command::Improve),
         "ask" => Some(Command::Ask),
         "ask_line" => Some(Command::AskLine),
+        "help" => Some(Command::Help),
         _ => None,
     }
+}
+
+/// Build the static `/help` message listing the supported commands.
+fn build_help_message() -> String {
+    let mut out = String::with_capacity(512);
+    out.push_str("## PR-Agent Commands 🤖\n\n");
+    out.push_str("| Command | Description |\n");
+    out.push_str("|---------|-------------|\n");
+    out.push_str("| `/review` | Review the PR: summary, key issues, and effort estimate |\n");
+    out.push_str("| `/describe` | Generate a PR title, type, and description |\n");
+    out.push_str("| `/improve` | Suggest committable code improvements |\n");
+    out.push_str("| `/ask <question>` | Ask a free-form question about the PR |\n");
+    out.push_str(
+        "| `/ask_line <question>` | Ask about specific lines (reply to a line comment) |\n",
+    );
+    out.push_str("| `/help` | Show this help message |\n");
+    out
 }
 
 /// Check whether a command name is one that pr-agent-rs can handle.
@@ -522,6 +544,14 @@ async fn dispatch(
             ask::PRAsk::new(provider).run(question).await
         }
         Command::AskLine => ask_line::PRAskLine::new(provider).run(args).await,
+        Command::Help => {
+            // Static help table — no AI call, mirrors the Python PRHelpMessage
+            // else-branch.
+            provider
+                .publish_comment(&build_help_message(), false)
+                .await
+                .map(|_| ())
+        }
     }
 }
 
@@ -534,6 +564,35 @@ mod tests {
         let (cmd, args) = parse_command("/review");
         assert_eq!(cmd, "review");
         assert!(args.is_empty());
+    }
+
+    #[test]
+    fn test_build_help_message_and_known() {
+        // F2: /help is a known command and lists every supported command.
+        assert!(is_known_command("help"));
+        let msg = build_help_message();
+        for cmd in [
+            "/review",
+            "/describe",
+            "/improve",
+            "/ask",
+            "/ask_line",
+            "/help",
+        ] {
+            assert!(msg.contains(cmd), "help should mention {cmd}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_dispatch_help_publishes_comment() {
+        use crate::testing::mock_git::MockGitProvider;
+        let provider = Arc::new(MockGitProvider::new());
+        dispatch("help", provider.clone(), &HashMap::new())
+            .await
+            .unwrap();
+        let calls = provider.get_calls();
+        assert!(!calls.comments.is_empty(), "/help should publish a comment");
+        assert!(calls.comments[0].0.contains("PR-Agent Commands"));
     }
 
     #[test]
@@ -807,7 +866,8 @@ mod tests {
 
     #[test]
     fn test_is_known_command_rejects_unknown() {
-        for cmd in ["qa-verify", "qa-review", "help", "deploy", "", "REVIEW"] {
+        // Note: "help" IS known (see test_build_help_message_and_known).
+        for cmd in ["qa-verify", "qa-review", "deploy", "", "REVIEW"] {
             assert!(
                 !is_known_command(cmd),
                 "'{cmd}' should NOT be a known command"
