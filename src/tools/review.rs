@@ -183,7 +183,9 @@ impl PRReviewer {
         vars.insert("answer_str".into(), Value::from(""));
         vars.insert(
             "extra_instructions".into(),
-            Value::from(settings.pr_reviewer.extra_instructions.as_str()),
+            Value::from(super::with_response_language(
+                &settings.pr_reviewer.extra_instructions,
+            )),
         );
         insert_custom_labels_vars(&mut vars, &settings);
         vars.insert("is_ai_metadata".into(), Value::from(false));

@@ -147,6 +147,28 @@ where
     result
 }
 
+/// Append the response-language instruction to a tool's `extra_instructions`
+/// when a non-default `response_language` is configured, mirroring the Python
+/// original (which injects it into every section's extra_instructions). The
+/// instruction is deduplicated so repeated runs don't stack it.
+pub(crate) fn with_response_language(extra_instructions: &str) -> String {
+    let lang = &get_settings().config.response_language;
+    if lang.is_empty() || lang.eq_ignore_ascii_case("en-us") {
+        return extra_instructions.to_string();
+    }
+    let lang_instruction = format!(
+        "Your response MUST be written in the language corresponding to locale code: '{lang}'. This is crucial."
+    );
+    if extra_instructions.contains(&lang_instruction) {
+        return extra_instructions.to_string();
+    }
+    if extra_instructions.is_empty() {
+        lang_instruction
+    } else {
+        format!("{extra_instructions}\n======\n\nIn addition, {lang_instruction}")
+    }
+}
+
 /// Build the custom labels class string for prompt templates.
 ///
 /// Produces the prompt-friendly label class format:
@@ -616,6 +638,41 @@ mod tests {
     fn test_scoped_settings_none_when_nothing_to_scope() {
         // No overrides and no repo/global TOML → dispatch against ambient settings.
         assert!(build_scoped_settings(&HashMap::new(), None, None).is_none());
+    }
+
+    #[tokio::test]
+    async fn test_with_response_language() {
+        use crate::config::loader::with_settings;
+
+        // Default en-US → unchanged.
+        let settings =
+            Arc::new(crate::config::loader::load_settings(&HashMap::new(), None, None).unwrap());
+        let unchanged = with_settings(settings, async { with_response_language("base") }).await;
+        assert_eq!(unchanged, "base");
+
+        // Non-default language → appended, with dedup on re-application.
+        let mut overrides = HashMap::new();
+        overrides.insert("config.response_language".to_string(), "pt-BR".to_string());
+        let settings =
+            Arc::new(crate::config::loader::load_settings(&overrides, None, None).unwrap());
+        let (from_empty, with_base, reapplied) = with_settings(settings, async {
+            let from_empty = with_response_language("");
+            let with_base = with_response_language("Focus on X");
+            let reapplied = with_response_language(&with_base);
+            (from_empty, with_base, reapplied)
+        })
+        .await;
+
+        assert!(
+            from_empty.contains("pt-BR"),
+            "empty base gets the instruction"
+        );
+        assert!(
+            with_base.starts_with("Focus on X"),
+            "existing instructions preserved"
+        );
+        assert!(with_base.contains("pt-BR"), "language instruction appended");
+        assert_eq!(reapplied, with_base, "re-applying must not duplicate");
     }
 
     #[tokio::test]

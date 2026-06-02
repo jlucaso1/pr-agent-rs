@@ -144,7 +144,9 @@ impl PRDescription {
         // Describe-specific variables
         vars.insert(
             "extra_instructions".into(),
-            Value::from(settings.pr_description.extra_instructions.as_str()),
+            Value::from(super::with_response_language(
+                &settings.pr_description.extra_instructions,
+            )),
         );
         insert_custom_labels_vars(&mut vars, &settings);
         vars.insert(

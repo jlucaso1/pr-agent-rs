@@ -347,7 +347,9 @@ impl PRCodeSuggestions {
         vars.insert("diff_no_line_numbers".into(), Value::from(diff));
         vars.insert(
             "extra_instructions".into(),
-            Value::from(settings.pr_code_suggestions.extra_instructions.as_str()),
+            Value::from(super::with_response_language(
+                &settings.pr_code_suggestions.extra_instructions,
+            )),
         );
         vars.insert(
             "num_code_suggestions".into(),
