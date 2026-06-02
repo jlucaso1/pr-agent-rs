@@ -307,12 +307,66 @@ pub async fn publish_as_comment(
 ) -> Result<(), PrAgentError> {
     if persistent {
         let marker = format!("<!-- pr-agent:{tool_name} -->");
-        provider
-            .publish_persistent_comment(content, &marker, "", tool_name, final_update_message)
+        publish_persistent_comment(provider, content, &marker, tool_name, final_update_message)
             .await?;
     } else {
         provider.publish_comment(content, false).await?;
     }
+    Ok(())
+}
+
+/// Find an existing persistent comment by its header marker and update it in
+/// place (appending an "updated until commit" header and an optional
+/// notification), or create a new one if none exists.
+///
+/// This is pr-agent's *usage* of the provider (business orchestration), so it
+/// lives here as a free function over `&dyn GitProvider` rather than as a
+/// GitProvider trait default — the trait stays about provider capabilities.
+pub async fn publish_persistent_comment(
+    provider: &dyn GitProvider,
+    text: &str,
+    initial_header: &str,
+    name: &str,
+    final_update_message: bool,
+) -> Result<(), PrAgentError> {
+    use crate::git::capitalize_first;
+    use crate::git::types::CommentId;
+
+    let comments = provider.get_issue_comments().await?;
+    for comment in &comments {
+        if comment.body.starts_with(initial_header) {
+            tracing::info!(comment_id = comment.id, "updating existing persistent comment");
+            let comment_url = comment.url.as_deref().unwrap_or("");
+
+            // Add "updated until commit" header
+            let latest_commit_url = provider.get_latest_commit_url().await.unwrap_or_default();
+            let updated_text = if !latest_commit_url.is_empty() {
+                let cap_name = capitalize_first(name);
+                let updated_header = format!(
+                    "{initial_header}\n\n#### ({cap_name} updated until commit {latest_commit_url})\n"
+                );
+                text.replace(initial_header, &updated_header)
+            } else {
+                text.to_string()
+            };
+
+            provider
+                .edit_comment(&CommentId(comment.id.to_string()), &updated_text)
+                .await?;
+
+            // Post notification comment linking to the updated persistent comment
+            if final_update_message && !comment_url.is_empty() && !latest_commit_url.is_empty() {
+                let notification = format!(
+                    "**[Persistent {name}]({comment_url})** updated to latest commit {latest_commit_url}"
+                );
+                let _ = provider.publish_comment(&notification, false).await;
+            }
+
+            return Ok(());
+        }
+    }
+    tracing::info!("creating new persistent comment");
+    provider.publish_comment(text, false).await?;
     Ok(())
 }
 

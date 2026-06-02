@@ -194,15 +194,14 @@ impl PRDescription {
                 .pr_description
                 .publish_description_as_comment_persistent
             {
-                self.provider
-                    .publish_persistent_comment(
-                        &output.body,
-                        "<!-- pr-agent:describe -->",
-                        "",
-                        "describe",
-                        settings.pr_description.final_update_message,
-                    )
-                    .await?;
+                super::publish_persistent_comment(
+                    self.provider.as_ref(),
+                    &output.body,
+                    "<!-- pr-agent:describe -->",
+                    "describe",
+                    settings.pr_description.final_update_message,
+                )
+                .await?;
             } else {
                 self.provider.publish_comment(&output.body, false).await?;
             }

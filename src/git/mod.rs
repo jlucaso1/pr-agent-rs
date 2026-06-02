@@ -10,7 +10,7 @@ use types::*;
 use crate::error::PrAgentError;
 
 /// Capitalize the first letter of a string.
-fn capitalize_first(s: &str) -> String {
+pub(crate) fn capitalize_first(s: &str) -> String {
     let mut chars = s.chars();
     match chars.next() {
         None => String::new(),
@@ -126,61 +126,6 @@ pub trait GitProvider: Send + Sync {
     /// Whether this provider supports a named capability.
     fn is_supported(&self, _capability: &str) -> bool {
         false
-    }
-
-    /// Find an existing comment by header marker, update it, or create a new one.
-    ///
-    /// Find-or-create a persistent comment:
-    /// 1. Search existing comments for `initial_header` marker
-    /// 2. If found: edit in place with updated content + commit header
-    /// 3. If not found: create new comment
-    async fn publish_persistent_comment(
-        &self,
-        text: &str,
-        initial_header: &str,
-        _update_header: &str,
-        name: &str,
-        final_update_message: bool,
-    ) -> Result<(), PrAgentError> {
-        let comments = self.get_issue_comments().await?;
-        for comment in &comments {
-            if comment.body.starts_with(initial_header) {
-                tracing::info!(
-                    comment_id = comment.id,
-                    "updating existing persistent comment"
-                );
-                let comment_url = comment.url.as_deref().unwrap_or("");
-
-                // Add "updated until commit" header
-                let latest_commit_url = self.get_latest_commit_url().await.unwrap_or_default();
-                let updated_text = if !latest_commit_url.is_empty() {
-                    let cap_name = capitalize_first(name);
-                    let updated_header = format!(
-                        "{initial_header}\n\n#### ({cap_name} updated until commit {latest_commit_url})\n"
-                    );
-                    text.replace(initial_header, &updated_header)
-                } else {
-                    text.to_string()
-                };
-
-                self.edit_comment(&CommentId(comment.id.to_string()), &updated_text)
-                    .await?;
-
-                // Post notification comment linking to updated persistent comment
-                if final_update_message && !comment_url.is_empty() && !latest_commit_url.is_empty()
-                {
-                    let notification = format!(
-                        "**[Persistent {name}]({comment_url})** updated to latest commit {latest_commit_url}"
-                    );
-                    let _ = self.publish_comment(&notification, false).await;
-                }
-
-                return Ok(());
-            }
-        }
-        tracing::info!("creating new persistent comment");
-        self.publish_comment(text, false).await?;
-        Ok(())
     }
 
     /// Get URL for the latest commit in the PR.
