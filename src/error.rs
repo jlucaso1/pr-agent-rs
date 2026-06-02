@@ -17,14 +17,6 @@ pub enum PrAgentError {
     #[error("Template rendering error: {0}")]
     Template(#[from] minijinja::Error),
 
-    #[allow(dead_code)]
-    #[error("YAML parsing error: {0}")]
-    YamlParse(String),
-
-    #[allow(dead_code)]
-    #[error("Token budget exceeded: needed {needed}, available {available}")]
-    TokenBudget { needed: u32, available: u32 },
-
     #[error("Unsupported operation: {0}")]
     Unsupported(String),
 
