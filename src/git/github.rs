@@ -211,8 +211,9 @@ impl GithubProvider {
         let resp = Self::check_response(resp, "GET").await?;
         let mut next_url = parse_next_link(resp.headers());
         let page: serde_json::Value = resp.json().await.map_err(PrAgentError::Http)?;
-        if let Some(arr) = page.as_array() {
-            all_items.extend(arr.iter().cloned());
+        // Move the array's elements out of the owned page instead of cloning.
+        if let serde_json::Value::Array(arr) = page {
+            all_items.extend(arr);
         }
 
         // Follow pagination links
@@ -223,8 +224,8 @@ impl GithubProvider {
             let resp = Self::check_response(resp, "GET").await?;
             next_url = parse_next_link(resp.headers());
             let page: serde_json::Value = resp.json().await.map_err(PrAgentError::Http)?;
-            if let Some(arr) = page.as_array() {
-                all_items.extend(arr.iter().cloned());
+            if let serde_json::Value::Array(arr) = page {
+                all_items.extend(arr);
             }
         }
 
