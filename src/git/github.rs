@@ -515,6 +515,13 @@ impl GitProvider for GithubProvider {
         Ok(diff_files)
     }
 
+    fn get_pr_number(&self) -> Option<u64> {
+        // The default trait impl parses get_pr_id() (empty here), so override it
+        // with the parsed PR number — otherwise the linked-issue extractor can't
+        // skip the PR's own reference.
+        Some(self.parsed.pr_number)
+    }
+
     async fn get_files(&self) -> Result<Vec<String>, PrAgentError> {
         let path = format!(
             "repos/{}/pulls/{}/files?per_page=100",
