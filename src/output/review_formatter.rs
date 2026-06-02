@@ -163,8 +163,14 @@ fn format_todo_sections_row(
     out: &mut String,
     link_gen: Option<&LinkGenerator>,
 ) {
-    // The "no todos" sentinel is the string "No" (or empty/null).
-    if value.as_sequence().is_none() && is_value_no(&yaml_value_to_string(value)) {
+    // "No todos" is signalled either by an empty list or by the "No" string
+    // sentinel. An empty `<ul>` would render a misleading TODO header, so treat
+    // an empty sequence the same as "No".
+    let no_todos = match value.as_sequence() {
+        Some(seq) => seq.is_empty(),
+        None => is_value_no(&yaml_value_to_string(value)),
+    };
+    if no_todos {
         let _ = writeln!(
             out,
             "<tr><td>✅&nbsp;<strong>No TODO sections</strong></td></tr>"
@@ -454,6 +460,18 @@ fn format_can_be_split_row(value: &serde_yaml_ng::Value, out: &mut String) {
     out.push_str("</td></tr>\n");
 }
 
+/// Normalize a requirement bucket: AI placeholders such as "None.", "No", or
+/// "N/A" mean "no items", so collapse them to empty before deriving compliance.
+/// Trailing sentence punctuation is stripped first so "None." matches.
+fn normalize_requirement_bucket(raw: &str) -> String {
+    let stripped = raw.trim().trim_end_matches(['.', '!']).trim();
+    if is_value_no(stripped) || stripped.eq_ignore_ascii_case("n/a") {
+        String::new()
+    } else {
+        raw.trim().to_string()
+    }
+}
+
 /// Format the `ticket_compliance_check` row — a `List[TicketCompliance]`, each
 /// item carrying `ticket_url` plus compliant / non-compliant / needs-human-
 /// verification requirement bullet lists. Mirrors Python `ticket_markdown_logic`:
@@ -479,9 +497,12 @@ fn format_ticket_compliance_row(emoji: &str, value: &serde_yaml_ng::Value, out: 
                 .to_string()
         };
         let ticket_url = field("ticket_url");
-        let fully = field("fully_compliant_requirements");
-        let not = field("not_compliant_requirements");
-        let needs = field("requires_further_human_verification");
+        // Requirement buckets: the model often emits a textual placeholder like
+        // "None." / "No" instead of leaving the field empty. Normalize those to
+        // empty so a fulfilled ticket isn't mislabeled "Partially compliant".
+        let fully = normalize_requirement_bucket(&field("fully_compliant_requirements"));
+        let not = normalize_requirement_bucket(&field("not_compliant_requirements"));
+        let needs = normalize_requirement_bucket(&field("requires_further_human_verification"));
 
         // A ticket with no compliant/non-compliant items carries no signal.
         if fully.is_empty() && not.is_empty() {
@@ -771,6 +792,17 @@ review:
     }
 
     #[test]
+    fn test_todo_sections_empty_list_shows_no_todos() {
+        // An empty List[TodoSection] means "no todos" — must render the same as
+        // the "No" sentinel, not an empty <ul> under a TODO header.
+        let yaml_str = "review:\n  todo_sections: []\n";
+        let data: serde_yaml_ng::Value = serde_yaml_ng::from_str(yaml_str).unwrap();
+        let result = format_review_markdown(&data, true, None);
+        assert!(result.contains("No TODO sections"), "got: {result}");
+        assert!(!result.contains("<ul>"), "no empty TODO list: {result}");
+    }
+
+    #[test]
     fn test_todo_sections_list_renders_items() {
         // When require_todo_scan is on, the AI returns a List[TodoSection].
         // It must render as a readable <ul>, not a flattened YAML blob.
@@ -963,6 +995,27 @@ review:
         assert!(result.contains("Compliant requirements:"));
         assert!(result.contains("Migrated the travel-requests router"));
         assert!(result.contains("Requires further human verification:"));
+
+        // The "None." placeholder must be normalized to empty, so this ticket
+        // (fully compliant + needs human verification, no real non-compliant
+        // items) classifies as PR Code Verified with a ✅ aggregate — NOT
+        // "Partially compliant" with a 🔶.
+        assert!(
+            result.contains("PR Code Verified"),
+            "placeholder 'None.' must not count as non-compliant: {result}"
+        );
+        assert!(
+            result.contains("Ticket compliance analysis ✅"),
+            "aggregate emoji should be ✅: {result}"
+        );
+        assert!(
+            !result.contains("Partially compliant"),
+            "must not be mislabeled partially compliant: {result}"
+        );
+        assert!(
+            !result.contains("Non-compliant requirements:"),
+            "normalized 'None.' must not render a non-compliant section: {result}"
+        );
 
         // CRITICAL regression guard: must NOT leak the raw YAML field names or
         // block-scalar markers that the flattened rendering produced.
