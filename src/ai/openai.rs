@@ -150,12 +150,7 @@ impl OpenAiCompatibleHandler {
 
             if status.as_u16() == 429 {
                 // Parse Retry-After header if available, default to 60s
-                let retry_after = resp
-                    .headers()
-                    .get("retry-after")
-                    .and_then(|v| v.to_str().ok())
-                    .and_then(|s| s.parse::<u64>().ok())
-                    .unwrap_or(60);
+                let retry_after = crate::util::parse_retry_after(resp.headers(), 60);
                 return Err(PrAgentError::RateLimited {
                     retry_after_secs: retry_after,
                 });

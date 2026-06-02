@@ -170,12 +170,8 @@ impl GithubProvider {
             let resp = req.send().await.map_err(PrAgentError::Http)?;
 
             if resp.status().as_u16() == 429 {
-                let retry_after = resp
-                    .headers()
-                    .get("retry-after")
-                    .and_then(|v| v.to_str().ok())
-                    .and_then(|s| s.parse::<u64>().ok())
-                    .unwrap_or(2u64.pow(attempt + 1));
+                let retry_after =
+                    crate::util::parse_retry_after(resp.headers(), 2u64.pow(attempt + 1));
 
                 if attempt < max_retries {
                     tracing::warn!(
