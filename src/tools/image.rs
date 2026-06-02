@@ -4,9 +4,9 @@ use std::time::Duration;
 
 use regex::Regex;
 
-/// Markdown image: `![alt](url)`
-static MD_IMAGE_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"!\[[^\]]*\]\(([^)\s]+)\)").unwrap());
+/// Opening of a markdown image up to the `(`: `![alt](`. The URL itself is
+/// scanned manually afterwards so balanced parentheses inside it are handled.
+static MD_IMAGE_OPEN_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"!\[[^\]]*\]\(").unwrap());
 
 /// HTML img tag: `<img src="url">` or `<img src='url'>`
 static HTML_IMG_RE: LazyLock<Regex> =
@@ -37,13 +37,31 @@ pub fn extract_image_urls(text: &str) -> Vec<String> {
     let mut urls = Vec::new();
     let mut seen = HashSet::new();
 
-    // Pass 1: Markdown images  ![alt](url)
-    for cap in MD_IMAGE_RE.captures_iter(text) {
-        if let Some(m) = cap.get(1) {
-            let url = m.as_str().trim_end_matches(['.', ',', ';', '!']);
-            if !url.is_empty() && seen.insert(url.to_string()) {
-                urls.push(url.to_string());
+    // Pass 1: Markdown images  ![alt](url). Scan the URL manually from after
+    // the `(`, tracking paren depth so balanced parentheses inside the URL
+    // (e.g. `File_(x).png`) are kept; the URL ends at the matching `)`, or at
+    // whitespace (which begins an optional `"title"`).
+    for m in MD_IMAGE_OPEN_RE.find_iter(text) {
+        let rest = &text[m.end()..];
+        let mut depth = 1i32;
+        let mut end = rest.len();
+        for (i, ch) in rest.char_indices() {
+            if ch == '(' {
+                depth += 1;
+            } else if ch == ')' {
+                depth -= 1;
+                if depth == 0 {
+                    end = i;
+                    break;
+                }
+            } else if ch.is_whitespace() {
+                end = i;
+                break;
             }
+        }
+        let url = rest[..end].trim();
+        if !url.is_empty() && seen.insert(url.to_string()) {
+            urls.push(url.to_string());
         }
     }
 
@@ -225,6 +243,22 @@ mod tests {
         let text = "![a](https://img.com/1.png) and ![b](https://img.com/2.jpg)";
         let urls = extract_image_urls(text);
         assert_eq!(urls, vec!["https://img.com/1.png", "https://img.com/2.jpg"]);
+    }
+
+    #[test]
+    fn test_extract_markdown_balanced_parens() {
+        // C24: a URL with balanced parentheses must be captured whole.
+        let text = "![x](https://en.wikipedia.org/wiki/File_(test).png)";
+        let urls = extract_image_urls(text);
+        assert_eq!(urls, vec!["https://en.wikipedia.org/wiki/File_(test).png"]);
+    }
+
+    #[test]
+    fn test_extract_markdown_with_title() {
+        // The optional "title" after the URL must not be included.
+        let text = "![x](https://img.com/a.png \"a title\")";
+        let urls = extract_image_urls(text);
+        assert_eq!(urls, vec!["https://img.com/a.png"]);
     }
 
     #[test]
