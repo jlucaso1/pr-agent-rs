@@ -94,13 +94,12 @@ impl PRDescription {
         )
         .await;
         let image_ref = image_urls.as_deref();
-        let response = crate::ai::chat_completion_with_fallback(
+        let response = super::ai_call_with_fallback(
             ai.as_ref(),
+            &settings,
             model,
-            &settings.config.fallback_models,
             &rendered.system,
             &rendered.user,
-            Some(settings.config.temperature),
             image_ref,
         )
         .await?;

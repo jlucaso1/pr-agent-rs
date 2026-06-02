@@ -198,13 +198,12 @@ impl PRCodeSuggestions {
 
         // 3. Call AI (generate suggestions, with fallback models)
         tracing::info!(model, batch = batch_index, "calling AI model for improve");
-        let response = crate::ai::chat_completion_with_fallback(
+        let response = super::ai_call_with_fallback(
             ai,
+            &settings,
             model,
-            &settings.config.fallback_models,
             &rendered.system,
             &rendered.user,
-            Some(settings.config.temperature),
             image_urls,
         )
         .await?;
@@ -305,13 +304,12 @@ impl PRCodeSuggestions {
 
         // Call AI (second pass -- reflect, with fallback models)
         tracing::info!(model, "calling AI model for improve reflect pass");
-        let response = crate::ai::chat_completion_with_fallback(
+        let response = super::ai_call_with_fallback(
             ai,
+            settings,
             model,
-            &settings.config.fallback_models,
             &rendered.system,
             &rendered.user,
-            Some(settings.config.temperature),
             None,
         )
         .await?;

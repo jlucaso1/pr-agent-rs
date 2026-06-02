@@ -87,6 +87,30 @@ impl PrMetadata {
     }
 }
 
+/// Call the AI with the configured fallback models, reading model/fallbacks/
+/// temperature from settings. Shared by review/describe/improve (which all use
+/// the fallback path). NOT used by ask/ask_line, which intentionally call the
+/// model directly without fallback.
+pub(crate) async fn ai_call_with_fallback(
+    ai: &dyn AiHandler,
+    settings: &Settings,
+    model: &str,
+    system: &str,
+    user: &str,
+    image_urls: Option<&[String]>,
+) -> Result<crate::ai::types::ChatResponse, PrAgentError> {
+    crate::ai::chat_completion_with_fallback(
+        ai,
+        model,
+        &settings.config.fallback_models,
+        system,
+        user,
+        Some(settings.config.temperature),
+        image_urls,
+    )
+    .await
+}
+
 /// Print a raw AI response to stdout when its YAML couldn't be parsed (CLI mode).
 pub(crate) fn print_raw_fallback(raw_response: &str) {
     eprintln!("Warning: could not parse YAML from AI response, printing raw:");
