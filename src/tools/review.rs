@@ -222,6 +222,18 @@ impl PRReviewer {
             }
         };
 
+        // Suppress the comment on a clean PR when configured: skip only when
+        // publish_output_no_suggestions is false AND the review found no major
+        // issues (mirrors the Python original).
+        if !settings.pr_reviewer.publish_output_no_suggestions
+            && markdown.contains("No major issues detected")
+        {
+            tracing::info!(
+                "review found no major issues; not publishing (publish_output_no_suggestions=false)"
+            );
+            return Ok(());
+        }
+
         publish_as_comment(
             self.provider.as_ref(),
             &markdown,
@@ -302,6 +314,35 @@ mod tests {
             crate::config::loader::load_settings(&overrides, None, None)
                 .expect("should load test settings"),
         )
+    }
+
+    #[tokio::test]
+    async fn test_review_skips_publish_on_clean_pr() {
+        // publish_output_no_suggestions=false + a review with no issues → no comment.
+        let provider = Arc::new(
+            MockGitProvider::new()
+                .with_diff_files(vec![sample_diff_file("src/main.rs", SAMPLE_PATCH)]),
+        );
+        let ai = Arc::new(MockAiHandler::new(
+            "```yaml\nreview:\n  key_issues_to_review: []\n```",
+        ));
+        let reviewer = PRReviewer::new_with_ai(provider.clone(), ai);
+
+        let mut overrides = std::collections::HashMap::new();
+        overrides.insert("config.publish_output".into(), "true".into());
+        overrides.insert("config.publish_output_progress".into(), "false".into());
+        overrides.insert(
+            "pr_reviewer.publish_output_no_suggestions".into(),
+            "false".into(),
+        );
+        let settings =
+            Arc::new(crate::config::loader::load_settings(&overrides, None, None).unwrap());
+        with_settings(settings, reviewer.run()).await.unwrap();
+
+        assert!(
+            provider.get_calls().comments.is_empty(),
+            "a clean PR with the flag off must not publish a review comment"
+        );
     }
 
     #[tokio::test]
