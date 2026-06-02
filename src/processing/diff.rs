@@ -58,9 +58,11 @@ pub fn convert_to_hunks_with_line_numbers(
     let mut current_header: Option<String> = None;
 
     for (i, &line) in lines.iter().enumerate() {
-        // Skip "\ No newline at end of file" markers — they are not real
-        // content and would inflate line numbers.
-        if line.to_lowercase().contains("no newline at end of file") {
+        // Skip the git "no newline" marker (`\ No newline at end of file`) —
+        // it's not real content and would inflate line numbers. Match the
+        // backslash prefix, not the phrase anywhere (a real changed line may
+        // contain that text as content).
+        if line.starts_with('\\') && line.to_lowercase().contains("no newline at end of file") {
             continue;
         }
 
@@ -198,7 +200,10 @@ pub fn extract_hunk_lines_from_patch(
     let mut new_line: usize = 0;
 
     for line in patch.lines() {
-        if line.to_lowercase().contains("no newline at end of file") {
+        // The git "no newline" marker is the backslash-prefixed
+        // `\ No newline at end of file` — match the prefix, not the phrase
+        // anywhere (a real changed line may contain that text as content).
+        if line.starts_with('\\') && line.to_lowercase().contains("no newline at end of file") {
             continue;
         }
 
@@ -225,13 +230,19 @@ pub fn extract_hunk_lines_from_patch(
             // with line numbers — the pr_line_questions template tells the model
             // to read those change markers.
             //
-            // Select by the side's CURRENT line number, with BOTH bounds. The
-            // Python original is buggy on the LEFT side (its lower bound is a
-            // tautology and it tracks the new-side count), so a LEFT query would
-            // select everything from the hunk start; here we track the proper
-            // old/new line numbers, so only the requested range is selected.
-            let line_no = if use_left { old_line } else { new_line };
-            if line_start <= line_no && line_no <= line_end {
+            // Select by the side's CURRENT line number, with BOTH bounds. Only
+            // lines that exist on the requested side are eligible: the LEFT
+            // (old) side ignores added (`+`) lines and the RIGHT (new) side
+            // ignores removed (`-`) lines — otherwise an opposite-side line,
+            // which shares the current line number, would be wrongly selected.
+            // (The Python original is buggy here: its LEFT lower bound is a
+            // tautology and it tracks the new-side count for the old side.)
+            let (line_no, on_side) = if use_left {
+                (old_line, !line.starts_with('+'))
+            } else {
+                (new_line, !line.starts_with('-'))
+            };
+            if on_side && line_start <= line_no && line_no <= line_end {
                 selected.push_str(line);
                 selected.push('\n');
             }
@@ -297,6 +308,40 @@ mod tests {
         assert!(
             result.contains("@@ -10,3 +10,4 @@ fn main()"),
             "should emit the hunk header with section context: {result}"
+        );
+    }
+
+    #[test]
+    fn test_convert_keeps_content_with_no_newline_phrase() {
+        // A real changed line that merely contains the phrase must be kept;
+        // only the backslash-prefixed git marker is skipped.
+        let patch =
+            "@@ -1,1 +1,2 @@\n a\n+// no newline at end of file\n\\ No newline at end of file";
+        let result = convert_to_hunks_with_line_numbers("f.rs", patch, EditType::Modified);
+        assert!(
+            result.contains("+// no newline at end of file"),
+            "content line must be kept: {result}"
+        );
+        assert!(
+            !result.contains("\\ No newline"),
+            "the git marker should still be skipped: {result}"
+        );
+    }
+
+    #[test]
+    fn test_extract_hunk_lines_left_skips_added_lines() {
+        // LEFT side: an added line shares the current old line number but does
+        // not exist on the old side, so it must NOT be selected for an old-line
+        // query (it would inject unrelated new-side content).
+        let patch = "@@ -10,2 +10,3 @@\n context10\n+added\n-removed11";
+        let (_full, selected) = extract_hunk_lines_from_patch(patch, "f.rs", 11, 11, "LEFT");
+        assert!(
+            selected.contains("-removed11"),
+            "the removed old line must be selected: {selected:?}"
+        );
+        assert!(
+            !selected.contains("+added"),
+            "an added (new-side) line must NOT be selected on LEFT: {selected:?}"
         );
     }
 
