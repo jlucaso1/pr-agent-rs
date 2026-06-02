@@ -99,17 +99,12 @@ pub fn format_describe_output(
 
     let _ = writeln!(body, "### **Description**");
     if !description.is_empty() {
-        // Format description as bullet points if it isn't already
-        for line in description.lines() {
-            let trimmed = line.trim();
-            if trimmed.is_empty() {
-                body.push('\n');
-            } else if trimmed.starts_with('-') || trimmed.starts_with('*') {
-                let _ = writeln!(body, "{trimmed}");
-            } else {
-                let _ = writeln!(body, "- {trimmed}");
-            }
-        }
+        // Mirror Python: emit the description near-verbatim, only double-spacing
+        // before top-level `-` bullets for readability. The previous line-by-line
+        // loop force-prefixed every line with `- `, which destroyed indented
+        // sub-bullets and corrupted fenced code blocks.
+        let formatted = description.replace("\n-", "\n\n-");
+        let _ = writeln!(body, "{}", formatted.trim());
         body.push('\n');
     }
 
@@ -240,7 +235,9 @@ fn format_pr_files(
         }
     }
 
-    out.push_str("</tr></tbody></table>");
+    // Each label group already closes its own <tr>, so don't emit another one
+    // here (it was an orphan that produced invalid HTML).
+    out.push_str("</tbody></table>");
 }
 
 /// A single file entry parsed from the AI YAML.
@@ -354,14 +351,17 @@ fn write_file_row(out: &mut String, entry: &FileEntry, file_stats: &HashMap<Stri
 /// Inserts `<br>` at word boundaries to limit visual line length.
 fn insert_br_after_x_chars(text: &str, max_chars: usize) -> String {
     let text = text.replace('\n', "<br>");
-    if text.len() <= max_chars {
+    // Count characters, not bytes — multibyte text (accents, CJK) would
+    // otherwise be split early because its byte length exceeds the char limit.
+    if text.chars().count() <= max_chars {
         return text;
     }
     let mut result = String::new();
     let mut line_len = 0;
     for (i, word) in text.split(' ').enumerate() {
+        let word_chars = word.chars().count();
         if i > 0 {
-            if line_len + word.len() + 1 > max_chars {
+            if line_len + word_chars + 1 > max_chars {
                 result.push_str("<br>");
                 line_len = 0;
             } else {
@@ -370,7 +370,7 @@ fn insert_br_after_x_chars(text: &str, max_chars: usize) -> String {
             }
         }
         result.push_str(word);
-        line_len += word.len();
+        line_len += word_chars;
     }
     result
 }
@@ -838,5 +838,70 @@ pr_files:
         // Lines without special chars should be untouched
         assert!(result.contains("-->|Validation added|"));
         assert!(result.contains("-->|Use uploadFileToR2|"));
+    }
+
+    #[test]
+    fn test_insert_br_counts_chars_not_bytes() {
+        // C30: 7 chars / 19 bytes — under a 10-char limit, so no <br> inserted.
+        assert_eq!(
+            insert_br_after_x_chars("日本語 日本語", 10),
+            "日本語 日本語"
+        );
+    }
+
+    #[test]
+    fn test_description_preserves_code_and_subbullets() {
+        // C31: the description must be emitted near-verbatim — sub-bullets keep
+        // their indentation and fenced code blocks are not bulleted.
+        use serde_yaml_ng::{Mapping, Value};
+        let description = "Summary line\n- main\n  - nested\n```text\nfenced\n```";
+        let mut m = Mapping::new();
+        m.insert(Value::from("title"), Value::from("x"));
+        m.insert(Value::from("type"), Value::from("Bug fix"));
+        m.insert(Value::from("description"), Value::from(description));
+        m.insert(Value::from("pr_files"), Value::Sequence(vec![]));
+        let data = Value::Mapping(m);
+
+        let config = test_config(false, false, true);
+        let result = format_describe_output(&data, "T", "", &config, &empty_stats());
+
+        assert!(
+            result.body.contains("  - nested"),
+            "nested sub-bullet indentation must be preserved: {}",
+            result.body
+        );
+        assert!(result.body.contains("```text"), "code fence must survive");
+        assert!(
+            !result.body.contains("- ```text"),
+            "code fence must not be bulleted: {}",
+            result.body
+        );
+        assert!(
+            !result.body.contains("- Summary line"),
+            "prose line must not be force-bulleted: {}",
+            result.body
+        );
+    }
+
+    #[test]
+    fn test_walkthrough_table_has_balanced_tr() {
+        // C32: the file walkthrough table must not emit an orphan </tr>.
+        let yaml_str = r#"
+title: "x"
+type: "Bug fix"
+description: "d"
+pr_files:
+  - filename: "src/a.rs"
+    changes_title: "t"
+    changes_summary: "s"
+    label: "bug fix"
+"#;
+        let data: serde_yaml_ng::Value = serde_yaml_ng::from_str(yaml_str).unwrap();
+        let config = test_config(false, false, true);
+        let result = format_describe_output(&data, "T", "", &config, &empty_stats());
+
+        let opens = result.body.matches("<tr>").count();
+        let closes = result.body.matches("</tr>").count();
+        assert_eq!(opens, closes, "<tr> tags must be balanced: {}", result.body);
     }
 }
