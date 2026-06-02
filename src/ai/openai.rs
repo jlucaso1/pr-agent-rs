@@ -207,6 +207,27 @@ impl OpenAiCompatibleHandler {
     }
 }
 
+/// Reject a fixed seed combined with a non-zero temperature — but only when the
+/// temperature is ACTUALLY part of the request. Temperature is sent iff the
+/// model supports it, it isn't a custom reasoning model, and no `reasoning_effort`
+/// overrides it (the same condition `build_request_body` uses). So a seed on a
+/// reasoning / no-temperature model (which drops temperature) is allowed.
+fn validate_seed_temperature(
+    reasoning_effort_set: bool,
+    supports_temperature: bool,
+    custom_reasoning_model: bool,
+    effective_temp: f32,
+    seed: i32,
+) -> Result<(), PrAgentError> {
+    let temperature_sent = supports_temperature && !custom_reasoning_model && !reasoning_effort_set;
+    if temperature_sent && effective_temp > 0.0 && seed >= 0 {
+        return Err(PrAgentError::AiHandler(format!(
+            "seed ({seed}) is not supported with temperature ({effective_temp}) > 0"
+        )));
+    }
+    Ok(())
+}
+
 #[async_trait]
 impl AiHandler for OpenAiCompatibleHandler {
     fn deployment_id(&self) -> &str {
@@ -243,17 +264,20 @@ impl AiHandler for OpenAiCompatibleHandler {
         image_urls: Option<&[String]>,
     ) -> Result<ChatResponse, PrAgentError> {
         // A fixed seed is incompatible with a non-zero temperature (the result
-        // would not be reproducible). Mirror Python: reject the combination
-        // instead of silently sending both. Default seed is -1 (opt-in), so the
-        // default config is unaffected.
+        // would not be reproducible) — but ONLY when temperature is actually
+        // sent. Reasoning / no-temperature models (e.g. the default
+        // gpt-5.2-2025-12-11) have temperature removed from the request, so a
+        // seed is fine there. Default seed is -1 (opt-in).
         let settings = get_settings();
+        let caps = self.capabilities(model);
         let effective_temp = temperature.unwrap_or(settings.config.temperature);
-        if effective_temp > 0.0 && settings.config.seed >= 0 {
-            return Err(PrAgentError::AiHandler(format!(
-                "seed ({}) is not supported with temperature ({effective_temp}) > 0",
-                settings.config.seed
-            )));
-        }
+        validate_seed_temperature(
+            caps.reasoning_effort.is_some(),
+            caps.supports_temperature,
+            settings.config.custom_reasoning_model,
+            effective_temp,
+            settings.config.seed,
+        )?;
 
         let body = self.build_request_body(model, system, user, temperature, image_urls);
 
@@ -476,6 +500,23 @@ mod tests {
         // Empty system message should be omitted
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0]["role"], "user");
+    }
+
+    #[test]
+    fn test_validate_seed_temperature() {
+        // (reasoning_effort_set, supports_temperature, custom_reasoning_model, temp, seed)
+        // Normal model with temp>0 + seed → conflict (temperature IS sent).
+        assert!(validate_seed_temperature(false, true, false, 0.2, 5).is_err());
+        // Reasoning model (reasoning_effort set) → temperature removed → OK.
+        assert!(validate_seed_temperature(true, true, false, 0.2, 5).is_ok());
+        // custom_reasoning_model → temperature suppressed → OK.
+        assert!(validate_seed_temperature(false, true, true, 0.2, 5).is_ok());
+        // No-temperature model → OK.
+        assert!(validate_seed_temperature(false, false, false, 0.2, 5).is_ok());
+        // Seed disabled (-1) → OK.
+        assert!(validate_seed_temperature(false, true, false, 0.2, -1).is_ok());
+        // Temperature 0 → OK.
+        assert!(validate_seed_temperature(false, true, false, 0.0, 5).is_ok());
     }
 
     #[tokio::test]
