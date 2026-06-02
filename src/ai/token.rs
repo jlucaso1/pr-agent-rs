@@ -163,11 +163,43 @@ pub fn get_max_tokens(model: &str) -> u32 {
     }
 }
 
-/// Look up the maximum context tokens for a model, falling back to the
-/// configured `max_model_tokens` if the model is unknown.
-pub fn get_max_tokens_with_fallback(model: &str, config_max: u32) -> u32 {
+/// Resolve the effective max context tokens for a model, mirroring the Python
+/// `get_max_tokens` (pr_agent/algo/utils.py):
+///
+/// 1. Known model → its table limit.
+/// 2. Unknown model with `custom_model_max_tokens > 0` → that value.
+/// 3. Unknown model with no custom limit → fall back to `max_model_tokens`
+///    (Python raises here; we warn and degrade gracefully instead of crashing).
+///
+/// In ALL cases the result is further capped by `max_model_tokens` when it is
+/// positive. This is an input-quality limit: the AI degrades when the input is
+/// too long, so users can cap even very large known models (e.g. limit a 128k
+/// model to the default 32k). Previously this cap was only applied to unknown
+/// models, silently ignoring `max_model_tokens` for every known model.
+pub fn get_max_tokens_with_fallback(
+    model: &str,
+    max_model_tokens: u32,
+    custom_model_max_tokens: i32,
+) -> u32 {
     let known = get_max_tokens(model);
-    if known > 0 { known } else { config_max }
+    let base = if known > 0 {
+        known
+    } else if custom_model_max_tokens > 0 {
+        custom_model_max_tokens as u32
+    } else {
+        tracing::warn!(
+            model,
+            "model not in the known token table and custom_model_max_tokens is unset; \
+             falling back to max_model_tokens"
+        );
+        max_model_tokens
+    };
+
+    if max_model_tokens > 0 {
+        base.min(max_model_tokens)
+    } else {
+        base
+    }
 }
 
 /// Check if a model does NOT support the temperature parameter.
@@ -300,6 +332,36 @@ mod tests {
         assert_eq!(get_max_tokens("gemini/gemini-2.5-pro"), 1_048_576);
         assert_eq!(get_max_tokens("deepseek/deepseek-chat"), 128_000);
         assert_eq!(get_max_tokens("unknown-model"), 0);
+    }
+
+    #[test]
+    fn test_get_max_tokens_with_fallback_caps_known_models() {
+        // Known model larger than the cap is clamped (the C2 fix): previously
+        // get_max_tokens_with_fallback ignored max_model_tokens for known models.
+        assert_eq!(get_max_tokens_with_fallback("gpt-4o", 32_000, -1), 32_000);
+        // Known model smaller than the cap stays as-is.
+        assert_eq!(get_max_tokens_with_fallback("gpt-4", 32_000, -1), 8_000);
+        // Cap disabled (0) → full known limit.
+        assert_eq!(get_max_tokens_with_fallback("gpt-4o", 0, -1), 128_000);
+    }
+
+    #[test]
+    fn test_get_max_tokens_with_fallback_unknown_model() {
+        // Unknown model uses custom_model_max_tokens when positive (the C4 fix),
+        // then still clamped by max_model_tokens.
+        assert_eq!(
+            get_max_tokens_with_fallback("unknown-model", 32_000, 16_000),
+            16_000
+        );
+        assert_eq!(
+            get_max_tokens_with_fallback("unknown-model", 32_000, 64_000),
+            32_000
+        );
+        // Unknown model with no custom limit → falls back to max_model_tokens.
+        assert_eq!(
+            get_max_tokens_with_fallback("unknown-model", 32_000, -1),
+            32_000
+        );
     }
 
     #[test]

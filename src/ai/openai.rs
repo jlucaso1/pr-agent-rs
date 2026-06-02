@@ -199,7 +199,11 @@ impl AiHandler for OpenAiCompatibleHandler {
 
     fn capabilities(&self, model: &str) -> ModelCapabilities {
         let settings = get_settings();
-        let max_tokens = get_max_tokens_with_fallback(model, settings.config.max_model_tokens);
+        let max_tokens = get_max_tokens_with_fallback(
+            model,
+            settings.config.max_model_tokens,
+            settings.config.custom_model_max_tokens,
+        );
 
         let reasoning_effort = uses_reasoning_effort(model)
             .then(|| &settings.config.reasoning_effort)
@@ -354,8 +358,7 @@ mod tests {
         // The default config model is a GPT-5 model: it must receive
         // `reasoning_effort` and must NOT receive `temperature`, mirroring the
         // Python `thinking_kwargs_gpt5` branch (model.startswith('gpt-5')).
-        let body =
-            handler.build_request_body("gpt-5.2-2025-12-11", "sys", "user", Some(0.2), None);
+        let body = handler.build_request_body("gpt-5.2-2025-12-11", "sys", "user", Some(0.2), None);
 
         assert!(
             body.get("temperature").is_none(),

@@ -81,7 +81,11 @@ pub fn get_pr_diff(
         drop(std::mem::take(&mut file.head_file));
     }
 
-    let max_tokens = get_max_tokens_with_fallback(model, settings.config.max_model_tokens);
+    let max_tokens = get_max_tokens_with_fallback(
+        model,
+        settings.config.max_model_tokens,
+        settings.config.custom_model_max_tokens,
+    );
 
     // 3. Check total tokens against budget
     let total_tokens: u32 = file_dict.iter().map(|(_, e)| e.tokens).sum();
@@ -317,7 +321,11 @@ pub fn get_pr_diff_multiple_patches(
         return Vec::new();
     }
 
-    let max_tokens = get_max_tokens_with_fallback(model, settings.config.max_model_tokens);
+    let max_tokens = get_max_tokens_with_fallback(
+        model,
+        settings.config.max_model_tokens,
+        settings.config.custom_model_max_tokens,
+    );
     let file_dict = build_file_dict(files, add_line_numbers, extra_before, extra_after);
     let mut remaining: Vec<String> = file_dict.iter().map(|(f, _)| f.clone()).collect();
     let mut batches = Vec::new();
