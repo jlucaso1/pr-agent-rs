@@ -89,10 +89,10 @@ fn format_review_gfm(
                 format_contribution_time_cost_row(value, out);
             }
             "ticket_compliance_check" => {
-                format_simple_row("🎫 Ticket compliance", value, out);
+                format_ticket_compliance_row(section_emoji("Ticket compliance check"), value, out);
             }
             "todo_sections" => {
-                format_todo_sections_row(value, out);
+                format_todo_sections_row(value, out, link_gen);
             }
             // Skip internal fields that shouldn't be rendered
             "todo_summary" => {}
@@ -153,21 +153,95 @@ fn format_relevant_tests_row(value: &serde_yaml_ng::Value, out: &mut String) {
     }
 }
 
-/// Format todo sections as HTML table rows.
-fn format_todo_sections_row(value: &serde_yaml_ng::Value, out: &mut String) {
-    let text = yaml_value_to_string(value);
-
-    if is_value_no(&text) {
+/// Format the `todo_sections` row — `Union[List[TodoSection], str]`. When the
+/// PR has TODO comments the AI returns a list (each item: relevant_file,
+/// line_number, content); otherwise the string "No". Mirrors Python
+/// `format_todo_items`: render a capped `<ul>` of linked file refs. Without the
+/// list branch, `yaml_value_to_string` flattened the items into raw YAML.
+fn format_todo_sections_row(
+    value: &serde_yaml_ng::Value,
+    out: &mut String,
+    link_gen: Option<&LinkGenerator>,
+) {
+    // "No todos" is signalled either by an empty list or by the "No" string
+    // sentinel. An empty `<ul>` would render a misleading TODO header, so treat
+    // an empty sequence the same as "No".
+    let no_todos = match value.as_sequence() {
+        Some(seq) => seq.is_empty(),
+        None => is_value_no(&yaml_value_to_string(value)),
+    };
+    if no_todos {
         let _ = writeln!(
             out,
             "<tr><td>✅&nbsp;<strong>No TODO sections</strong></td></tr>"
         );
+        return;
+    }
+
+    let emoji = section_emoji("Todo sections");
+    let _ = write!(
+        out,
+        "<tr><td>{emoji}&nbsp;<strong>TODO sections</strong>\n<br><br>\n"
+    );
+    out.push_str(&format_todo_items(value, link_gen));
+    out.push_str("</td></tr>\n");
+}
+
+/// Maximum TODO items to display (mirrors Python `MAX_ITEMS`).
+const MAX_TODO_ITEMS: usize = 5;
+
+/// Render the TODO items as a capped `<ul>` list (or a single `<p>` when the
+/// value is one item rather than a list). Mirrors Python `format_todo_items`.
+fn format_todo_items(value: &serde_yaml_ng::Value, link_gen: Option<&LinkGenerator>) -> String {
+    let mut out = String::new();
+    match value.as_sequence() {
+        Some(items) => {
+            out.push_str("<ul>\n");
+            for item in items.iter().take(MAX_TODO_ITEMS) {
+                let _ = writeln!(out, "<li>{}</li>", format_todo_item(item, link_gen));
+            }
+            out.push_str("</ul>\n");
+        }
+        None => {
+            let _ = writeln!(out, "<p>{}</p>", format_todo_item(value, link_gen));
+        }
+    }
+    out
+}
+
+/// Render one TODO item as `<a href=link>file [line]</a>: content`.
+/// Mirrors Python `format_todo_item`.
+fn format_todo_item(item: &serde_yaml_ng::Value, link_gen: Option<&LinkGenerator>) -> String {
+    let relevant_file = item
+        .get("relevant_file")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
+    let line_str = item
+        .get("line_number")
+        .map(yaml_value_to_string)
+        .unwrap_or_default();
+    let content = item
+        .get("content")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
+
+    let mut file_ref = format!("{relevant_file} [{line_str}]");
+    let line_num: i32 = line_str.parse().unwrap_or(0);
+    if !relevant_file.is_empty()
+        && let Some(link_fn) = link_gen
+    {
+        let link = link_fn(relevant_file, line_num, None);
+        if !link.is_empty() {
+            file_ref = format!("<a href='{link}'>{file_ref}</a>");
+        }
+    }
+
+    if content.is_empty() {
+        file_ref
     } else {
-        let emoji = section_emoji("Todo sections");
-        let _ = writeln!(
-            out,
-            "<tr><td>{emoji}&nbsp;<strong>TODO sections</strong><br><br>{text}</td></tr>"
-        );
+        format!("{file_ref}: {content}")
     }
 }
 
@@ -386,6 +460,136 @@ fn format_can_be_split_row(value: &serde_yaml_ng::Value, out: &mut String) {
     out.push_str("</td></tr>\n");
 }
 
+/// Normalize a requirement bucket: AI placeholders such as "None.", "No", or
+/// "N/A" mean "no items", so collapse them to empty before deriving compliance.
+/// The prompt asks for bullet lists, so a lone bullet marker and trailing
+/// sentence punctuation are stripped first (e.g. "* None." / "- No" also match).
+/// Only the emptiness *check* uses the stripped form — the original text (with
+/// its bullets) is returned for display when the bucket is real.
+fn normalize_requirement_bucket(raw: &str) -> String {
+    let stripped = raw
+        .trim()
+        .trim_start_matches(['*', '-', '+', '•'])
+        .trim()
+        .trim_end_matches(['.', '!'])
+        .trim();
+    if is_value_no(stripped) || stripped.eq_ignore_ascii_case("n/a") {
+        String::new()
+    } else {
+        raw.trim().to_string()
+    }
+}
+
+/// Format the `ticket_compliance_check` row — a `List[TicketCompliance]`, each
+/// item carrying `ticket_url` plus compliant / non-compliant / needs-human-
+/// verification requirement bullet lists. Mirrors Python `ticket_markdown_logic`:
+/// derive a per-ticket compliance level, an aggregate emoji, and render a
+/// readable block per ticket. Without this the nested list was flattened by
+/// `yaml_value_to_string` into one unreadable paragraph (raw YAML field names
+/// and `|` block-scalar markers included).
+fn format_ticket_compliance_row(emoji: &str, value: &serde_yaml_ng::Value, out: &mut String) {
+    let Some(tickets) = value.as_sequence() else {
+        return;
+    };
+
+    let mut compliance_str = String::new();
+    let mut levels: Vec<&str> = Vec::new();
+
+    for ticket in tickets {
+        let field = |k: &str| {
+            ticket
+                .get(k)
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string()
+        };
+        let ticket_url = field("ticket_url");
+        // Requirement buckets: the model often emits a textual placeholder like
+        // "None." / "No" instead of leaving the field empty. Normalize those to
+        // empty so a fulfilled ticket isn't mislabeled "Partially compliant".
+        let fully = normalize_requirement_bucket(&field("fully_compliant_requirements"));
+        let not = normalize_requirement_bucket(&field("not_compliant_requirements"));
+        let needs = normalize_requirement_bucket(&field("requires_further_human_verification"));
+
+        // A ticket with no compliant/non-compliant items carries no signal.
+        if fully.is_empty() && not.is_empty() {
+            continue;
+        }
+
+        let level = if !fully.is_empty() {
+            if !not.is_empty() {
+                "Partially compliant"
+            } else if needs.is_empty() {
+                "Fully compliant"
+            } else {
+                "PR Code Verified"
+            }
+        } else {
+            "Not compliant"
+        };
+        levels.push(level);
+
+        let mut explanation = String::new();
+        if !fully.is_empty() {
+            let _ = write!(explanation, "Compliant requirements:\n\n{fully}\n\n");
+        }
+        if !not.is_empty() {
+            let _ = write!(explanation, "Non-compliant requirements:\n\n{not}\n\n");
+        }
+        if !needs.is_empty() {
+            let _ = write!(
+                explanation,
+                "Requires further human verification:\n\n{needs}\n\n"
+            );
+        }
+
+        // Link text is the trailing path segment (the ticket id), as in Python.
+        let ticket_id = ticket_url.rsplit('/').next().unwrap_or("");
+        let heading = if ticket_url.is_empty() {
+            level.to_string()
+        } else {
+            format!("[{ticket_id}]({ticket_url}) - {level}")
+        };
+        let _ = write!(compliance_str, "\n\n**{heading}**\n\n{explanation}\n\n");
+    }
+
+    // Nothing renderable → skip the whole row (don't emit an empty header).
+    if compliance_str.trim().is_empty() {
+        return;
+    }
+
+    let compliance_emoji = aggregate_compliance_emoji(&levels);
+    let _ = write!(
+        out,
+        "<tr><td>\n\n**{emoji} Ticket compliance analysis {compliance_emoji}**\n\n{compliance_str}</td></tr>\n"
+    );
+}
+
+/// Derive the overall compliance emoji from the per-ticket levels.
+/// Mirrors the aggregation in Python `ticket_markdown_logic`.
+fn aggregate_compliance_emoji(levels: &[&str]) -> &'static str {
+    if levels.is_empty() {
+        return "";
+    }
+    let all = |target: &str| levels.iter().all(|&l| l == target);
+    let any = |target: &str| levels.contains(&target);
+
+    if all("Fully compliant") || all("PR Code Verified") {
+        "✅"
+    } else if any("Not compliant") {
+        if any("Fully compliant") || any("PR Code Verified") {
+            "🔶" // mix of compliant and non-compliant
+        } else {
+            "❌"
+        }
+    } else if any("Partially compliant") {
+        "🔶"
+    } else {
+        "✅"
+    }
+}
+
 /// Format the `contribution_time_cost_estimate` row (best/average/worst case).
 /// Mirrors Python: render the three cases inline, expanding the `m` suffix to
 /// " minutes". Without this, the mapping was serialized as a raw YAML blob.
@@ -596,6 +800,63 @@ review:
     }
 
     #[test]
+    fn test_todo_sections_empty_list_shows_no_todos() {
+        // An empty List[TodoSection] means "no todos" — must render the same as
+        // the "No" sentinel, not an empty <ul> under a TODO header.
+        let yaml_str = "review:\n  todo_sections: []\n";
+        let data: serde_yaml_ng::Value = serde_yaml_ng::from_str(yaml_str).unwrap();
+        let result = format_review_markdown(&data, true, None);
+        assert!(result.contains("No TODO sections"), "got: {result}");
+        assert!(!result.contains("<ul>"), "no empty TODO list: {result}");
+    }
+
+    #[test]
+    fn test_todo_sections_list_renders_items() {
+        // When require_todo_scan is on, the AI returns a List[TodoSection].
+        // It must render as a readable <ul>, not a flattened YAML blob.
+        let yaml_str = r#"
+review:
+  todo_sections:
+    - relevant_file: "src/auth.rs"
+      line_number: 42
+      content: "handle token refresh"
+    - relevant_file: "src/db.rs"
+      line_number: 7
+      content: "add migration"
+"#;
+        let data: serde_yaml_ng::Value = serde_yaml_ng::from_str(yaml_str).unwrap();
+        let result = format_review_markdown(&data, true, None);
+
+        assert!(result.contains("<strong>TODO sections</strong>"));
+        assert!(result.contains("<ul>"));
+        assert!(result.contains("src/auth.rs [42]: handle token refresh"));
+        assert!(result.contains("src/db.rs [7]: add migration"));
+        // Regression guard: no leaked raw YAML field names.
+        assert!(!result.contains("relevant_file:"), "leaked field: {result}");
+        assert!(!result.contains("line_number:"), "leaked field: {result}");
+    }
+
+    #[test]
+    fn test_todo_sections_list_caps_at_five() {
+        // More than MAX_TODO_ITEMS (5) items are truncated.
+        let mut yaml_str = String::from("review:\n  todo_sections:\n");
+        for i in 0..8 {
+            yaml_str.push_str(&format!(
+                "    - relevant_file: \"f{i}.rs\"\n      line_number: {i}\n      content: \"todo {i}\"\n"
+            ));
+        }
+        let data: serde_yaml_ng::Value = serde_yaml_ng::from_str(&yaml_str).unwrap();
+        let result = format_review_markdown(&data, true, None);
+        assert!(result.contains("todo 4"), "keeps first 5: {result}");
+        assert!(!result.contains("todo 5"), "drops the 6th item: {result}");
+        assert_eq!(
+            result.matches("<li>").count(),
+            5,
+            "exactly 5 items rendered"
+        );
+    }
+
+    #[test]
     fn test_key_issues_with_canonical_field_names() {
         let yaml_str = r#"
 review:
@@ -705,5 +966,178 @@ review:
         assert!(result.contains("30 minutes"));
         // Must NOT leak the raw YAML keys.
         assert!(!result.contains("best_case:"));
+    }
+
+    #[test]
+    fn test_ticket_compliance_renders_structured_block() {
+        // Reproduces the production scenario where the nested list was flattened
+        // into one paragraph (raw `ticket_url: |` keys and `|` markers leaked).
+        let yaml = "\
+review:
+  ticket_compliance_check:
+    - ticket_url: |
+        https://github.com/acme/repo/issues/2504
+      ticket_requirements: |
+        * Migrate db.transaction() calls
+      fully_compliant_requirements: |
+        * Migrated the travel-requests router
+        * Migrated fleet-requests REST routes
+      not_compliant_requirements: |
+        None.
+      requires_further_human_verification: |
+        * Test file updates are not included in this diff
+";
+        let data: serde_yaml_ng::Value = serde_yaml_ng::from_str(yaml).unwrap();
+        let result = format_review_markdown(&data, true, None);
+
+        // Renders the analysis header and a per-ticket linked heading.
+        assert!(
+            result.contains("Ticket compliance analysis"),
+            "has the analysis header: {result}"
+        );
+        assert!(
+            result.contains("[2504](https://github.com/acme/repo/issues/2504)"),
+            "links the ticket by id: {result}"
+        );
+        // Renders the readable requirement sub-sections.
+        assert!(result.contains("Compliant requirements:"));
+        assert!(result.contains("Migrated the travel-requests router"));
+        assert!(result.contains("Requires further human verification:"));
+
+        // The "None." placeholder must be normalized to empty, so this ticket
+        // (fully compliant + needs human verification, no real non-compliant
+        // items) classifies as PR Code Verified with a ✅ aggregate — NOT
+        // "Partially compliant" with a 🔶.
+        assert!(
+            result.contains("PR Code Verified"),
+            "placeholder 'None.' must not count as non-compliant: {result}"
+        );
+        assert!(
+            result.contains("Ticket compliance analysis ✅"),
+            "aggregate emoji should be ✅: {result}"
+        );
+        assert!(
+            !result.contains("Partially compliant"),
+            "must not be mislabeled partially compliant: {result}"
+        );
+        assert!(
+            !result.contains("Non-compliant requirements:"),
+            "normalized 'None.' must not render a non-compliant section: {result}"
+        );
+
+        // CRITICAL regression guard: must NOT leak the raw YAML field names or
+        // block-scalar markers that the flattened rendering produced.
+        assert!(
+            !result.contains("ticket_url:"),
+            "raw ticket_url key leaked: {result}"
+        );
+        assert!(
+            !result.contains("fully_compliant_requirements:"),
+            "raw field key leaked: {result}"
+        );
+        assert!(
+            !result.contains("ticket_requirements:"),
+            "raw field key leaked: {result}"
+        );
+    }
+
+    #[test]
+    fn test_normalize_requirement_bucket() {
+        // Placeholders → empty, with or without bullet markers / trailing punct.
+        for placeholder in [
+            "None.",
+            "None",
+            "no",
+            "N/A",
+            "* None.",
+            "- No",
+            "+ none",
+            "•  None",
+            "",
+        ] {
+            assert!(
+                normalize_requirement_bucket(placeholder).is_empty(),
+                "placeholder {placeholder:?} should normalize to empty"
+            );
+        }
+        // Real content is preserved verbatim (bullets and all).
+        assert_eq!(
+            normalize_requirement_bucket("* Migrated the router"),
+            "* Migrated the router"
+        );
+        // A real multi-item list that merely starts with a bullet stays.
+        assert_eq!(
+            normalize_requirement_bucket("- None of the inputs are validated"),
+            "- None of the inputs are validated"
+        );
+    }
+
+    #[test]
+    fn test_ticket_compliance_bullet_placeholder_not_compliant() {
+        // The model follows the "bullet list" prompt shape but has nothing to
+        // report: "* None." must not count as a non-compliant requirement.
+        let yaml = "\
+review:
+  ticket_compliance_check:
+    - ticket_url: |
+        https://github.com/acme/repo/issues/7
+      fully_compliant_requirements: |
+        * Implemented the feature
+      not_compliant_requirements: |
+        * None.
+      requires_further_human_verification: |
+";
+        let data: serde_yaml_ng::Value = serde_yaml_ng::from_str(yaml).unwrap();
+        let result = format_review_markdown(&data, true, None);
+        assert!(
+            result.contains("Fully compliant"),
+            "bullet placeholder should yield Fully compliant: {result}"
+        );
+        assert!(
+            !result.contains("Non-compliant requirements:"),
+            "bullet placeholder must not render a non-compliant section: {result}"
+        );
+        assert!(result.contains("Ticket compliance analysis ✅"));
+    }
+
+    #[test]
+    fn test_ticket_compliance_aggregate_emoji_levels() {
+        // Fully compliant (no non-compliant, no further verification) → ✅
+        assert_eq!(aggregate_compliance_emoji(&["Fully compliant"]), "✅");
+        // A non-compliant ticket alone → ❌
+        assert_eq!(aggregate_compliance_emoji(&["Not compliant"]), "❌");
+        // Mix of compliant + non-compliant → partial 🔶
+        assert_eq!(
+            aggregate_compliance_emoji(&["Fully compliant", "Not compliant"]),
+            "🔶"
+        );
+        // Partially compliant present → 🔶
+        assert_eq!(aggregate_compliance_emoji(&["Partially compliant"]), "🔶");
+        // PR Code Verified across the board → ✅
+        assert_eq!(aggregate_compliance_emoji(&["PR Code Verified"]), "✅");
+        // No levels → no emoji.
+        assert_eq!(aggregate_compliance_emoji(&[]), "");
+    }
+
+    #[test]
+    fn test_ticket_compliance_skips_empty_requirements() {
+        // A ticket with neither compliant nor non-compliant items carries no
+        // signal and must be dropped (no empty header row).
+        let yaml = "\
+review:
+  ticket_compliance_check:
+    - ticket_url: |
+        https://github.com/acme/repo/issues/9
+      ticket_requirements: |
+        * Something
+      fully_compliant_requirements: |
+      not_compliant_requirements: |
+";
+        let data: serde_yaml_ng::Value = serde_yaml_ng::from_str(yaml).unwrap();
+        let result = format_review_markdown(&data, true, None);
+        assert!(
+            !result.contains("Ticket compliance analysis"),
+            "empty ticket should not render a row: {result}"
+        );
     }
 }
