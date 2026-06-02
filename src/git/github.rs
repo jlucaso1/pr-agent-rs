@@ -11,7 +11,7 @@ use serde_json::json;
 
 use super::GitProvider;
 use super::types::*;
-use super::url_parser::{ParsedPrUrl, parse_pr_url};
+use super::url_parser::{ParsedPrUrl, ProviderType, parse_pr_url};
 use crate::config::loader::get_settings;
 use crate::error::PrAgentError;
 
@@ -111,6 +111,15 @@ impl GithubProvider {
     /// Supports both "user" (token) and "app" (JWT + installation token) auth.
     pub async fn new(pr_url: &str) -> Result<Self, PrAgentError> {
         let parsed = parse_pr_url(pr_url)?;
+        // GithubProvider is the only implementation. Reject non-GitHub URLs at
+        // the boundary instead of silently building a GitHub client for a
+        // GitLab/Bitbucket URL and failing later with a confusing API error.
+        if parsed.provider != ProviderType::GitHub {
+            return Err(PrAgentError::Other(format!(
+                "only GitHub URLs are supported, but '{pr_url}' parsed as {:?}",
+                parsed.provider
+            )));
+        }
         let settings = get_settings();
 
         let base_url = settings.github.base_url.clone();
@@ -1148,6 +1157,22 @@ mod tests {
     fn test_truncate_comment_under_limit() {
         let text = "short comment";
         assert_eq!(truncate_comment(text), text);
+    }
+
+    #[tokio::test]
+    async fn test_github_provider_rejects_non_github_url() {
+        // F7: a non-GitHub URL is rejected at construction (before any network).
+        let result =
+            GithubProvider::new("https://gitlab.com/group/project/-/merge_requests/10").await;
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .to_lowercase()
+                .contains("github"),
+            "error should mention GitHub"
+        );
     }
 
     #[test]
