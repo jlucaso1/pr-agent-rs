@@ -29,7 +29,7 @@ futures-util = "0.3.31"
 hex = "0.4"
 
 # HMAC signature verification
-hmac = "0.12"
+hmac = "0.13"
 indexmap = "2.13.0"
 
 # JWT (for GitHub App auth — uses aws-lc-rs shared with reqwest/rustls)
