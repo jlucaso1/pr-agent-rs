@@ -57,7 +57,7 @@ sha2 = "0.10"
 thiserror = "2"
 
 # Token counting
-tiktoken-rs = "0.9"
+tiktoken-rs = "0.12"
 
 # Async runtime
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "net", "signal"] }
